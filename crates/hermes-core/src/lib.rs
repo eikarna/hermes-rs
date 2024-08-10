@@ -95,7 +95,7 @@ pub use repomap::{
     discover_source_files, extract_file_tags, rank_and_render, Language as RepoMapLanguage,
     MinimalRepoMap, RepoMapRenderer, RepoTag, TagKind,
 };
-pub use skills::{Skill, SkillManager};
+pub use skills::{write_skill_metadata, Skill, SkillManager, SkillOrigin, ARCHIVE_DIR_NAME};
 pub use tools::{
     register_builtin_tools, register_builtin_tools_with_provider_sub_agent,
     register_builtin_tools_with_sub_agent, HermesTool, ToolRegistry, ToolResult,

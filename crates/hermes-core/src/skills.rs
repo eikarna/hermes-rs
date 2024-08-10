@@ -7,9 +7,37 @@
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Directory name (inside the skills root) holding archived skills.
 pub const ARCHIVE_DIR_NAME: &str = "_archive";
+
+/// Provenance of a skill — who authored it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillOrigin {
+    /// Installed by the user or hand-authored.
+    #[default]
+    User,
+    /// Created by the agent (e.g. curator distillation).
+    Agent,
+}
+
+impl SkillOrigin {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        if s.trim().eq_ignore_ascii_case("agent") {
+            Self::Agent
+        } else {
+            Self::User
+        }
+    }
+}
 
 /// A loaded skill with parsed metadata and content.
 #[derive(Debug, Clone)]
@@ -30,6 +58,14 @@ pub struct Skill {
     pub prerequisites_commands: Vec<String>,
     /// Supporting reference files: filename -> content
     pub references: HashMap<String, String>,
+    /// Who authored the skill; curator auto-archiving only touches agent-made skills.
+    pub origin: SkillOrigin,
+    /// Pinned skills are exempt from curator review/archival.
+    pub pinned: bool,
+    /// Times this skill was invoked (surfaced via `record_use`).
+    pub use_count: u64,
+    /// Unix seconds of last invocation; `None` = never used.
+    pub last_activity_at: Option<i64>,
 }
 
 /// Manages skill discovery, loading, and lifecycle.
@@ -230,6 +266,35 @@ impl SkillManager {
         self.skills.remove(name);
         Ok(())
     }
+
+    /// Record an invocation of this skill: increment use_count, set last_activity_at.
+    pub fn record_use(&mut self, name: &str) -> bool {
+        if let Some(skill) = self.skills.get_mut(name) {
+            skill.use_count += 1;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|d| i64::try_from(d.as_secs()).ok());
+            skill.last_activity_at = now;
+            // Persist metadata (best effort; non-fatal).
+            let _ = write_skill_metadata(&self.skills_dir.join(name), skill);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update provenance fields for existing skill.
+    pub fn update_metadata(&mut self, name: &str, origin: SkillOrigin, pinned: bool) -> bool {
+        if let Some(skill) = self.skills.get_mut(name) {
+            skill.origin = origin;
+            skill.pinned = pinned;
+            let _ = write_skill_metadata(&self.skills_dir.join(name), skill);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +327,21 @@ fn load_skill(skill_dir: &Path) -> Result<Skill> {
     let platforms = parse_list(front_matter.get("platforms"));
     let prerequisites_env = parse_list(front_matter.get("prerequisites_env"));
     let prerequisites_commands = parse_list(front_matter.get("prerequisites_commands"));
+    let origin = front_matter
+        .get("created_by")
+        .map(|s| SkillOrigin::parse(s))
+        .unwrap_or_default();
+    let pinned = front_matter
+        .get("pinned")
+        .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+        .unwrap_or(false);
+    let use_count = front_matter
+        .get("use_count")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let last_activity_at = front_matter
+        .get("last_activity_at")
+        .and_then(|v| v.trim().parse::<i64>().ok());
 
     // Load reference files (everything in the skill dir that isn't SKILL.md)
     let mut references = HashMap::new();
@@ -289,7 +369,74 @@ fn load_skill(skill_dir: &Path) -> Result<Skill> {
         prerequisites_env,
         prerequisites_commands,
         references,
+        origin,
+        pinned,
+        use_count,
+        last_activity_at,
     })
+}
+
+/// Write lifecycle metadata (`origin`, `pinned`, `use_count`,
+/// `last_activity_at`) back into a skill's SKILL.md front matter, preserving
+/// the body and any unknown keys. Creating the file when absent.
+pub fn write_skill_metadata(skill_dir: &Path, skill: &Skill) -> Result<()> {
+    let skill_file = skill_dir.join("SKILL.md");
+    let raw = std::fs::read_to_string(&skill_file).unwrap_or_default();
+    let (front_matter, body) = parse_front_matter(&raw).unwrap_or((HashMap::new(), raw.clone()));
+
+    let mut fm = front_matter;
+    fm.insert("name".to_string(), skill.name.clone());
+    fm.insert("description".to_string(), skill.description.clone());
+    fm.insert("version".to_string(), skill.version.clone());
+    fm.insert("created_by".to_string(), skill.origin.as_str().to_string());
+    if skill.pinned {
+        fm.insert("pinned".to_string(), "true".to_string());
+    } else {
+        fm.remove("pinned");
+    }
+    if skill.use_count > 0 {
+        fm.insert("use_count".to_string(), skill.use_count.to_string());
+    } else {
+        fm.remove("use_count");
+    }
+    match skill.last_activity_at {
+        Some(ts) => {
+            fm.insert("last_activity_at".to_string(), ts.to_string());
+        }
+        None => {
+            fm.remove("last_activity_at");
+        }
+    }
+
+    // Stable key order for readable diffs.
+    let order = [
+        "name",
+        "description",
+        "version",
+        "created_by",
+        "pinned",
+        "use_count",
+        "last_activity_at",
+        "platforms",
+        "prerequisites_env",
+        "prerequisites_commands",
+    ];
+    let mut keys: Vec<&String> = fm.keys().collect();
+    keys.sort_by_key(|k| {
+        order
+            .iter()
+            .position(|o| *o == k.as_str())
+            .unwrap_or(order.len())
+    });
+
+    let mut out = String::from("---\n");
+    for key in keys {
+        out.push_str(&format!("{}: {}\n", key, fm[key]));
+    }
+    out.push_str("---\n");
+    out.push_str(body.trim_start_matches('\n'));
+    std::fs::write(&skill_file, out)
+        .map_err(|e| Error::Config(format!("Failed to write SKILL.md: {}", e)))
 }
 
 /// Parse YAML-like front matter delimited by `---` lines.
@@ -578,6 +725,10 @@ mod tests {
             prerequisites_env: vec![],
             prerequisites_commands: vec![],
             references: HashMap::new(),
+            origin: SkillOrigin::User,
+            pinned: false,
+            use_count: 0,
+            last_activity_at: None,
         };
 
         let mgr = SkillManager::new(PathBuf::from("."));
@@ -595,6 +746,10 @@ mod tests {
             prerequisites_env: vec![],
             prerequisites_commands: vec![],
             references: HashMap::new(),
+            origin: SkillOrigin::User,
+            pinned: false,
+            use_count: 0,
+            last_activity_at: None,
         };
 
         let mgr = SkillManager::new(PathBuf::from("."));
@@ -612,6 +767,10 @@ mod tests {
             prerequisites_env: vec![],
             prerequisites_commands: vec![],
             references: HashMap::new(),
+            origin: SkillOrigin::User,
+            pinned: false,
+            use_count: 0,
+            last_activity_at: None,
         };
 
         let mgr = SkillManager::new(PathBuf::from("."));
@@ -629,6 +788,10 @@ mod tests {
             prerequisites_env: vec!["HERMES_NONEXISTENT_VAR_12345".into()],
             prerequisites_commands: vec![],
             references: HashMap::new(),
+            origin: SkillOrigin::User,
+            pinned: false,
+            use_count: 0,
+            last_activity_at: None,
         };
 
         let mgr = SkillManager::new(PathBuf::from("."));
@@ -653,6 +816,33 @@ mod tests {
         assert!(skill.platforms.is_empty());
         assert!(skill.content.contains("# Just content"));
 
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn test_record_use_updates_metadata() {
+        let tmp = make_temp_dir();
+        let mut mgr = SkillManager::new(tmp.clone());
+        let content =
+            "---\nname: usage-skill\ndescription: Tracks uses\nversion: 1.0.0\n---\nUse me.";
+        mgr.create("usage-skill", content).unwrap();
+        assert!(mgr.record_use("usage-skill"));
+        let skill = mgr.get("usage-skill").unwrap();
+        assert_eq!(skill.use_count, 1);
+        assert!(skill.last_activity_at.is_some());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn test_update_metadata_provenance() {
+        let tmp = make_temp_dir();
+        let mut mgr = SkillManager::new(tmp.clone());
+        let content = "---\nname: prov-skill\ndescription: Prov\nversion: 1.0.0\n---\nBody.";
+        mgr.create("prov-skill", content).unwrap();
+        assert!(mgr.update_metadata("prov-skill", SkillOrigin::Agent, true));
+        let skill = mgr.get("prov-skill").unwrap();
+        assert_eq!(skill.origin, SkillOrigin::Agent);
+        assert!(skill.pinned);
         cleanup(&tmp);
     }
 }

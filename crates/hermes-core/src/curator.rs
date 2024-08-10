@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::memory::{MemoryBlock, MemoryManager};
-use crate::skills::{SkillManager, ARCHIVE_DIR_NAME};
+use crate::skills::SkillManager;
 
 /// Tunables for a curator pass. All thresholds are opt-out: setting
 /// `*_days` to `0` disables that particular rule.
@@ -214,7 +214,11 @@ async fn curate_sessions(
     }
 }
 
-/// Move skills whose SKILL.md is older than `skill_stale_days` into `_archive/`.
+/// Move stale *agent-created, unpinned* skills into `_archive/`. User skills
+/// are never auto-archived (curator policy: archive is provenance-gated), and
+/// pinned skills are exempt regardless of provenance. Staleness prefers
+/// `last_activity_at` metadata when present, otherwise falls back to SKILL.md
+/// mtime.
 fn archive_stale_skills(
     skills_dir: &Path,
     policy: &CurationPolicy,
@@ -226,28 +230,27 @@ fn archive_stale_skills(
     }
     let stale_after = u64::from(policy.skill_stale_days) * 86_400;
     let mut manager = SkillManager::new(skills_dir.to_path_buf());
-    if manager.load_all().is_err() {
-        return Ok(()); // unreadable root: nothing to curate
-    }
+    let loaded = match manager.load_all() {
+        Ok(loaded) => loaded,
+        Err(_) => return Ok(()), // unreadable root: nothing to curate
+    };
 
-    let entries = std::fs::read_dir(skills_dir)
-        .map_err(|e| Error::Config(format!("Failed to scan skills dir: {}", e)))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() || entry.file_name() == ARCHIVE_DIR_NAME {
+    for skill in loaded {
+        if skill.origin != crate::skills::SkillOrigin::Agent || skill.pinned {
             continue;
         }
-        let skill_md = path.join("SKILL.md");
-        let modified = std::fs::metadata(&skill_md)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
-        let Some(modified) = modified else { continue };
-        if now.saturating_sub(modified) as u64 > stale_after {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if manager.archive(&name)? {
-                report.skills_archived.push(name);
+        let last_touch = skill.last_activity_at.unwrap_or_else(|| {
+            // Fall back to SKILL.md mtime for agent skills never invoked.
+            std::fs::metadata(skills_dir.join(&skill.name).join("SKILL.md"))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(now)
+        });
+        if now.saturating_sub(last_touch) > stale_after as i64 {
+            if manager.archive(&skill.name)? {
+                report.skills_archived.push(skill.name.clone());
             }
         }
     }
@@ -321,7 +324,7 @@ async fn distill_skills_from_memory(
             _ => bullet_body(&contents),
         };
         let skill_md = format!(
-            "---\nname: {}\ndescription: Distilled from {} long-term memories\nversion: 0.1.0\n---\n# {}\n\n{}\n",
+            "---\nname: {}\ndescription: Distilled from {} long-term memories\nversion: 0.1.0\ncreated_by: agent\n---\n# {}\n\n{}\n",
             skill_name,
             contents.len(),
             skill_name,
