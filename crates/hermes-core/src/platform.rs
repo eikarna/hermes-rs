@@ -332,6 +332,7 @@ mod tests {
     // -- Config directories -------------------------------------------------
 
     #[test]
+    #[serial_test::serial]
     fn test_hermes_home_respects_env() {
         let key = "HERMES_HOME";
         let original = env::var(key).ok();
@@ -347,6 +348,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_hermes_home_default_not_empty() {
         let key = "HERMES_HOME";
         let original = env::var(key).ok();
