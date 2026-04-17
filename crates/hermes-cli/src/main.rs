@@ -268,22 +268,16 @@ fn init_logging(verbose: bool, level: &str) {
 }
 
 /// Build the tool registry with built-in tools
-fn build_registry() -> ToolRegistry {
+async fn build_registry() -> ToolRegistry {
     let registry = ToolRegistry::new(Duration::from_secs(30));
 
     // Register all built-in tools (file, terminal, web, code, memory, http, datetime, todo, clarify, patch)
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            hermes_core::tools::register_builtin_tools(&registry)
-                .await
-                .unwrap();
-            // Also register CLI-specific demo tools
-            registry.register(EchoTool::new()).await.unwrap();
-            registry.register(CalculatorTool::new()).await.unwrap();
-        });
+    hermes_core::tools::register_builtin_tools(&registry)
+        .await
+        .unwrap();
+    // Also register CLI-specific demo tools
+    registry.register(EchoTool::new()).await.unwrap();
+    registry.register(CalculatorTool::new()).await.unwrap();
 
     registry
 }
@@ -300,7 +294,7 @@ async fn run_agent(
     let client_config = config.merge_with(cli);
     let client = OpenAIClient::new(client_config);
 
-    let registry = build_registry();
+    let registry = build_registry().await;
 
     let mut agent_config = AgentConfig {
         model: config.model.clone().unwrap_or_else(|| cli.model.clone()),
@@ -372,7 +366,7 @@ async fn run_agent(
 
 /// List available tools
 async fn list_tools(verbose: bool) -> Result<()> {
-    let registry = build_registry();
+    let registry = build_registry().await;
     let tools = registry.get_schemas().await;
 
     if tools.is_empty() {
@@ -406,7 +400,7 @@ async fn chat_mode(cli: &Cli, config: &FileConfig, system_prompt: Option<&str>) 
 
     let client_config = config.merge_with(cli);
     let client = OpenAIClient::new(client_config);
-    let registry = build_registry();
+    let registry = build_registry().await;
 
     let agent_config = AgentConfig {
         model: config.model.clone().unwrap_or_else(|| cli.model.clone()),
@@ -463,7 +457,7 @@ async fn test_tool(
     tool_name: &str,
     args: Option<&str>,
 ) -> Result<()> {
-    let registry = build_registry();
+    let registry = build_registry().await;
 
     // Check if tool exists
     if !registry.contains(tool_name).await {
