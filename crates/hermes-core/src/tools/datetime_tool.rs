@@ -215,7 +215,7 @@ fn is_leap_year(year: u64) -> bool {
 fn parse_date(date: &str) -> Result<u64, String> {
     // Try ISO 8601 format first: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
     let parts: Vec<&str> = date
-        .split(|c| c == '-' || c == 'T' || c == ':' || c == 'Z' || c == '+' || c == ' ')
+        .split(['-', 'T', ':', 'Z', '+', ' '])
         .collect();
 
     if parts.len() >= 3 {
@@ -223,7 +223,7 @@ fn parse_date(date: &str) -> Result<u64, String> {
         let month: u64 = parts[1].parse().map_err(|_| "Invalid month")?;
         let day: u64 = parts[2].parse().map_err(|_| "Invalid day")?;
 
-        if month < 1 || month > 12 || day < 1 || day > 31 {
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
             return Err("Invalid date values".to_string());
         }
 

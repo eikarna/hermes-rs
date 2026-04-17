@@ -112,7 +112,7 @@ impl HermesTool for TerminalTool {
         if let Some(stdout) = stdout {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Ok(Some(l))) = tokio::time::timeout(timeout, reader.next_line()).await {
-                if stdout_output.len() + l.len() + 1 <= max_output {
+                if stdout_output.len() + l.len() < max_output {
                     stdout_output.push_str(&l);
                     stdout_output.push('\n');
                 } else if stdout_output.len() < max_output {
@@ -130,7 +130,7 @@ impl HermesTool for TerminalTool {
         if let Some(stderr) = stderr {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Ok(Some(l))) = tokio::time::timeout(timeout, reader.next_line()).await {
-                if stderr_output.len() + l.len() + 1 <= max_output / 4 {
+                if stderr_output.len() + l.len() < max_output / 4 {
                     stderr_output.push_str(&l);
                     stderr_output.push('\n');
                 }

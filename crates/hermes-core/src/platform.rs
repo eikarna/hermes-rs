@@ -355,9 +355,8 @@ mod tests {
         let home = hermes_home();
         assert!(!home.as_os_str().is_empty());
 
-        match original {
-            Some(val) => env::set_var(key, val),
-            None => {}
+        if let Some(val) = original {
+            env::set_var(key, val);
         }
     }
 

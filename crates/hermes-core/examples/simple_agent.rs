@@ -33,6 +33,7 @@ impl HermesTool for EchoTool {
     fn schema(&self) -> ToolSchema {
         #[derive(JsonSchema, Deserialize)]
         #[serde(rename_all = "camelCase")]
+        #[allow(dead_code)]
         struct EchoArgs {
             message: String,
         }
@@ -65,6 +66,7 @@ impl HermesTool for CalculatorTool {
     fn schema(&self) -> ToolSchema {
         #[derive(JsonSchema, Deserialize)]
         #[serde(rename_all = "camelCase")]
+        #[allow(dead_code)]
         struct CalcArgs {
             operation: String,
             a: f64,

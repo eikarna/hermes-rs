@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::error::Result;
 
 /// Configuration for the gateway
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GatewayConfig {
     /// Enable Telegram bot
     pub telegram_enabled: bool,
@@ -34,21 +34,7 @@ pub struct GatewayConfig {
     pub admins: Vec<String>,
 }
 
-impl Default for GatewayConfig {
-    fn default() -> Self {
-        Self {
-            telegram_enabled: false,
-            telegram_token: None,
-            discord_enabled: false,
-            discord_token: None,
-            slack_enabled: false,
-            slack_token: None,
-            webhooks_enabled: false,
-            webhooks_addr: None,
-            admins: Vec::new(),
-        }
-    }
-}
+
 
 /// Incoming message from a platform
 #[derive(Debug, Clone)]
@@ -333,7 +319,7 @@ impl PlatformAdapter for TelegramAdapter {
         // Verify the token by getting bot info
         let client = reqwest::Client::new();
         let response = client
-            .get(&format!("{}/getMe", self.api_url()))
+            .get(format!("{}/getMe", self.api_url()))
             .send()
             .await?;
 
@@ -369,7 +355,7 @@ impl PlatformAdapter for TelegramAdapter {
         }
 
         client
-            .post(&format!("{}/sendMessage", self.api_url()))
+            .post(format!("{}/sendMessage", self.api_url()))
             .json(&body)
             .send()
             .await?;
@@ -466,7 +452,7 @@ impl PlatformAdapter for DiscordAdapter {
         // Verify the token
         let client = reqwest::Client::new();
         let response = client
-            .get(&format!("{}/users/@me", self.api_url()))
+            .get(format!("{}/users/@me", self.api_url()))
             .header(
                 "Authorization",
                 format!("Bot {}", self.token.as_ref().unwrap()),

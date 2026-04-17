@@ -71,13 +71,11 @@ impl ToolSchema {
                     if let Some(reqs) = required.as_array() {
                         let required_keys: Vec<&str> =
                             reqs.iter().filter_map(|v| v.as_str()).collect();
-                        if required_keys.contains(&key.as_str()) {
-                            if !args.get(key).is_some() {
-                                return Err(Error::InvalidToolArgs {
-                                    name: self.name.clone(),
-                                    details: format!("Missing required field: {}", key),
-                                });
-                            }
+                        if required_keys.contains(&key.as_str()) && args.get(key).is_none() {
+                            return Err(Error::InvalidToolArgs {
+                                name: self.name.clone(),
+                                details: format!("Missing required field: {}", key),
+                            });
                         }
                     }
                 }
@@ -224,6 +222,7 @@ mod tests {
 
     #[derive(JsonSchema)]
     #[serde(rename_all = "camelCase")]
+    #[allow(dead_code)]
     struct TestParams {
         query: String,
         limit: Option<i32>,

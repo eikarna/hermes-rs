@@ -123,19 +123,13 @@ pub trait HermesTool: Send + Sync {
 }
 
 /// Context passed to tool execution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolContext {
     /// Additional metadata about the execution
     pub metadata: HashMap<String, String>,
 }
 
-impl Default for ToolContext {
-    fn default() -> Self {
-        Self {
-            metadata: HashMap::new(),
-        }
-    }
-}
+
 
 impl ToolContext {
     /// Create a new context with metadata
@@ -374,6 +368,7 @@ mod tests {
 
     #[derive(JsonSchema, Deserialize)]
     #[serde(rename_all = "camelCase")]
+    #[allow(dead_code)]
     struct TestArgs {
         query: String,
         limit: Option<i32>,

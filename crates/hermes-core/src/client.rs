@@ -461,41 +461,34 @@ impl Stream for ChatStreamResponse {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        loop {
-            // Try to find a complete SSE event in the buffer
-            if let Some(event_end) = this.buffer.find("\n\n") {
-                let event_data = this.buffer[..event_end].to_string();
-                this.buffer = this.buffer[event_end + 2..].to_string();
+        while let Some(event_end) = this.buffer.find("\n\n") {
+            let event_data = this.buffer[..event_end].to_string();
+            this.buffer = this.buffer[event_end + 2..].to_string();
 
-                // Parse SSE event format: "data: {...}\n\n"
-                for line in event_data.lines() {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data == "[DONE]" {
-                            return Poll::Ready(None);
-                        }
+            // Parse SSE event format: "data: {...}\n\n"
+            for line in event_data.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data == "[DONE]" {
+                        return Poll::Ready(None);
+                    }
 
-                        match serde_json::from_str::<ChatStreamEvent>(data.trim()) {
-                            Ok(event) => return Poll::Ready(Some(Ok(event))),
-                            Err(e) => {
-                                // Try to recover by looking for partial JSON
-                                if let Some(json_start) = data.find('{') {
-                                    let potential_json = &data[json_start..];
-                                    if let Ok(event) =
-                                        serde_json::from_str::<ChatStreamEvent>(potential_json)
-                                    {
-                                        return Poll::Ready(Some(Ok(event)));
-                                    }
+                    match serde_json::from_str::<ChatStreamEvent>(data.trim()) {
+                        Ok(event) => return Poll::Ready(Some(Ok(event))),
+                        Err(e) => {
+                            // Try to recover by looking for partial JSON
+                            if let Some(json_start) = data.find('{') {
+                                let potential_json = &data[json_start..];
+                                if let Ok(event) =
+                                    serde_json::from_str::<ChatStreamEvent>(potential_json)
+                                {
+                                    return Poll::Ready(Some(Ok(event)));
                                 }
-                                // If parsing fails, continue to get more data
-                                debug!(error = %e, "Failed to parse SSE event, will retry");
                             }
+                            // If parsing fails, continue to get more data
+                            debug!(error = %e, "Failed to parse SSE event, will retry");
                         }
                     }
                 }
-                // Continue loop to look for more events
-            } else {
-                // No complete event, need to read more data
-                break;
             }
         }
 

@@ -302,11 +302,12 @@ async fn run_agent(
 
     let registry = build_registry();
 
-    let mut agent_config = AgentConfig::default();
-    agent_config.model = config.model.clone().unwrap_or_else(|| cli.model.clone());
-    agent_config.max_iterations = config.max_iterations.unwrap_or(cli.max_iterations);
-    agent_config.tool_timeout =
-        Duration::from_secs(config.tool_timeout.unwrap_or(cli.tool_timeout));
+    let mut agent_config = AgentConfig {
+        model: config.model.clone().unwrap_or_else(|| cli.model.clone()),
+        max_iterations: config.max_iterations.unwrap_or(cli.max_iterations),
+        tool_timeout: Duration::from_secs(config.tool_timeout.unwrap_or(cli.tool_timeout)),
+        ..AgentConfig::default()
+    };
 
     if let Some(ref prompt) = config.system_prompt {
         agent_config.system_prompt = Some(prompt.clone());
@@ -407,13 +408,15 @@ async fn chat_mode(cli: &Cli, config: &FileConfig, system_prompt: Option<&str>) 
     let client = OpenAIClient::new(client_config);
     let registry = build_registry();
 
-    let mut agent_config = AgentConfig::default();
-    agent_config.model = config.model.clone().unwrap_or_else(|| cli.model.clone());
-    agent_config.max_iterations = config.max_iterations.unwrap_or(cli.max_iterations);
-    agent_config.system_prompt = config
-        .system_prompt
-        .clone()
-        .or(system_prompt.map(String::from));
+    let agent_config = AgentConfig {
+        model: config.model.clone().unwrap_or_else(|| cli.model.clone()),
+        max_iterations: config.max_iterations.unwrap_or(cli.max_iterations),
+        system_prompt: config
+            .system_prompt
+            .clone()
+            .or(system_prompt.map(String::from)),
+        ..AgentConfig::default()
+    };
 
     let agent = HermesAgent::new(agent_config, client, registry);
 

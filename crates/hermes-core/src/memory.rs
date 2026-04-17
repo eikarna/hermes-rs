@@ -403,8 +403,8 @@ impl MemoryStore {
                                 preferences.insert(key, value);
                             }
                         }
-                        "facts" => {
-                            if trimmed.starts_with('[') {
+                        "facts"
+                            if trimmed.starts_with('[') => {
                                 if let Some(bracket_end) = trimmed.find(']') {
                                     let fact_type = trimmed[1..bracket_end].to_string();
                                     let fact_content =
@@ -416,7 +416,6 @@ impl MemoryStore {
                                     ));
                                 }
                             }
-                        }
                         _ => {}
                     }
                 }

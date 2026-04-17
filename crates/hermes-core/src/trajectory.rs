@@ -108,7 +108,7 @@ impl Trajectory {
         self.total_tokens = self
             .messages
             .iter()
-            .map(|m| crate::context::estimate_message_tokens(m))
+            .map(crate::context::estimate_message_tokens)
             .sum();
     }
 
