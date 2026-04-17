@@ -1,0 +1,79 @@
+//! Built-in tools for Hermes-RS
+//!
+//! This module aggregates all built-in tools and provides a convenient
+//! function to register them all with a ToolRegistry.
+
+use crate::error::Result;
+use crate::tools::ToolRegistry;
+
+pub use super::file_tools::{FileReadTool, FileWriteTool, FileSearchTool, FileListTool};
+pub use super::terminal_tool::TerminalTool;
+pub use super::web_tools::{WebSearchTool, WebFetchTool};
+pub use super::code_execution::CodeExecutionTool;
+pub use super::memory_tools::{MemoryStoreTool, MemorySearchTool, MemoryRecallTool};
+pub use super::http_tool::HttpRequestTool;
+pub use super::datetime_tool::{DateTimeTool, TimestampTool};
+pub use super::todo_tool::TodoTool;
+pub use super::clarify_tool::ClarifyTool;
+pub use super::patch_tool::PatchTool;
+
+/// Register all built-in tools with a registry
+pub async fn register_builtin_tools(registry: &ToolRegistry) -> Result<()> {
+    registry.register(FileReadTool).await?;
+    registry.register(FileWriteTool).await?;
+    registry.register(FileSearchTool).await?;
+    registry.register(FileListTool).await?;
+    registry.register(TerminalTool).await?;
+    registry.register(WebSearchTool).await?;
+    registry.register(WebFetchTool).await?;
+    registry.register(CodeExecutionTool).await?;
+    registry.register(MemoryStoreTool).await?;
+    registry.register(MemorySearchTool).await?;
+    registry.register(MemoryRecallTool).await?;
+    registry.register(HttpRequestTool).await?;
+    registry.register(DateTimeTool).await?;
+    registry.register(TimestampTool).await?;
+    registry.register(TodoTool).await?;
+    registry.register(ClarifyTool).await?;
+    registry.register(PatchTool).await?;
+
+    Ok(())
+}
+
+/// Get a list of all built-in tool names
+pub fn builtin_tool_names() -> Vec<&'static str> {
+    vec![
+        "file_read",
+        "file_write",
+        "file_search",
+        "file_list",
+        "terminal",
+        "web_search",
+        "web_fetch",
+        "code_execution",
+        "memory_store",
+        "memory_search",
+        "memory_recall",
+        "http_request",
+        "datetime",
+        "timestamp",
+        "todo",
+        "clarify",
+        "patch",
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_register_all_builtin_tools() {
+        let registry = ToolRegistry::new(Duration::from_secs(5));
+        register_builtin_tools(&registry).await.unwrap();
+
+        let schemas = registry.get_schemas().await;
+        assert_eq!(schemas.len(), builtin_tool_names().len());
+    }
+}

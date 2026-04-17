@@ -1,0 +1,44 @@
+[package]
+name = "hermes-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Core library for Hermes-RS: A high-performance ReAct agent framework"
+readme = "README.md"
+keywords = ["ai", "agent", "llm", "hermes", "react"]
+categories = ["ai", "asynchronous", "network-programming"]
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+pin-project = { workspace = true }
+
+# Networking
+reqwest = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+regex = "1.10"
+lazy_static = "1.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockito = "1.4"
+tracing-subscriber = { workspace = true }

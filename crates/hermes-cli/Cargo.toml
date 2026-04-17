@@ -1,0 +1,39 @@
+[package]
+name = "hermes-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI for Hermes-RS: A high-performance ReAct agent framework"
+readme = "README.md"
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[dependencies]
+# Core library
+hermes-core = { path = "../hermes-core" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+
+# CLI
+clap = { workspace = true, features = ["derive"] }
+config = { workspace = true }
+
+# Serialization
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+anyhow = { workspace = true }
+dirs = "5.0"
