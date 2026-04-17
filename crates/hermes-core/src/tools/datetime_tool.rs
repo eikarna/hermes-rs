@@ -214,9 +214,7 @@ fn is_leap_year(year: u64) -> bool {
 /// Parse a date string to Unix timestamp (simplified)
 fn parse_date(date: &str) -> Result<u64, String> {
     // Try ISO 8601 format first: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
-    let parts: Vec<&str> = date
-        .split(['-', 'T', ':', 'Z', '+', ' '])
-        .collect();
+    let parts: Vec<&str> = date.split(['-', 'T', ':', 'Z', '+', ' ']).collect();
 
     if parts.len() >= 3 {
         let year: u64 = parts[0].parse().map_err(|_| "Invalid year")?;

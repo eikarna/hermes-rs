@@ -34,8 +34,6 @@ pub struct GatewayConfig {
     pub admins: Vec<String>,
 }
 
-
-
 /// Incoming message from a platform
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {

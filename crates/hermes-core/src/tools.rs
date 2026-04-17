@@ -129,8 +129,6 @@ pub struct ToolContext {
     pub metadata: HashMap<String, String>,
 }
 
-
-
 impl ToolContext {
     /// Create a new context with metadata
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {

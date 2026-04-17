@@ -372,12 +372,12 @@ mod tests {
 
     #[test]
     fn test_hermes_subdir_names() {
-        let home = hermes_home();
-        assert_eq!(hermes_config_dir(), home.join("config"));
-        assert_eq!(hermes_data_dir(), home.join("data"));
-        assert_eq!(hermes_memories_dir(), home.join("memories"));
-        assert_eq!(hermes_skills_dir(), home.join("skills"));
-        assert_eq!(hermes_sessions_dir(), home.join("sessions"));
+        // Verify suffix only — avoids race with tests that modify HERMES_HOME.
+        assert!(hermes_config_dir().ends_with("config"));
+        assert!(hermes_data_dir().ends_with("data"));
+        assert!(hermes_memories_dir().ends_with("memories"));
+        assert!(hermes_skills_dir().ends_with("skills"));
+        assert!(hermes_sessions_dir().ends_with("sessions"));
     }
 
     // -- File permissions ---------------------------------------------------

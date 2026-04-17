@@ -403,19 +403,17 @@ impl MemoryStore {
                                 preferences.insert(key, value);
                             }
                         }
-                        "facts"
-                            if trimmed.starts_with('[') => {
-                                if let Some(bracket_end) = trimmed.find(']') {
-                                    let fact_type = trimmed[1..bracket_end].to_string();
-                                    let fact_content =
-                                        trimmed[bracket_end + 1..].trim().to_string();
-                                    facts.push(MemoryBlock::new(
-                                        format!("{}_{}", user_id, facts.len()),
-                                        fact_type,
-                                        fact_content,
-                                    ));
-                                }
+                        "facts" if trimmed.starts_with('[') => {
+                            if let Some(bracket_end) = trimmed.find(']') {
+                                let fact_type = trimmed[1..bracket_end].to_string();
+                                let fact_content = trimmed[bracket_end + 1..].trim().to_string();
+                                facts.push(MemoryBlock::new(
+                                    format!("{}_{}", user_id, facts.len()),
+                                    fact_type,
+                                    fact_content,
+                                ));
                             }
+                        }
                         _ => {}
                     }
                 }
