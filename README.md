@@ -201,3 +201,9 @@ match result {
 ## License
 
 MIT OR Apache-2.0
+
+## Credits & Attribution
+
+This project is a Rust implementation of the [Hermes-Agent](https://github.com/nousresearch/hermes-agent) originally developed by [Nous Research](https://nousresearch.com). 
+
+While this is a "pure Rust" rewrite, the orchestration logic, system prompts, and architecture are based on the original work. This project is an unofficial community port and is not affiliated with or endorsed by Nous Research.
