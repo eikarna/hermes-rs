@@ -279,17 +279,14 @@ impl Gateway {
     }
 
     /// Send a message to a specific platform
-    pub async fn send_to_platform(
-        &self,
-        platform: &str,
-        message: OutgoingMessage,
-    ) -> Result<()> {
+    pub async fn send_to_platform(&self, platform: &str, message: OutgoingMessage) -> Result<()> {
         let adapter = match self.adapters.get(platform) {
             Some(a) => a,
             None => {
-                return Err(crate::error::Error::Agent(
-                    format!("Unknown platform: {}", platform)
-                ));
+                return Err(crate::error::Error::Agent(format!(
+                    "Unknown platform: {}",
+                    platform
+                )));
             }
         };
 
@@ -345,7 +342,7 @@ impl PlatformAdapter for TelegramAdapter {
             Ok(())
         } else {
             Err(crate::error::Error::Agent(
-                "Failed to verify Telegram bot token".to_string()
+                "Failed to verify Telegram bot token".to_string(),
             ))
         }
     }
@@ -404,21 +401,24 @@ impl PlatformAdapter for TelegramAdapter {
             return Ok(None);
         }
 
-        Ok(Some(IncomingMessage::new(
-            "telegram",
-            from.and_then(|f| f.get("id"))
-                .and_then(|id| id.as_i64())
-                .map(|i| i.to_string())
-                .unwrap_or_default(),
-            from.and_then(|f| f.get("username"))
-                .and_then(|u| u.as_str())
-                .unwrap_or("unknown"),
-            chat.get("id")
-                .and_then(|id| id.as_i64())
-                .map(|i| i.to_string())
-                .unwrap_or_default(),
-            content,
-        ).with_raw(update)))
+        Ok(Some(
+            IncomingMessage::new(
+                "telegram",
+                from.and_then(|f| f.get("id"))
+                    .and_then(|id| id.as_i64())
+                    .map(|i| i.to_string())
+                    .unwrap_or_default(),
+                from.and_then(|f| f.get("username"))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("unknown"),
+                chat.get("id")
+                    .and_then(|id| id.as_i64())
+                    .map(|i| i.to_string())
+                    .unwrap_or_default(),
+                content,
+            )
+            .with_raw(update),
+        ))
     }
 
     fn config_json(&self) -> serde_json::Value {
@@ -467,7 +467,10 @@ impl PlatformAdapter for DiscordAdapter {
         let client = reqwest::Client::new();
         let response = client
             .get(&format!("{}/users/@me", self.api_url()))
-            .header("Authorization", format!("Bot {}", self.token.as_ref().unwrap()))
+            .header(
+                "Authorization",
+                format!("Bot {}", self.token.as_ref().unwrap()),
+            )
             .send()
             .await?;
 
@@ -476,7 +479,7 @@ impl PlatformAdapter for DiscordAdapter {
             Ok(())
         } else {
             Err(crate::error::Error::Agent(
-                "Failed to verify Discord bot token".to_string()
+                "Failed to verify Discord bot token".to_string(),
             ))
         }
     }
@@ -493,11 +496,18 @@ impl PlatformAdapter for DiscordAdapter {
             "content": message.content,
         });
 
-        let url = format!("{}/channels/{}/messages", self.api_url(), message.channel_id);
+        let url = format!(
+            "{}/channels/{}/messages",
+            self.api_url(),
+            message.channel_id
+        );
 
         client
             .post(&url)
-            .header("Authorization", format!("Bot {}", self.token.as_ref().unwrap()))
+            .header(
+                "Authorization",
+                format!("Bot {}", self.token.as_ref().unwrap()),
+            )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -534,17 +544,22 @@ impl PlatformAdapter for DiscordAdapter {
             .unwrap_or_default()
             .to_string();
 
-        Ok(Some(IncomingMessage::new(
-            "discord",
-            author.get("id")
-                .and_then(|id| id.as_str())
-                .unwrap_or("unknown"),
-            author.get("username")
-                .and_then(|u| u.as_str())
-                .unwrap_or("unknown"),
-            channel_id,
-            content,
-        ).with_raw(update)))
+        Ok(Some(
+            IncomingMessage::new(
+                "discord",
+                author
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("unknown"),
+                author
+                    .get("username")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("unknown"),
+                channel_id,
+                content,
+            )
+            .with_raw(update),
+        ))
     }
 
     fn config_json(&self) -> serde_json::Value {
@@ -568,7 +583,11 @@ impl SlackAdapter {
     /// Create a new Slack adapter
     pub fn new(token: Option<String>, signing_secret: Option<String>) -> Self {
         let enabled = token.is_some();
-        Self { token, enabled, _signing_secret: signing_secret }
+        Self {
+            token,
+            enabled,
+            _signing_secret: signing_secret,
+        }
     }
 }
 
@@ -606,7 +625,10 @@ impl PlatformAdapter for SlackAdapter {
 
         client
             .post("https://slack.com/api/chat.postMessage")
-            .header("Authorization", format!("Bearer {}", self.token.as_ref().unwrap()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.token.as_ref().unwrap()),
+            )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -622,7 +644,8 @@ impl PlatformAdapter for SlackAdapter {
             None => return Ok(None),
         };
 
-        let msg_type = event.get("type")
+        let msg_type = event
+            .get("type")
             .and_then(|t| t.as_str())
             .unwrap_or_default();
 
@@ -630,17 +653,20 @@ impl PlatformAdapter for SlackAdapter {
             return Ok(None);
         }
 
-        let user = event.get("user")
+        let user = event
+            .get("user")
             .and_then(|u| u.as_str())
             .unwrap_or_default()
             .to_string();
 
-        let content = event.get("text")
+        let content = event
+            .get("text")
             .and_then(|t| t.as_str())
             .unwrap_or_default()
             .to_string();
 
-        let channel = event.get("channel")
+        let channel = event
+            .get("channel")
             .and_then(|c| c.as_str())
             .unwrap_or_default()
             .to_string();
@@ -649,13 +675,9 @@ impl PlatformAdapter for SlackAdapter {
             return Ok(None);
         }
 
-        Ok(Some(IncomingMessage::new(
-            "slack",
-            user.clone(),
-            user,
-            channel,
-            content,
-        ).with_raw(update)))
+        Ok(Some(
+            IncomingMessage::new("slack", user.clone(), user, channel, content).with_raw(update),
+        ))
     }
 
     fn config_json(&self) -> serde_json::Value {
@@ -673,13 +695,7 @@ mod tests {
 
     #[test]
     fn test_incoming_message() {
-        let msg = IncomingMessage::new(
-            "telegram",
-            "12345",
-            "testuser",
-            "67890",
-            "Hello, world!",
-        );
+        let msg = IncomingMessage::new("telegram", "12345", "testuser", "67890", "Hello, world!");
 
         assert_eq!(msg.platform, "telegram");
         assert_eq!(msg.user_id, "12345");

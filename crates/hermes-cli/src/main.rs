@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hermes_core::agent::{AgentConfig, HermesAgent, AgentEvent};
-use hermes_core::client::{OpenAIClient, ClientConfig};
+use hermes_core::agent::{AgentConfig, AgentEvent, HermesAgent};
+use hermes_core::client::{ClientConfig, OpenAIClient};
 use hermes_core::tools::{HermesTool, ToolContext, ToolRegistry};
 use serde::Deserialize;
 use serde_json::Value;
@@ -37,15 +37,18 @@ impl HermesTool for EchoTool {
 
     fn schema(&self) -> hermes_core::schema::ToolSchema {
         use schemars::JsonSchema;
-        
+
         #[derive(JsonSchema, Deserialize)]
         #[serde(rename_all = "camelCase")]
         #[allow(dead_code)]
         struct EchoArgs {
             message: String,
         }
-        
-        hermes_core::schema::ToolSchema::from_type::<EchoArgs>("echo", "Echo back the input message")
+
+        hermes_core::schema::ToolSchema::from_type::<EchoArgs>(
+            "echo",
+            "Echo back the input message",
+        )
     }
 
     async fn execute(&self, args: Value, _context: ToolContext) -> hermes_core::tools::ToolResult {
@@ -78,7 +81,7 @@ impl HermesTool for CalculatorTool {
 
     fn schema(&self) -> hermes_core::schema::ToolSchema {
         use schemars::JsonSchema;
-        
+
         #[derive(JsonSchema, Deserialize)]
         #[serde(rename_all = "camelCase")]
         #[allow(dead_code)]
@@ -87,12 +90,13 @@ impl HermesTool for CalculatorTool {
             a: f64,
             b: f64,
         }
-        
+
         hermes_core::schema::ToolSchema::from_type::<CalcArgs>("calculate", "Perform calculations")
     }
 
     async fn execute(&self, args: Value, _context: ToolContext) -> hermes_core::tools::ToolResult {
-        let op = args.get("operation")
+        let op = args
+            .get("operation")
             .and_then(|v| v.as_str())
             .unwrap_or("add");
         let a = args.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -109,17 +113,22 @@ impl HermesTool for CalculatorTool {
                 a / b
             }
             _ => {
-                return hermes_core::tools::ToolResult::error("calculate", 
-                    format!("Unknown operation: {}", op));
+                return hermes_core::tools::ToolResult::error(
+                    "calculate",
+                    format!("Unknown operation: {}", op),
+                );
             }
         };
 
-        hermes_core::tools::ToolResult::success("calculate", serde_json::json!({
-            "operation": op,
-            "operand_a": a,
-            "operand_b": b,
-            "result": result
-        }))
+        hermes_core::tools::ToolResult::success(
+            "calculate",
+            serde_json::json!({
+                "operation": op,
+                "operand_a": a,
+                "operand_b": b,
+                "result": result
+            }),
+        )
     }
 }
 
@@ -149,7 +158,12 @@ struct Cli {
     api_key: Option<String>,
 
     /// OpenAI base URL
-    #[arg(long, global = true, env = "OPENAI_BASE_URL", default_value = "https://api.openai.com/v1")]
+    #[arg(
+        long,
+        global = true,
+        env = "OPENAI_BASE_URL",
+        default_value = "https://api.openai.com/v1"
+    )]
     base_url: String,
 
     /// Model to use
@@ -221,9 +235,12 @@ struct FileConfig {
 impl FileConfig {
     fn merge_with(&self, cli: &Cli) -> ClientConfig {
         let api_key = self.api_key.clone().or(cli.api_key.clone());
-        
+
         ClientConfig {
-            base_url: self.base_url.clone().unwrap_or_else(|| cli.base_url.clone()),
+            base_url: self
+                .base_url
+                .clone()
+                .unwrap_or_else(|| cli.base_url.clone()),
             api_key,
             timeout: Duration::from_secs(60),
             max_context_length: 128_000,
@@ -247,21 +264,22 @@ fn init_logging(verbose: bool, level: &str) {
         .with_line_number(true)
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set tracing subscriber");
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 }
 
 /// Build the tool registry with built-in tools
 fn build_registry() -> ToolRegistry {
     let registry = ToolRegistry::new(Duration::from_secs(30));
-    
+
     // Register all built-in tools (file, terminal, web, code, memory, http, datetime, todo, clarify, patch)
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(async {
-            hermes_core::tools::register_builtin_tools(&registry).await.unwrap();
+            hermes_core::tools::register_builtin_tools(&registry)
+                .await
+                .unwrap();
             // Also register CLI-specific demo tools
             registry.register(EchoTool::new()).await.unwrap();
             registry.register(CalculatorTool::new()).await.unwrap();
@@ -287,9 +305,8 @@ async fn run_agent(
     let mut agent_config = AgentConfig::default();
     agent_config.model = config.model.clone().unwrap_or_else(|| cli.model.clone());
     agent_config.max_iterations = config.max_iterations.unwrap_or(cli.max_iterations);
-    agent_config.tool_timeout = Duration::from_secs(
-        config.tool_timeout.unwrap_or(cli.tool_timeout)
-    );
+    agent_config.tool_timeout =
+        Duration::from_secs(config.tool_timeout.unwrap_or(cli.tool_timeout));
 
     if let Some(ref prompt) = config.system_prompt {
         agent_config.system_prompt = Some(prompt.clone());
@@ -300,12 +317,7 @@ async fn run_agent(
     // Create event channel for streaming output
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(100);
 
-    let agent = HermesAgent::with_events(
-        agent_config,
-        client,
-        registry,
-        event_tx,
-    );
+    let agent = HermesAgent::with_events(agent_config, client, registry, event_tx);
 
     // Spawn task to handle events
     tokio::spawn(async move {
@@ -368,12 +380,15 @@ async fn list_tools(verbose: bool) -> Result<()> {
     }
 
     println!("Available tools ({} total):\n", tools.len());
-    
+
     for (i, tool) in tools.iter().enumerate() {
         println!("{}. {}: {}", i + 1, tool.name, tool.description);
-        
+
         if verbose {
-            println!("   Schema: {}", serde_json::to_string_pretty(&tool.parameters).unwrap_or_default());
+            println!(
+                "   Schema: {}",
+                serde_json::to_string_pretty(&tool.parameters).unwrap_or_default()
+            );
         }
         println!();
     }
@@ -395,7 +410,9 @@ async fn chat_mode(cli: &Cli, config: &FileConfig, system_prompt: Option<&str>) 
     let mut agent_config = AgentConfig::default();
     agent_config.model = config.model.clone().unwrap_or_else(|| cli.model.clone());
     agent_config.max_iterations = config.max_iterations.unwrap_or(cli.max_iterations);
-    agent_config.system_prompt = config.system_prompt.clone()
+    agent_config.system_prompt = config
+        .system_prompt
+        .clone()
         .or(system_prompt.map(String::from));
 
     let agent = HermesAgent::new(agent_config, client, registry);
@@ -437,7 +454,12 @@ async fn chat_mode(cli: &Cli, config: &FileConfig, system_prompt: Option<&str>) 
 }
 
 /// Test a specific tool
-async fn test_tool(_cli: &Cli, _config: &FileConfig, tool_name: &str, args: Option<&str>) -> Result<()> {
+async fn test_tool(
+    _cli: &Cli,
+    _config: &FileConfig,
+    tool_name: &str,
+    args: Option<&str>,
+) -> Result<()> {
     let registry = build_registry();
 
     // Check if tool exists
@@ -447,17 +469,24 @@ async fn test_tool(_cli: &Cli, _config: &FileConfig, tool_name: &str, args: Opti
 
     // Parse arguments
     let parsed_args: Value = if let Some(args_str) = args {
-        serde_json::from_str(args_str)
-            .context("Failed to parse tool arguments as JSON")?
+        serde_json::from_str(args_str).context("Failed to parse tool arguments as JSON")?
     } else {
         Value::Object(serde_json::Map::new())
     };
 
     println!("Testing tool: {}", tool_name);
-    println!("Arguments: {}", serde_json::to_string_pretty(&parsed_args).unwrap_or_default());
+    println!(
+        "Arguments: {}",
+        serde_json::to_string_pretty(&parsed_args).unwrap_or_default()
+    );
 
     let result = registry
-        .execute(tool_name, &format!("test_{}", tool_name), parsed_args, ToolContext::default())
+        .execute(
+            tool_name,
+            &format!("test_{}", tool_name),
+            parsed_args,
+            ToolContext::default(),
+        )
         .await?;
 
     println!("\nResult:");
@@ -484,11 +513,12 @@ async fn main() -> Result<()> {
     let config = if let Some(ref config_path) = cli.config {
         let contents = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-        
-        let ext = config_path.extension()
+
+        let ext = config_path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("yaml");
-        
+
         match ext {
             "json" => serde_json::from_str(&contents)?,
             _ => serde_yaml::from_str(&contents)?,
@@ -529,7 +559,8 @@ async fn main() -> Result<()> {
     // Execute command
     match &cli.command {
         Commands::Run { system, query } => {
-            let query = query.as_ref()
+            let query = query
+                .as_ref()
                 .context("No query provided. Use --query or enter interactive mode.")?;
             run_agent(&cli, &config, system.as_deref(), query).await?;
         }

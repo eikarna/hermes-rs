@@ -4,11 +4,11 @@
 //! user profiles, and context block injection.
 
 use crate::client::Message;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 /// A memory block that can be injected into context
@@ -32,7 +32,11 @@ pub struct MemoryBlock {
 
 impl MemoryBlock {
     /// Create a new memory block
-    pub fn new(id: impl Into<String>, block_type: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        block_type: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -498,7 +502,10 @@ impl MemoryManager {
         let session_id = format!("session_{}", uuid_simple());
         let session = Session::new(&session_id, title);
 
-        self.sessions.write().await.insert(session_id.clone(), session);
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
         *self.current_session.write().await = Some(session_id.clone());
         self.session_messages.write().await.clear();
 
@@ -574,7 +581,9 @@ impl MemoryManager {
             .values()
             .filter(|m| {
                 m.content.to_lowercase().contains(&query_lower)
-                    || m.tags.iter().any(|t| t.to_lowercase().contains(&query_lower))
+                    || m.tags
+                        .iter()
+                        .any(|t| t.to_lowercase().contains(&query_lower))
             })
             .cloned()
             .collect()
@@ -606,7 +615,10 @@ impl MemoryManager {
     /// When `storage_dir` is set, automatically persists to USER.md on disk.
     pub async fn save_profile(&self, profile: UserProfile) {
         debug!(user_id = %profile.user_id, "Saving user profile");
-        self.profiles.write().await.insert(profile.user_id.clone(), profile);
+        self.profiles
+            .write()
+            .await
+            .insert(profile.user_id.clone(), profile);
         if self.storage_dir.is_some() {
             let _ = self.save_to_disk().await;
         }
@@ -749,9 +761,19 @@ mod tests {
     async fn test_search() {
         let manager = MemoryManager::new();
 
-        manager.store(MemoryBlock::new("1", "fact", "Rivers flow downhill")).await;
-        manager.store(MemoryBlock::new("2", "fact", "The sky is blue")).await;
-        manager.store(MemoryBlock::new("3", "preference", "User prefers dark mode")).await;
+        manager
+            .store(MemoryBlock::new("1", "fact", "Rivers flow downhill"))
+            .await;
+        manager
+            .store(MemoryBlock::new("2", "fact", "The sky is blue"))
+            .await;
+        manager
+            .store(MemoryBlock::new(
+                "3",
+                "preference",
+                "User prefers dark mode",
+            ))
+            .await;
 
         let results = manager.search("river").await;
         assert_eq!(results.len(), 1);
@@ -965,7 +987,11 @@ mod tests {
             last_accessed: 600,
             tags: vec!["lang".to_string()],
         };
-        manager.long_term.write().await.insert("persist1".to_string(), block);
+        manager
+            .long_term
+            .write()
+            .await
+            .insert("persist1".to_string(), block);
 
         let profile = UserProfile {
             user_id: "bob".to_string(),
@@ -977,7 +1003,11 @@ mod tests {
             },
             facts: Vec::new(),
         };
-        manager.profiles.write().await.insert("bob".to_string(), profile);
+        manager
+            .profiles
+            .write()
+            .await
+            .insert("bob".to_string(), profile);
 
         manager.save_to_disk().await.unwrap();
 
@@ -991,7 +1021,10 @@ mod tests {
 
         let loaded_profile = manager2.get_profile("bob").await;
         assert!(loaded_profile.is_some());
-        assert_eq!(loaded_profile.as_ref().unwrap().name, Some("Bob".to_string()));
+        assert_eq!(
+            loaded_profile.as_ref().unwrap().name,
+            Some("Bob".to_string())
+        );
         assert_eq!(
             loaded_profile.unwrap().preferences.get("editor").unwrap(),
             "vim"

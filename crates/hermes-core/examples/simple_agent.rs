@@ -74,7 +74,10 @@ impl HermesTool for CalculatorTool {
     }
 
     async fn execute(&self, args: Value, _context: ToolContext) -> ToolResult {
-        let op = args.get("operation").and_then(|v| v.as_str()).unwrap_or("+");
+        let op = args
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("+");
         let a = args.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let b = args.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
@@ -149,7 +152,8 @@ async fn main() -> Result<()> {
         tool_timeout: Duration::from_secs(30),
         system_prompt: Some(
             "You are a helpful assistant with access to echo and calculate tools. \
-Use the echo tool to repeat information and the calculate tool for math.".to_string(),
+Use the echo tool to repeat information and the calculate tool for math."
+                .to_string(),
         ),
         stream: true,
         context_window: 128_000,
@@ -176,5 +180,5 @@ Use the echo tool to repeat information and the calculate tool for math.".to_str
         }
     }
 
-Ok(())
+    Ok(())
 }

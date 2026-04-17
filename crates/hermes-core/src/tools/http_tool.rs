@@ -3,9 +3,9 @@
 //! Tool for making HTTP requests with full control over headers, method, and body.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use schemars::JsonSchema;
 use std::collections::HashMap;
 
 use crate::schema::ToolSchema;
@@ -41,7 +41,9 @@ impl HermesTool for HttpRequestTool {
     async fn execute(&self, args: Value, _context: ToolContext) -> ToolResult {
         let args: HttpRequestArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error("http_request", format!("Invalid arguments: {}", e)),
+            Err(e) => {
+                return ToolResult::error("http_request", format!("Invalid arguments: {}", e))
+            }
         };
 
         // Validate URL
@@ -56,12 +58,11 @@ impl HermesTool for HttpRequestTool {
 
         let timeout = std::time::Duration::from_secs(args.timeout.unwrap_or(30));
 
-        let client = match reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-        {
+        let client = match reqwest::Client::builder().timeout(timeout).build() {
             Ok(c) => c,
-            Err(e) => return ToolResult::error("http_request", format!("Failed to create client: {}", e)),
+            Err(e) => {
+                return ToolResult::error("http_request", format!("Failed to create client: {}", e))
+            }
         };
 
         let method = args.method.as_deref().unwrap_or("GET").to_uppercase();
@@ -73,7 +74,12 @@ impl HermesTool for HttpRequestTool {
             "PATCH" => client.patch(&args.url),
             "HEAD" => client.head(&args.url),
             "OPTIONS" => client.request(reqwest::Method::OPTIONS, &args.url),
-            _ => return ToolResult::error("http_request", format!("Unsupported HTTP method: {}", method)),
+            _ => {
+                return ToolResult::error(
+                    "http_request",
+                    format!("Unsupported HTTP method: {}", method),
+                )
+            }
         };
 
         // Add headers
@@ -102,29 +108,27 @@ impl HermesTool for HttpRequestTool {
                 let response_headers: HashMap<String, String> = response
                     .headers()
                     .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.to_string(),
-                            v.to_str().unwrap_or("").to_string(),
-                        )
-                    })
+                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect();
 
                 // Get body
                 let body_size = response.content_length();
                 let body = response.text().await.ok();
 
-                ToolResult::success("http_request", serde_json::json!({
-                    "url": args.url,
-                    "method": method,
-                    "status_code": status.as_u16(),
-                    "status_text": status.canonical_reason().unwrap_or(""),
-                    "version": version,
-                    "headers": response_headers,
-                    "body": body,
-                    "body_size": body_size,
-                    "response_time_ms": elapsed.as_millis() as u64
-                }))
+                ToolResult::success(
+                    "http_request",
+                    serde_json::json!({
+                        "url": args.url,
+                        "method": method,
+                        "status_code": status.as_u16(),
+                        "status_text": status.canonical_reason().unwrap_or(""),
+                        "version": version,
+                        "headers": response_headers,
+                        "body": body,
+                        "body_size": body_size,
+                        "response_time_ms": elapsed.as_millis() as u64
+                    }),
+                )
             }
             Err(e) => {
                 let error_type = if e.is_timeout() {
@@ -135,12 +139,16 @@ impl HermesTool for HttpRequestTool {
                     "request_error"
                 };
 
-                ToolResult::error("http_request", serde_json::json!({
-                    "error": e.to_string(),
-                    "error_type": error_type,
-                    "url": args.url,
-                    "method": method
-                }).to_string())
+                ToolResult::error(
+                    "http_request",
+                    serde_json::json!({
+                        "error": e.to_string(),
+                        "error_type": error_type,
+                        "url": args.url,
+                        "method": method
+                    })
+                    .to_string(),
+                )
             }
         }
     }

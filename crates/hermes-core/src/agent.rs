@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::client::{ChatStreamEvent, ChatStreamResponse, OpenAIClient, ToolCall, Message};
+use crate::client::{ChatStreamEvent, ChatStreamResponse, Message, OpenAIClient, ToolCall};
 use crate::error::{Error, Result};
 use crate::parser::{ToolCallParser, ToolCallStreamParser};
 use crate::tools::{ToolContext, ToolRegistry, ToolResult};
@@ -68,8 +68,6 @@ pub enum AgentEvent {
     /// Agent error
     Error { error: String },
 }
-
-
 
 /// Hermes Agent for tool orchestration
 pub struct HermesAgent {
@@ -162,15 +160,19 @@ impl HermesAgent {
 
             // Emit thinking event
             self.emit(AgentEvent::Thinking {
-                content: format!("Iteration {}/{}: Requesting LLM response...", 
-                    iteration, self.config.max_iterations)
-            }).await;
+                content: format!(
+                    "Iteration {}/{}: Requesting LLM response...",
+                    iteration, self.config.max_iterations
+                ),
+            })
+            .await;
 
             // Get tool schemas
             let tools = self.registry.get_schemas().await;
 
             // Make streaming request
-            let stream = self.client
+            let stream = self
+                .client
                 .chat_streaming(&self.config.model, &messages, Some(&tools))
                 .await?;
 
@@ -181,35 +183,37 @@ impl HermesAgent {
                     let assistant_msg = if tool_calls.is_empty() {
                         Message::assistant(&response_text)
                     } else {
-                        Message::assistant(&response_text)
-                            .with_tool_calls(tool_calls.clone())
+                        Message::assistant(&response_text).with_tool_calls(tool_calls.clone())
                     };
-                    
+
                     messages.push(assistant_msg.clone());
                     self.add_message(assistant_msg.clone()).await;
 
-// If no tool calls, we're done
-            if tool_calls.is_empty() {
-                let result = assistant_msg.clone();
-                self.emit(AgentEvent::Done {
-                    message: assistant_msg
-                }).await;
-                return Ok(result);
-            }
+                    // If no tool calls, we're done
+                    if tool_calls.is_empty() {
+                        let result = assistant_msg.clone();
+                        self.emit(AgentEvent::Done {
+                            message: assistant_msg,
+                        })
+                        .await;
+                        return Ok(result);
+                    }
 
                     // Execute tools and add results
                     let tool_results = self.execute_tools(tool_calls).await?;
-                    
+
                     for result in &tool_results {
                         if result.success {
                             self.emit(AgentEvent::ToolComplete {
-                                result: result.clone()
-                            }).await;
+                                result: result.clone(),
+                            })
+                            .await;
                         } else {
                             self.emit(AgentEvent::ToolError {
                                 name: result.tool_call_id.clone(),
-                                error: result.error.clone().unwrap_or_default()
-                            }).await;
+                                error: result.error.clone().unwrap_or_default(),
+                            })
+                            .await;
                         }
                     }
 
@@ -217,13 +221,20 @@ impl HermesAgent {
                     for result in tool_results {
                         messages.push(Message::tool(
                             &result.tool_call_id,
-                            if result.success { &result.content } else { result.error.as_deref().unwrap_or("Error") }
+                            if result.success {
+                                &result.content
+                            } else {
+                                result.error.as_deref().unwrap_or("Error")
+                            },
                         ));
                     }
                 }
                 Err(e) => {
                     error!(error = %e, "Error processing stream");
-                    self.emit(AgentEvent::Error { error: e.to_string() }).await;
+                    self.emit(AgentEvent::Error {
+                        error: e.to_string(),
+                    })
+                    .await;
                     return Err(e);
                 }
             }
@@ -257,19 +268,18 @@ impl HermesAgent {
         Ok(messages)
     }
 
-/// Process streaming response with early tool detection
-async fn process_stream(
-    &self,
-    mut stream: ChatStreamResponse,
-) -> Result<(String, Vec<ToolCall>)> {
-    let _parser = ToolCallStreamParser::new()
-        .on_tool_call(|tc| {
+    /// Process streaming response with early tool detection
+    async fn process_stream(
+        &self,
+        mut stream: ChatStreamResponse,
+    ) -> Result<(String, Vec<ToolCall>)> {
+        let _parser = ToolCallStreamParser::new().on_tool_call(|tc| {
             let tc_id = tc.id.clone();
             debug!(tool_call_id = %tc_id, name = %tc.function.name, "Early tool call detected");
         });
-    let mut accumulated_text = String::new();
-    let mut tool_calls = Vec::new();
-    let mut has_error = false;
+        let mut accumulated_text = String::new();
+        let mut tool_calls = Vec::new();
+        let mut has_error = false;
 
         while let Some(event_result) = stream.next().await {
             match event_result {
@@ -301,7 +311,7 @@ async fn process_stream(
         // Also try to extract any remaining tool calls from accumulated text
         let mut remaining_parser = ToolCallParser::new();
         let remaining_calls = remaining_parser.parse(&accumulated_text)?;
-        
+
         // Merge tool calls, avoiding duplicates
         for tc in remaining_calls {
             if !tool_calls.iter().any(|existing| existing.id == tc.id) {
@@ -319,7 +329,7 @@ async fn process_stream(
         for tool_call in tool_calls {
             let name = tool_call.function.name.clone();
             let args_str = tool_call.function.arguments.clone();
-            
+
             debug!(tool = %name, args = %args_str, "Executing tool");
 
             // Parse arguments
@@ -327,7 +337,10 @@ async fn process_stream(
                 Ok(a) => a,
                 Err(e) => {
                     warn!(tool = %name, error = %e, "Failed to parse tool arguments");
-                    results.push(ToolResult::error(&tool_call.id, format!("Invalid JSON: {}", e)));
+                    results.push(ToolResult::error(
+                        &tool_call.id,
+                        format!("Invalid JSON: {}", e),
+                    ));
                     continue;
                 }
             };
@@ -335,15 +348,20 @@ async fn process_stream(
             // Validate tool exists
             if !self.registry.contains(&name).await {
                 error!(tool = %name, "Tool not found");
-                results.push(ToolResult::error(&tool_call.id, format!("Tool '{}' not found", name)));
+                results.push(ToolResult::error(
+                    &tool_call.id,
+                    format!("Tool '{}' not found", name),
+                ));
                 continue;
             }
 
             // Execute with timeout
             let result = timeout(
                 self.config.tool_timeout,
-                self.registry.execute(&name, &tool_call.id, args, ToolContext::default())
-            ).await;
+                self.registry
+                    .execute(&name, &tool_call.id, args, ToolContext::default()),
+            )
+            .await;
 
             match result {
                 Ok(Ok(r)) => {
@@ -356,8 +374,10 @@ async fn process_stream(
                 }
                 Err(_) => {
                     error!(tool = %name, "Tool execution timed out");
-                    results.push(ToolResult::error(&tool_call.id, 
-                        format!("Tool timed out after {:?}", self.config.tool_timeout)));
+                    results.push(ToolResult::error(
+                        &tool_call.id,
+                        format!("Tool timed out after {:?}", self.config.tool_timeout),
+                    ));
                 }
             }
         }
@@ -365,7 +385,7 @@ async fn process_stream(
         Ok(results)
     }
 
-/// Run agent and handle self-healing on tool errors
+    /// Run agent and handle self-healing on tool errors
     pub async fn run_with_healing(&self, user_query: String) -> Result<Message> {
         let mut iteration = 0;
         let max_healing_attempts = 3;
@@ -377,14 +397,14 @@ async fn process_stream(
                 Ok(response) => return Ok(response),
                 Err(e) if e.is_self_healing() && iteration <= max_healing_attempts => {
                     warn!(iteration, error = %e, "Self-healing: re-prompting LLM");
-                    
+
                     // Add error context as a system message
                     let error_msg = format!(
                         "Note: The previous attempt encountered an error: {}. \
                         Please correct your approach and try again.",
                         e.user_message()
                     );
-                    
+
                     self.add_message(Message::system(&error_msg)).await;
                 }
                 Err(e) => {
@@ -399,13 +419,13 @@ async fn process_stream(
 /// Extract text content from a streaming event
 fn extract_text_from_event(event: &ChatStreamEvent) -> Option<String> {
     let mut text = String::new();
-    
+
     for choice in &event.choices {
         if let Some(content) = &choice.delta.content {
             text.push_str(content);
         }
     }
-    
+
     if text.is_empty() {
         None
     } else {
@@ -416,14 +436,17 @@ fn extract_text_from_event(event: &ChatStreamEvent) -> Option<String> {
 /// Extract tool calls from a streaming event
 fn extract_tool_calls_from_event(event: &ChatStreamEvent) -> Vec<ToolCall> {
     let mut tool_calls: Vec<ToolCall> = Vec::new();
-    
+
     for choice in &event.choices {
         if let Some(delta_tool_calls) = &choice.delta.tool_calls {
             for delta in delta_tool_calls {
                 if let Some(ref function) = delta.function {
                     // Extract the tool call ID
-                    let id = delta.id.clone().unwrap_or_else(|| format!("call_{}", tool_calls.len()));
-                    
+                    let id = delta
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
+
                     // Create or update tool call
                     if let Some(last) = tool_calls.last_mut() {
                         if last.id == id {
@@ -432,20 +455,20 @@ fn extract_tool_calls_from_event(event: &ChatStreamEvent) -> Vec<ToolCall> {
                             continue;
                         }
                     }
-                    
-// New tool call
-            tool_calls.push(ToolCall {
-                id: id.clone(),
-                function: crate::client::ToolCallFunction {
-                    name: function.name.clone(),
-                    arguments: function.arguments.clone(),
-                },
-            });
+
+                    // New tool call
+                    tool_calls.push(ToolCall {
+                        id: id.clone(),
+                        function: crate::client::ToolCallFunction {
+                            name: function.name.clone(),
+                            arguments: function.arguments.clone(),
+                        },
+                    });
                 }
             }
         }
     }
-    
+
     tool_calls
 }
 
@@ -515,12 +538,13 @@ impl HermesAgentBuilder {
 
     /// Build the agent
     pub fn build(self) -> Result<HermesAgent> {
-        let client = self.client
-            .unwrap_or_else(|| OpenAIClient::from_env().unwrap_or_else(|_| {
-                OpenAIClient::new(crate::client::ClientConfig::default())
-            }));
-        
-        let registry = self.registry
+        let client = self.client.unwrap_or_else(|| {
+            OpenAIClient::from_env()
+                .unwrap_or_else(|_| OpenAIClient::new(crate::client::ClientConfig::default()))
+        });
+
+        let registry = self
+            .registry
             .unwrap_or_else(|| ToolRegistry::new(self.config.tool_timeout));
 
         Ok(HermesAgent::new(self.config, client, registry))
@@ -544,26 +568,25 @@ mod tests {
         assert_eq!(config.max_iterations, 20);
     }
 
-#[tokio::test]
-async fn test_agent_builder() {
-    let _agent = HermesAgentBuilder::new()
-        .model("gpt-3.5-turbo")
-        .max_iterations(10)
-        .build()
-        .unwrap();
+    #[tokio::test]
+    async fn test_agent_builder() {
+        let _agent = HermesAgentBuilder::new()
+            .model("gpt-3.5-turbo")
+            .max_iterations(10)
+            .build()
+            .unwrap();
 
-    // If we reach here, the agent was created successfully
-}
+        // If we reach here, the agent was created successfully
+    }
 
-#[test]
-fn test_extract_text_from_event() {
-    let event = ChatStreamEvent {
-        id: "test".to_string(),
-        object: "chat.completion.chunk".to_string(),
-        created: 0,
-        model: "test".to_string(),
-        choices: vec![
-            crate::client::StreamChoice {
+    #[test]
+    fn test_extract_text_from_event() {
+        let event = ChatStreamEvent {
+            id: "test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "test".to_string(),
+            choices: vec![crate::client::StreamChoice {
                 index: 0,
                 delta: crate::client::StreamingMessageDelta {
                     role: None,
@@ -571,11 +594,10 @@ fn test_extract_text_from_event() {
                     tool_calls: None,
                 },
                 finish_reason: None,
-            }
-        ],
-    };
+            }],
+        };
 
-    let text = extract_text_from_event(&event);
-    assert_eq!(text, Some("Hello ".to_string()));
-}
+        let text = extract_text_from_event(&event);
+        assert_eq!(text, Some("Hello ".to_string()));
+    }
 }

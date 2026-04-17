@@ -3,9 +3,9 @@
 //! Tools for getting current time and timestamps.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use schemars::JsonSchema;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::schema::ToolSchema;
@@ -66,17 +66,22 @@ impl HermesTool for DateTimeTool {
             }
         };
 
-        let format = args.format.unwrap_or_else(|| "%Y-%m-%d %H:%M:%S".to_string());
+        let format = args
+            .format
+            .unwrap_or_else(|| "%Y-%m-%d %H:%M:%S".to_string());
         let dt = format_datetime(local_secs, nsecs, &format);
 
-        ToolResult::success("datetime", serde_json::json!({
-            "timestamp": utc_secs,
-            "nanoseconds": nsecs,
-            "formatted": dt,
-            "timezone": tz_label,
-            "timezone_offset_seconds": offset_secs,
-            "unix_timestamp": utc_secs
-        }))
+        ToolResult::success(
+            "datetime",
+            serde_json::json!({
+                "timestamp": utc_secs,
+                "nanoseconds": nsecs,
+                "formatted": dt,
+                "timezone": tz_label,
+                "timezone_offset_seconds": offset_secs,
+                "unix_timestamp": utc_secs
+            }),
+        )
     }
 }
 
@@ -131,12 +136,15 @@ impl HermesTool for TimestampTool {
             (ts, unit)
         };
 
-        ToolResult::success("timestamp", serde_json::json!({
-            "timestamp": timestamp,
-            "unit": unit,
-            "datetime": format_datetime(timestamp, 0, "%Y-%m-%d %H:%M:%S"),
-            "iso8601": format_datetime(timestamp, 0, "%Y-%m-%dT%H:%M:%SZ")
-        }))
+        ToolResult::success(
+            "timestamp",
+            serde_json::json!({
+                "timestamp": timestamp,
+                "unit": unit,
+                "datetime": format_datetime(timestamp, 0, "%Y-%m-%d %H:%M:%S"),
+                "iso8601": format_datetime(timestamp, 0, "%Y-%m-%dT%H:%M:%SZ")
+            }),
+        )
     }
 }
 
@@ -184,7 +192,11 @@ fn days_to_date(days: u64) -> (u64, u8, u8) {
     let days_in_months = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut month = 1;
     for (i, &dim) in days_in_months.iter().enumerate() {
-        let days_in_this_month = if i == 1 && is_leap_year(year) { 29 } else { dim };
+        let days_in_this_month = if i == 1 && is_leap_year(year) {
+            29
+        } else {
+            dim
+        };
         if remaining_days < days_in_this_month as i64 {
             break;
         }
@@ -202,7 +214,9 @@ fn is_leap_year(year: u64) -> bool {
 /// Parse a date string to Unix timestamp (simplified)
 fn parse_date(date: &str) -> Result<u64, String> {
     // Try ISO 8601 format first: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
-    let parts: Vec<&str> = date.split(|c| c == '-' || c == 'T' || c == ':' || c == 'Z' || c == '+' || c == ' ').collect();
+    let parts: Vec<&str> = date
+        .split(|c| c == '-' || c == 'T' || c == ':' || c == 'Z' || c == '+' || c == ' ')
+        .collect();
 
     if parts.len() >= 3 {
         let year: u64 = parts[0].parse().map_err(|_| "Invalid year")?;
@@ -290,20 +304,20 @@ fn parse_timezone_offset(tz: &str) -> i64 {
         "CST_CHINA" | "CCT" => 8 * 3600,
         "HKT" => 8 * 3600,
         "SGT" => 8 * 3600,
-        "IST" => 5 * 3600 + 1800,     // India +5:30
-        "ICT" => 7 * 3600,             // Indochina (Thailand, Vietnam)
-        "WIB" => 7 * 3600,             // Western Indonesia
+        "IST" => 5 * 3600 + 1800, // India +5:30
+        "ICT" => 7 * 3600,        // Indochina (Thailand, Vietnam)
+        "WIB" => 7 * 3600,        // Western Indonesia
         "CET" => 3600,
         "CEST" => 2 * 3600,
         "EET" => 2 * 3600,
         "EEST" => 3 * 3600,
         "MSK" => 3 * 3600,
-        "GST" => 4 * 3600,             // Gulf Standard Time
+        "GST" => 4 * 3600, // Gulf Standard Time
         "PKT" => 5 * 3600,
-        "BST" => 3600,                  // British Summer Time
+        "BST" => 3600, // British Summer Time
         "AEST" => 10 * 3600,
         "AEDT" => 11 * 3600,
-        "ACST" => 9 * 3600 + 1800,     // Australian Central +9:30
+        "ACST" => 9 * 3600 + 1800, // Australian Central +9:30
         "AWST" => 8 * 3600,
         "NZST" => 12 * 3600,
         "NZDT" => 13 * 3600,

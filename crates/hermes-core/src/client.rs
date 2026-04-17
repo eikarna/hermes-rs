@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::Stream;
-use reqwest::{Client, header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE}};
+use reqwest::{
+    header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE},
+    Client,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, instrument};
@@ -81,12 +84,9 @@ impl OpenAIClient {
     /// Build authorization headers
     fn build_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        
+
         // Content type
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         // Authorization
         if let Some(ref api_key) = self.config.api_key {
@@ -117,11 +117,12 @@ impl OpenAIClient {
         tools: Option<&[ToolSchema]>,
     ) -> Result<ChatResponse> {
         let request = self.build_chat_request(model, messages, tools, false)?;
-        
+
         let url = self.build_url("")?;
         let headers = self.build_headers()?;
-        
-        let response = self.http_client
+
+        let response = self
+            .http_client
             .post(url)
             .headers(headers)
             .json(&request)
@@ -152,11 +153,12 @@ impl OpenAIClient {
         tools: Option<&[ToolSchema]>,
     ) -> Result<ChatStreamResponse> {
         let request = self.build_chat_request(model, messages, tools, true)?;
-        
+
         let url = self.build_url("")?;
         let headers = self.build_headers()?;
-        
-        let response = self.http_client
+
+        let response = self
+            .http_client
             .post(url)
             .headers(headers)
             .json(&request)
@@ -291,7 +293,7 @@ impl Message {
     fn to_value(&self) -> Value {
         let mut map = serde_json::Map::new();
         map.insert("role".to_string(), json!(self.role.as_str()));
-        
+
         if let Some(ref tool_calls) = self.tool_calls {
             let tc_array: Vec<Value> = tool_calls
                 .iter()
@@ -443,7 +445,9 @@ pub struct ChatStreamResponse {
 }
 
 impl ChatStreamResponse {
-    pub fn new(stream: impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + Unpin + 'static) -> Self {
+    pub fn new(
+        stream: impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
+    ) -> Self {
         Self {
             inner: Box::new(stream),
             buffer: String::new(),
@@ -476,7 +480,9 @@ impl Stream for ChatStreamResponse {
                                 // Try to recover by looking for partial JSON
                                 if let Some(json_start) = data.find('{') {
                                     let potential_json = &data[json_start..];
-                                    if let Ok(event) = serde_json::from_str::<ChatStreamEvent>(potential_json) {
+                                    if let Ok(event) =
+                                        serde_json::from_str::<ChatStreamEvent>(potential_json)
+                                    {
                                         return Poll::Ready(Some(Ok(event)));
                                     }
                                 }
@@ -577,7 +583,7 @@ mod tests {
     fn test_message_to_value() {
         let msg = Message::user("Hello, world!");
         let value = msg.to_value();
-        
+
         assert_eq!(value["role"], "user");
         assert_eq!(value["content"], "Hello, world!");
     }
@@ -586,7 +592,7 @@ mod tests {
     fn test_tool_message() {
         let msg = Message::tool("call_123", "Result: 42");
         let value = msg.to_value();
-        
+
         assert_eq!(value["role"], "tool");
         assert_eq!(value["tool_call_id"], "call_123");
     }

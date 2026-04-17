@@ -3,9 +3,9 @@
 //! Provides secure code execution in a sandboxed environment.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use schemars::JsonSchema;
 use std::collections::HashMap;
 use std::process::Stdio;
 
@@ -51,11 +51,15 @@ impl HermesTool for CodeExecutionTool {
     async fn execute(&self, args: Value, _context: ToolContext) -> ToolResult {
         let args: CodeExecutionArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error("code_execution", format!("Invalid arguments: {}", e)),
+            Err(e) => {
+                return ToolResult::error("code_execution", format!("Invalid arguments: {}", e))
+            }
         };
 
         let timeout = std::time::Duration::from_secs(
-            args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(MAX_TIMEOUT_SECS)
+            args.timeout
+                .unwrap_or(DEFAULT_TIMEOUT_SECS)
+                .min(MAX_TIMEOUT_SECS),
         );
 
         let result = match args.language.to_lowercase().as_str() {
@@ -63,7 +67,12 @@ impl HermesTool for CodeExecutionTool {
             "javascript" | "js" | "node" => execute_javascript(&args.code, timeout).await,
             "shell" | "bash" | "sh" => execute_shell(&args.code, timeout).await,
             "rust" | "rs" => execute_rust(&args.code, timeout).await,
-            _ => return ToolResult::error("code_execution", format!("Unsupported language: {}", args.language)),
+            _ => {
+                return ToolResult::error(
+                    "code_execution",
+                    format!("Unsupported language: {}", args.language),
+                )
+            }
         };
 
         match result {
@@ -73,9 +82,12 @@ impl HermesTool for CodeExecutionTool {
     }
 }
 
-async fn execute_python(code: &str, timeout: std::time::Duration) -> Result<serde_json::Value, String> {
-    use tokio::process::Command;
+async fn execute_python(
+    code: &str,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
 
     // Create a temp file for the code
     let temp_dir = std::env::temp_dir();
@@ -84,14 +96,16 @@ async fn execute_python(code: &str, timeout: std::time::Duration) -> Result<serd
     std::fs::write(&script_path, code)
         .map_err(|e| format!("Failed to write temp script: {}", e))?;
 
-    let python_cmd = crate::platform::find_python()
-        .unwrap_or_else(|| std::path::PathBuf::from("python3"));
+    let python_cmd =
+        crate::platform::find_python().unwrap_or_else(|| std::path::PathBuf::from("python3"));
     let mut cmd = Command::new(&python_cmd);
     cmd.arg(script_path.to_str().unwrap_or("script.py"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn python: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn python: {}", e))?;
 
     let start = std::time::Instant::now();
     let stdout = child.stdout.take();
@@ -103,27 +117,28 @@ async fn execute_python(code: &str, timeout: std::time::Duration) -> Result<serd
     // Read outputs
     if let Some(stdout) = stdout {
         let mut reader = BufReader::new(stdout).lines();
-while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-        stdout_output.push_str(&line);
-        stdout_output.push('\n');
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            stdout_output.push_str(&line);
+            stdout_output.push('\n');
+        }
     }
+
+    if let Some(stderr) = stderr {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            stderr_output.push_str(&line);
+            stderr_output.push('\n');
+        }
     }
 
-if let Some(stderr) = stderr {
-    let mut reader = BufReader::new(stderr).lines();
-    while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-        stderr_output.push_str(&line);
-        stderr_output.push('\n');
-    }
-}
+    let status = tokio::time::timeout(timeout, child.wait())
+        .await
+        .map_err(|_| "Command timed out")?
+        .map_err(|e| format!("Failed to wait: {}", e))?;
 
-let status = tokio::time::timeout(timeout, child.wait()).await
-    .map_err(|_| "Command timed out")?
-    .map_err(|e| format!("Failed to wait: {}", e))?;
+    let runtime = start.elapsed();
 
-let runtime = start.elapsed();
-
-// Clean up temp file
+    // Clean up temp file
     let _ = std::fs::remove_file(&script_path);
 
     Ok(serde_json::json!({
@@ -136,9 +151,12 @@ let runtime = start.elapsed();
     }))
 }
 
-async fn execute_javascript(code: &str, timeout: std::time::Duration) -> Result<serde_json::Value, String> {
-    use tokio::process::Command;
+async fn execute_javascript(
+    code: &str,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
 
     // Create a temp file for the code
     let temp_dir = std::env::temp_dir();
@@ -152,7 +170,9 @@ async fn execute_javascript(code: &str, timeout: std::time::Duration) -> Result<
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn node: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn node: {}", e))?;
 
     let start = std::time::Instant::now();
     let stdout = child.stdout.take();
@@ -163,27 +183,28 @@ async fn execute_javascript(code: &str, timeout: std::time::Duration) -> Result<
 
     if let Some(stdout) = stdout {
         let mut reader = BufReader::new(stdout).lines();
-while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-        stdout_output.push_str(&line);
-        stdout_output.push('\n');
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            stdout_output.push_str(&line);
+            stdout_output.push('\n');
+        }
     }
+
+    if let Some(stderr) = stderr {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            stderr_output.push_str(&line);
+            stderr_output.push('\n');
+        }
     }
 
-if let Some(stderr) = stderr {
-    let mut reader = BufReader::new(stderr).lines();
-    while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-        stderr_output.push_str(&line);
-        stderr_output.push('\n');
-    }
-}
+    let status = tokio::time::timeout(timeout, child.wait())
+        .await
+        .map_err(|_| "Command timed out")?
+        .map_err(|e| format!("Failed to wait: {}", e))?;
 
-let status = tokio::time::timeout(timeout, child.wait()).await
-    .map_err(|_| "Command timed out")?
-    .map_err(|e| format!("Failed to wait: {}", e))?;
+    let runtime = start.elapsed();
 
-let runtime = start.elapsed();
-
-let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&script_path);
 
     Ok(serde_json::json!({
         "language": "javascript",
@@ -195,9 +216,12 @@ let _ = std::fs::remove_file(&script_path);
     }))
 }
 
-async fn execute_shell(code: &str, timeout: std::time::Duration) -> Result<serde_json::Value, String> {
-    use tokio::process::Command;
+async fn execute_shell(
+    code: &str,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
 
     let shell = crate::platform::detect_shell();
     let mut cmd = {
@@ -212,7 +236,9 @@ async fn execute_shell(code: &str, timeout: std::time::Duration) -> Result<serde
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn shell: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn shell: {}", e))?;
 
     let start = std::time::Instant::now();
     let stdout = child.stdout.take();
@@ -223,27 +249,28 @@ async fn execute_shell(code: &str, timeout: std::time::Duration) -> Result<serde
 
     if let Some(stdout) = stdout {
         let mut reader = BufReader::new(stdout).lines();
-while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-        stdout_output.push_str(&line);
-        stdout_output.push('\n');
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            stdout_output.push_str(&line);
+            stdout_output.push('\n');
+        }
     }
+
+    if let Some(stderr) = stderr {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            stderr_output.push_str(&line);
+            stderr_output.push('\n');
+        }
     }
 
-if let Some(stderr) = stderr {
-    let mut reader = BufReader::new(stderr).lines();
-    while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-        stderr_output.push_str(&line);
-        stderr_output.push('\n');
-    }
-}
+    let status = tokio::time::timeout(timeout, child.wait())
+        .await
+        .map_err(|_| "Command timed out")?
+        .map_err(|e| format!("Failed to wait: {}", e))?;
 
-let status = tokio::time::timeout(timeout, child.wait()).await
-    .map_err(|_| "Command timed out")?
-    .map_err(|e| format!("Failed to wait: {}", e))?;
+    let runtime = start.elapsed();
 
-let runtime = start.elapsed();
-
-Ok(serde_json::json!({
+    Ok(serde_json::json!({
     "language": "shell",
         "exit_code": status.code(),
         "stdout": stdout_output,
@@ -253,10 +280,13 @@ Ok(serde_json::json!({
     }))
 }
 
-async fn execute_rust(code: &str, timeout: std::time::Duration) -> Result<serde_json::Value, String> {
+async fn execute_rust(
+    code: &str,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, String> {
     // Rust requires compilation, so we create a proper project
-    use tokio::process::Command;
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
 
     let temp_dir = std::env::temp_dir();
     let project_dir = temp_dir.join(format!("hermes_rust_{}", uuid_simple()));
@@ -291,9 +321,12 @@ path = "src/main.rs"
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut compile_child = cmd.spawn().map_err(|e| format!("Failed to spawn rustc: {}", e))?;
+    let mut compile_child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn rustc: {}", e))?;
 
-    let compile_status = tokio::time::timeout(timeout, compile_child.wait()).await
+    let compile_status = tokio::time::timeout(timeout, compile_child.wait())
+        .await
         .map_err(|_| "Compilation timed out")?
         .map_err(|e| format!("Compilation failed: {}", e))?;
 
@@ -323,7 +356,9 @@ path = "src/main.rs"
     run_cmd.stderr(Stdio::piped());
 
     let start = std::time::Instant::now();
-    let mut run_child = run_cmd.spawn().map_err(|e| format!("Failed to run binary: {}", e))?;
+    let mut run_child = run_cmd
+        .spawn()
+        .map_err(|e| format!("Failed to run binary: {}", e))?;
 
     let stdout = run_child.stdout.take();
     let stderr = run_child.stderr.take();
@@ -333,23 +368,24 @@ path = "src/main.rs"
 
     if let Some(stdout) = stdout {
         let mut reader = BufReader::new(stdout).lines();
-while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-        stdout_output.push_str(&line);
-        stdout_output.push('\n');
-    }
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            stdout_output.push_str(&line);
+            stdout_output.push('\n');
+        }
     }
 
-if let Some(stderr) = stderr {
-    let mut reader = BufReader::new(stderr).lines();
-    while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-        stderr_output.push_str(&line);
-        stderr_output.push('\n');
+    if let Some(stderr) = stderr {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            stderr_output.push_str(&line);
+            stderr_output.push('\n');
+        }
     }
-}
 
-let status = tokio::time::timeout(timeout, run_child.wait()).await
-    .map_err(|_| "Execution timed out")?
-    .map_err(|e| format!("Execution failed: {}", e))?;
+    let status = tokio::time::timeout(timeout, run_child.wait())
+        .await
+        .map_err(|_| "Execution timed out")?
+        .map_err(|e| format!("Execution failed: {}", e))?;
 
     let runtime = start.elapsed();
 

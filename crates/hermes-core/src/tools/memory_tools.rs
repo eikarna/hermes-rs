@@ -3,12 +3,12 @@
 //! Tools for storing, searching, and recalling memories.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use schemars::JsonSchema;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::HashMap;
 
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
@@ -58,7 +58,9 @@ impl HermesTool for MemoryStoreTool {
     async fn execute(&self, args: Value, _context: ToolContext) -> ToolResult {
         let args: MemoryStoreArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error("memory_store", format!("Invalid arguments: {}", e)),
+            Err(e) => {
+                return ToolResult::error("memory_store", format!("Invalid arguments: {}", e))
+            }
         };
 
         let now = std::time::SystemTime::now()
@@ -76,11 +78,14 @@ impl HermesTool for MemoryStoreTool {
 
         MEMORY_STORE.write().await.insert(args.key.clone(), entry);
 
-        ToolResult::success("memory_store", serde_json::json!({
-            "key": args.key,
-            "stored": true,
-            "timestamp": now
-        }))
+        ToolResult::success(
+            "memory_store",
+            serde_json::json!({
+                "key": args.key,
+                "stored": true,
+                "timestamp": now
+            }),
+        )
     }
 }
 
@@ -111,7 +116,9 @@ impl HermesTool for MemorySearchTool {
     async fn execute(&self, args: Value, _context: ToolContext) -> ToolResult {
         let args: MemorySearchArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error("memory_search", format!("Invalid arguments: {}", e)),
+            Err(e) => {
+                return ToolResult::error("memory_search", format!("Invalid arguments: {}", e))
+            }
         };
 
         let max_results = args.max_results.unwrap_or(10).min(50);
@@ -122,7 +129,10 @@ impl HermesTool for MemorySearchTool {
 
         for (key, entry) in store.iter() {
             let content_match = entry.content.to_lowercase().contains(&query_lower);
-            let tag_match = entry.tags.iter().any(|t| t.to_lowercase().contains(&query_lower));
+            let tag_match = entry
+                .tags
+                .iter()
+                .any(|t| t.to_lowercase().contains(&query_lower));
             let type_match = entry.block_type.to_lowercase().contains(&query_lower);
 
             if content_match || tag_match || type_match {
@@ -146,14 +156,19 @@ impl HermesTool for MemorySearchTool {
         results.sort_by(|a, b| {
             let relevance_a = a["relevance"].as_f64().unwrap_or(0.0);
             let relevance_b = b["relevance"].as_f64().unwrap_or(0.0);
-            relevance_b.partial_cmp(&relevance_a).unwrap_or(std::cmp::Ordering::Equal)
+            relevance_b
+                .partial_cmp(&relevance_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        ToolResult::success("memory_search", serde_json::json!({
-            "query": args.query,
-            "results": results,
-            "count": results.len()
-        }))
+        ToolResult::success(
+            "memory_search",
+            serde_json::json!({
+                "query": args.query,
+                "results": results,
+                "count": results.len()
+            }),
+        )
     }
 }
 
@@ -183,25 +198,33 @@ impl HermesTool for MemoryRecallTool {
     async fn execute(&self, args: Value, _context: ToolContext) -> ToolResult {
         let args: MemoryRecallArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error("memory_recall", format!("Invalid arguments: {}", e)),
+            Err(e) => {
+                return ToolResult::error("memory_recall", format!("Invalid arguments: {}", e))
+            }
         };
 
         let store = MEMORY_STORE.read().await;
 
         match store.get(&args.key) {
-            Some(entry) => ToolResult::success("memory_recall", serde_json::json!({
-                "key": args.key,
-                "content": entry.content,
-                "block_type": entry.block_type,
-                "importance": entry.importance,
-                "tags": entry.tags,
-                "created_at": entry.created_at,
-                "found": true
-            })),
-            None => ToolResult::success("memory_recall", serde_json::json!({
-                "key": args.key,
-                "found": false
-            })),
+            Some(entry) => ToolResult::success(
+                "memory_recall",
+                serde_json::json!({
+                    "key": args.key,
+                    "content": entry.content,
+                    "block_type": entry.block_type,
+                    "importance": entry.importance,
+                    "tags": entry.tags,
+                    "created_at": entry.created_at,
+                    "found": true
+                }),
+            ),
+            None => ToolResult::success(
+                "memory_recall",
+                serde_json::json!({
+                    "key": args.key,
+                    "found": false
+                }),
+            ),
         }
     }
 }

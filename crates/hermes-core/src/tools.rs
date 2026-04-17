@@ -6,25 +6,23 @@
 //! - Built-in tools for common operations
 
 pub mod builtin;
-pub mod file_tools;
-pub mod terminal_tool;
-pub mod web_tools;
-pub mod code_execution;
-pub mod memory_tools;
-pub mod http_tool;
-pub mod datetime_tool;
-pub mod todo_tool;
 pub mod clarify_tool;
+pub mod code_execution;
+pub mod datetime_tool;
+pub mod file_tools;
+pub mod http_tool;
+pub mod memory_tools;
 pub mod patch_tool;
+pub mod terminal_tool;
+pub mod todo_tool;
+pub mod web_tools;
 
 // Re-export commonly used types
 pub use builtin::{
-    register_builtin_tools, builtin_tool_names,
-    FileReadTool, FileWriteTool, FileSearchTool, FileListTool,
-    TerminalTool, WebSearchTool, WebFetchTool, CodeExecutionTool,
-    MemoryStoreTool, MemorySearchTool, MemoryRecallTool,
-    HttpRequestTool, DateTimeTool, TimestampTool,
-    TodoTool, ClarifyTool, PatchTool,
+    builtin_tool_names, register_builtin_tools, ClarifyTool, CodeExecutionTool, DateTimeTool,
+    FileListTool, FileReadTool, FileSearchTool, FileWriteTool, HttpRequestTool, MemoryRecallTool,
+    MemorySearchTool, MemoryStoreTool, PatchTool, TerminalTool, TimestampTool, TodoTool,
+    WebFetchTool, WebSearchTool,
 };
 
 use std::collections::HashMap;
@@ -183,16 +181,16 @@ impl ToolExecutor {
         args: Value,
         context: ToolContext,
     ) -> ToolResult {
-        let result = timeout(
-            self.timeout,
-            tool.execute(args, context),
-        ).await;
+        let result = timeout(self.timeout, tool.execute(args, context)).await;
 
         match result {
             Ok(result) => result,
             Err(_) => {
                 warn!(tool = %tool_name, timeout = ?self.timeout, "Tool execution timed out");
-                ToolResult::error(tool_call_id, format!("Tool timed out after {:?}", self.timeout))
+                ToolResult::error(
+                    tool_call_id,
+                    format!("Tool timed out after {:?}", self.timeout),
+                )
             }
         }
     }
@@ -292,14 +290,17 @@ impl ToolRegistry {
                 let name = tool_name.to_string();
                 let id = tool_call_id.to_string();
                 debug!(tool = %name, args = ?args, "Executing tool");
-                let result = self.executor
+                let result = self
+                    .executor
                     .execute_with_timeout(tool, name, id, args, context)
                     .await;
                 Ok(result)
             }
             None => {
                 error!(tool = %tool_name, "Tool not found in registry");
-                Err(Error::ToolNotFound { name: tool_name.to_string() })
+                Err(Error::ToolNotFound {
+                    name: tool_name.to_string(),
+                })
             }
         }
     }
@@ -328,7 +329,12 @@ async fn registry_worker(
 
     while let Some(cmd) = command_rx.recv().await {
         match cmd {
-            ToolCommand::Execute { tool_name, tool_call_id, args, response_tx } => {
+            ToolCommand::Execute {
+                tool_name,
+                tool_call_id,
+                args,
+                response_tx,
+            } => {
                 let tool = {
                     let tools = tools.read().await;
                     tools.get(&tool_name).cloned()
@@ -346,7 +352,9 @@ async fn registry_worker(
                             )
                             .await
                     }
-                    None => ToolResult::error(&tool_call_id, format!("Tool '{}' not found", tool_name)),
+                    None => {
+                        ToolResult::error(&tool_call_id, format!("Tool '{}' not found", tool_name))
+                    }
                 };
 
                 let _ = response_tx.send(result);
@@ -389,7 +397,10 @@ mod tests {
 
         async fn execute(&self, args: Value, _context: ToolContext) -> ToolResult {
             if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-                ToolResult::success("call_1", serde_json::json!({ "result": format!("Processed: {}", query) }))
+                ToolResult::success(
+                    "call_1",
+                    serde_json::json!({ "result": format!("Processed: {}", query) }),
+                )
             } else {
                 ToolResult::error("call_1", "Missing 'query' argument")
             }
@@ -437,7 +448,12 @@ mod tests {
         let registry = ToolRegistry::new(Duration::from_secs(5));
 
         let result = registry
-            .execute("nonexistent", "call_1", serde_json::json!({}), ToolContext::default())
+            .execute(
+                "nonexistent",
+                "call_1",
+                serde_json::json!({}),
+                ToolContext::default(),
+            )
             .await;
 
         assert!(result.is_err());

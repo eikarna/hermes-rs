@@ -5,9 +5,9 @@
 //! for the frontend/CLI layer to present to the user.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use schemars::JsonSchema;
 
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
@@ -57,7 +57,11 @@ impl HermesTool for ClarifyTool {
             Some(ref c) if c.len() > MAX_CHOICES => {
                 return ToolResult::error(
                     "clarify",
-                    format!("Too many choices: {} provided, maximum is {}", c.len(), MAX_CHOICES),
+                    format!(
+                        "Too many choices: {} provided, maximum is {}",
+                        c.len(),
+                        MAX_CHOICES
+                    ),
                 );
             }
             Some(c) => Some(c),

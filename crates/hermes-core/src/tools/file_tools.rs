@@ -3,10 +3,10 @@
 //! Tools for reading, writing, searching, and listing files.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
-use schemars::JsonSchema;
 
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
@@ -60,12 +60,15 @@ impl HermesTool for FileReadTool {
                 let lines: Vec<&str> = content.lines().skip(offset).take(limit).collect();
                 let result = lines.join("\n");
 
-                ToolResult::success("file_read", serde_json::json!({
-                    "path": args.path,
-                    "content": result,
-                    "length": result.len(),
-                    "total_lines": content.lines().count()
-                }))
+                ToolResult::success(
+                    "file_read",
+                    serde_json::json!({
+                        "path": args.path,
+                        "content": result,
+                        "length": result.len(),
+                        "total_lines": content.lines().count()
+                    }),
+                )
             }
             Err(e) => ToolResult::error("file_read", format!("Failed to read file: {}", e)),
         }
@@ -109,7 +112,10 @@ impl HermesTool for FileWriteTool {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    return ToolResult::error("file_write", format!("Failed to create directory: {}", e));
+                    return ToolResult::error(
+                        "file_write",
+                        format!("Failed to create directory: {}", e),
+                    );
                 }
             }
         }
@@ -130,11 +136,14 @@ impl HermesTool for FileWriteTool {
         match result {
             Ok(_) => {
                 let metadata = std::fs::metadata(&path).ok();
-                ToolResult::success("file_write", serde_json::json!({
-                    "path": args.path,
-                    "bytes_written": args.content.len(),
-                    "file_size": metadata.map(|m| m.len()).unwrap_or(0)
-                }))
+                ToolResult::success(
+                    "file_write",
+                    serde_json::json!({
+                        "path": args.path,
+                        "bytes_written": args.content.len(),
+                        "file_size": metadata.map(|m| m.len()).unwrap_or(0)
+                    }),
+                )
             }
             Err(e) => ToolResult::error("file_write", format!("Failed to write file: {}", e)),
         }
@@ -209,7 +218,11 @@ impl HermesTool for FileSearchTool {
                 if path.is_dir() {
                     // Skip hidden directories and common non-relevant dirs
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if !name.starts_with('.') && name != "node_modules" && name != "target" && name != "__pycache__" {
+                        if !name.starts_with('.')
+                            && name != "node_modules"
+                            && name != "target"
+                            && name != "__pycache__"
+                        {
                             search_recursive(&path, pattern, case_sensitive, results, max_results);
                         }
                     }
@@ -246,7 +259,13 @@ impl HermesTool for FileSearchTool {
         }
 
         if path.is_dir() {
-            search_recursive(&path, &pattern, args.case_sensitive.unwrap_or(true), &mut results, max_results);
+            search_recursive(
+                &path,
+                &pattern,
+                args.case_sensitive.unwrap_or(true),
+                &mut results,
+                max_results,
+            );
         } else if path.is_file() {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let search_pattern = if args.case_sensitive.unwrap_or(true) {
@@ -279,12 +298,15 @@ impl HermesTool for FileSearchTool {
             return ToolResult::error("file_search", format!("Path does not exist: {}", args.path));
         }
 
-        ToolResult::success("file_search", serde_json::json!({
-            "pattern": args.pattern,
-            "path": args.path,
-            "matches": results,
-            "count": results.len()
-        }))
+        ToolResult::success(
+            "file_search",
+            serde_json::json!({
+                "pattern": args.pattern,
+                "path": args.path,
+                "matches": results,
+                "count": results.len()
+            }),
+        )
     }
 }
 
@@ -326,7 +348,10 @@ impl HermesTool for FileListTool {
         }
 
         if !path.is_dir() {
-            return ToolResult::error("file_list", format!("Path is not a directory: {}", args.path));
+            return ToolResult::error(
+                "file_list",
+                format!("Path is not a directory: {}", args.path),
+            );
         }
 
         let mut entries = Vec::new();
@@ -386,14 +411,20 @@ impl HermesTool for FileListTool {
             match (a_is_dir, b_is_dir) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")),
+                _ => a["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["name"].as_str().unwrap_or("")),
             }
         });
 
-        ToolResult::success("file_list", serde_json::json!({
-            "path": args.path,
-            "entries": entries,
-            "count": entries.len()
-        }))
+        ToolResult::success(
+            "file_list",
+            serde_json::json!({
+                "path": args.path,
+                "entries": entries,
+                "count": entries.len()
+            }),
+        )
     }
 }

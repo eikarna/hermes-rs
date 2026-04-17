@@ -3,9 +3,9 @@
 //! Provides secure shell command execution capabilities.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use schemars::JsonSchema;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -54,7 +54,9 @@ impl HermesTool for TerminalTool {
         };
 
         let timeout = std::time::Duration::from_secs(
-            args.timeout.unwrap_or(MAX_TIMEOUT_SECS).min(MAX_TIMEOUT_SECS)
+            args.timeout
+                .unwrap_or(MAX_TIMEOUT_SECS)
+                .min(MAX_TIMEOUT_SECS),
         );
         let max_output = args.max_output.unwrap_or(MAX_OUTPUT_SIZE);
 
@@ -95,7 +97,9 @@ impl HermesTool for TerminalTool {
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => return ToolResult::error("terminal", format!("Failed to spawn process: {}", e)),
+            Err(e) => {
+                return ToolResult::error("terminal", format!("Failed to spawn process: {}", e))
+            }
         };
 
         let stdout = child.stdout.take();
@@ -104,23 +108,23 @@ impl HermesTool for TerminalTool {
         let mut stdout_output = String::new();
         let mut stderr_output = String::new();
 
-// Read stdout
-if let Some(stdout) = stdout {
-    let mut reader = BufReader::new(stdout).lines();
-    while let Ok(Ok(Some(l))) = tokio::time::timeout(timeout, reader.next_line()).await {
-        if stdout_output.len() + l.len() + 1 <= max_output {
-            stdout_output.push_str(&l);
-            stdout_output.push('\n');
-        } else if stdout_output.len() < max_output {
-            let remaining = max_output - stdout_output.len();
-            stdout_output.push_str(&l[..remaining.min(l.len())]);
-            stdout_output.push_str("\n[output truncated]");
-        } else {
-            stdout_output.push_str("\n[output truncated]");
-            break;
+        // Read stdout
+        if let Some(stdout) = stdout {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Ok(Some(l))) = tokio::time::timeout(timeout, reader.next_line()).await {
+                if stdout_output.len() + l.len() + 1 <= max_output {
+                    stdout_output.push_str(&l);
+                    stdout_output.push('\n');
+                } else if stdout_output.len() < max_output {
+                    let remaining = max_output - stdout_output.len();
+                    stdout_output.push_str(&l[..remaining.min(l.len())]);
+                    stdout_output.push_str("\n[output truncated]");
+                } else {
+                    stdout_output.push_str("\n[output truncated]");
+                    break;
+                }
+            }
         }
-    }
-}
 
         // Read stderr
         if let Some(stderr) = stderr {
@@ -136,31 +140,42 @@ if let Some(stdout) = stdout {
         // Wait for process to complete
         let status = match tokio::time::timeout(timeout, child.wait()).await {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => return ToolResult::error("terminal", format!("Failed to wait for process: {}", e)),
+            Ok(Err(e)) => {
+                return ToolResult::error("terminal", format!("Failed to wait for process: {}", e))
+            }
             Err(_) => {
                 let _ = child.kill().await;
-                return ToolResult::error("terminal", format!("Command timed out after {:?}", timeout));
+                return ToolResult::error(
+                    "terminal",
+                    format!("Command timed out after {:?}", timeout),
+                );
             }
         };
 
         let exit_code = status.code();
 
         if status.success() {
-            ToolResult::success("terminal", serde_json::json!({
-                "success": true,
-                "exit_code": exit_code,
-                "stdout": stdout_output,
-                "stderr": stderr_output,
-                "runtime": "Command completed successfully"
-            }))
+            ToolResult::success(
+                "terminal",
+                serde_json::json!({
+                    "success": true,
+                    "exit_code": exit_code,
+                    "stdout": stdout_output,
+                    "stderr": stderr_output,
+                    "runtime": "Command completed successfully"
+                }),
+            )
         } else {
-            ToolResult::success("terminal", serde_json::json!({
-                "success": false,
-                "exit_code": exit_code,
-                "stdout": stdout_output,
-                "stderr": stderr_output,
-                "runtime": "Command failed"
-            }))
+            ToolResult::success(
+                "terminal",
+                serde_json::json!({
+                    "success": false,
+                    "exit_code": exit_code,
+                    "stdout": stdout_output,
+                    "stderr": stderr_output,
+                    "runtime": "Command failed"
+                }),
+            )
         }
     }
 }

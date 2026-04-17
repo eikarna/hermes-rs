@@ -4,9 +4,9 @@
 //! Stores todos per session using a global lazy_static HashMap.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use schemars::JsonSchema;
 
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
@@ -34,7 +34,10 @@ pub struct TodoItem {
 impl TodoItem {
     /// Validate that the status is one of the allowed values
     fn is_valid_status(status: &str) -> bool {
-        matches!(status, "pending" | "in_progress" | "completed" | "cancelled")
+        matches!(
+            status,
+            "pending" | "in_progress" | "completed" | "cancelled"
+        )
     }
 }
 
@@ -107,11 +110,14 @@ impl HermesTool for TodoTool {
             store.insert(session_id.clone(), todos);
         }
 
-        ToolResult::success("todo", serde_json::json!({
-            "sessionId": session_id,
-            "count": count,
-            "todos": summary,
-        }))
+        ToolResult::success(
+            "todo",
+            serde_json::json!({
+                "sessionId": session_id,
+                "count": count,
+                "todos": summary,
+            }),
+        )
     }
 }
 

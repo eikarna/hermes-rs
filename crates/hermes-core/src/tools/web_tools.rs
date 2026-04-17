@@ -3,9 +3,9 @@
 //! Tools for searching the web and fetching web content.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use schemars::JsonSchema;
 
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
@@ -135,7 +135,10 @@ impl HermesTool for WebFetchTool {
         match reqwest::Url::parse(&args.url) {
             Ok(url) => {
                 if url.scheme() != "http" && url.scheme() != "https" {
-                    return ToolResult::error("web_fetch", "Only HTTP and HTTPS URLs are supported");
+                    return ToolResult::error(
+                        "web_fetch",
+                        "Only HTTP and HTTPS URLs are supported",
+                    );
                 }
             }
             Err(e) => return ToolResult::error("web_fetch", format!("Invalid URL: {}", e)),
@@ -143,9 +146,15 @@ impl HermesTool for WebFetchTool {
 
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(args.timeout.unwrap_or(30)))
-            .build() {
+            .build()
+        {
             Ok(c) => c,
-            Err(e) => return ToolResult::error("web_fetch", format!("Failed to create HTTP client: {}", e)),
+            Err(e) => {
+                return ToolResult::error(
+                    "web_fetch",
+                    format!("Failed to create HTTP client: {}", e),
+                )
+            }
         };
 
         let method = args.method.as_deref().unwrap_or("GET");
@@ -156,7 +165,12 @@ impl HermesTool for WebFetchTool {
             "DELETE" => client.delete(&args.url),
             "PATCH" => client.patch(&args.url),
             "HEAD" => client.head(&args.url),
-            _ => return ToolResult::error("web_fetch", format!("Unsupported HTTP method: {}", method)),
+            _ => {
+                return ToolResult::error(
+                    "web_fetch",
+                    format!("Unsupported HTTP method: {}", method),
+                )
+            }
         };
 
         // Add custom headers
@@ -185,17 +199,23 @@ impl HermesTool for WebFetchTool {
                 match response.text().await {
                     Ok(body) => {
                         let body_size = body.len();
-                        ToolResult::success("web_fetch", serde_json::json!({
-                            "url": args.url,
-                            "method": method,
-                            "status_code": status.as_u16(),
-                            "status_text": status.canonical_reason().unwrap_or(""),
-                            "headers": headers,
-                            "body": body,
-                            "body_size": body_size
-                        }))
+                        ToolResult::success(
+                            "web_fetch",
+                            serde_json::json!({
+                                "url": args.url,
+                                "method": method,
+                                "status_code": status.as_u16(),
+                                "status_text": status.canonical_reason().unwrap_or(""),
+                                "headers": headers,
+                                "body": body,
+                                "body_size": body_size
+                            }),
+                        )
                     }
-                    Err(e) => ToolResult::error("web_fetch", format!("Failed to read response body: {}", e)),
+                    Err(e) => ToolResult::error(
+                        "web_fetch",
+                        format!("Failed to read response body: {}", e),
+                    ),
                 }
             }
             Err(e) => ToolResult::error("web_fetch", format!("Request failed: {}", e)),

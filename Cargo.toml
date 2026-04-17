@@ -18,7 +18,7 @@ tokio = { version = "1.36", features = ["full"] }
 async-trait = "0.1"
 
 # Networking
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

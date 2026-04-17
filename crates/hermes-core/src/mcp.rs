@@ -205,10 +205,16 @@ impl McpClient {
             },
         };
 
-        let response = self.send_request("initialize", Some(serde_json::to_value(request)?)).await?;
+        let response = self
+            .send_request("initialize", Some(serde_json::to_value(request)?))
+            .await?;
 
-        let init_response: InitializeResponse = serde_json::from_value(response)
-            .map_err(|e| crate::error::Error::ParseResponse(format!("Failed to parse initialize response: {}", e)))?;
+        let init_response: InitializeResponse = serde_json::from_value(response).map_err(|e| {
+            crate::error::Error::ParseResponse(format!(
+                "Failed to parse initialize response: {}",
+                e
+            ))
+        })?;
 
         debug!(
             server = %init_response.server_info.name,
@@ -252,10 +258,12 @@ impl McpClient {
     /// List tools from the server
     pub async fn list_tools(&self) -> Result<Vec<McpToolDefinition>> {
         let response = self.send_request("tools/list", None).await?;
-        let tool_list: ToolListResult = serde_json::from_value(response)
-            .map_err(|e| crate::error::Error::ParseResponse(format!("Failed to parse tool list: {}", e)))?;
+        let tool_list: ToolListResult = serde_json::from_value(response).map_err(|e| {
+            crate::error::Error::ParseResponse(format!("Failed to parse tool list: {}", e))
+        })?;
 
-        let tools: Vec<McpTool> = tool_list.tools
+        let tools: Vec<McpTool> = tool_list
+            .tools
             .into_iter()
             .map(|def| McpTool::new(self.clone(), def))
             .collect();
@@ -263,7 +271,13 @@ impl McpClient {
         *self.tools.write().await = tools;
 
         debug!(count = self.tools.read().await.len(), "Listed MCP tools");
-        Ok(self.tools.read().await.iter().map(|t| t.definition.clone()).collect())
+        Ok(self
+            .tools
+            .read()
+            .await
+            .iter()
+            .map(|t| t.definition.clone())
+            .collect())
     }
 
     /// Call a tool on the MCP server
@@ -301,7 +315,8 @@ impl McpClient {
             id: request_id,
         };
 
-        let mut req_builder = self.client
+        let mut req_builder = self
+            .client
             .post(&self.url)
             .header("Content-Type", "application/json");
 
@@ -309,10 +324,7 @@ impl McpClient {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
         }
 
-        let response = req_builder
-            .json(&request)
-            .send()
-            .await?;
+        let response = req_builder.json(&request).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -333,7 +345,8 @@ impl McpClient {
             )));
         }
 
-        rpc_response.result
+        rpc_response
+            .result
             .ok_or_else(|| crate::error::Error::Agent("No result in MCP response".to_string()))
     }
 
@@ -346,7 +359,8 @@ impl McpClient {
             id: 0,
         };
 
-        let mut req_builder = self.client
+        let mut req_builder = self
+            .client
             .post(&self.url)
             .header("Content-Type", "application/json");
 
@@ -460,14 +474,12 @@ impl McpStdioClient {
             .send_request("initialize", Some(serde_json::to_value(request)?))
             .await?;
 
-        let init_response: InitializeResponse = serde_json::from_value(response).map_err(
-            |e| {
-                crate::error::Error::ParseResponse(format!(
-                    "Failed to parse initialize response: {}",
-                    e
-                ))
-            },
-        )?;
+        let init_response: InitializeResponse = serde_json::from_value(response).map_err(|e| {
+            crate::error::Error::ParseResponse(format!(
+                "Failed to parse initialize response: {}",
+                e
+            ))
+        })?;
 
         debug!(
             server = %init_response.server_info.name,
@@ -536,7 +548,10 @@ impl McpStdioClient {
 
         *self.tools.write().await = tools;
 
-        debug!(count = self.tools.read().await.len(), "Listed MCP stdio tools");
+        debug!(
+            count = self.tools.read().await.len(),
+            "Listed MCP stdio tools"
+        );
         Ok(self
             .tools
             .read()
@@ -595,18 +610,16 @@ impl McpStdioClient {
             .map_err(|e| {
                 crate::error::Error::Agent(format!("Failed to write to MCP stdin: {}", e))
             })?;
-        io.stdin.flush().await.map_err(|e| {
-            crate::error::Error::Agent(format!("Failed to flush MCP stdin: {}", e))
-        })?;
+        io.stdin
+            .flush()
+            .await
+            .map_err(|e| crate::error::Error::Agent(format!("Failed to flush MCP stdin: {}", e)))?;
 
         // Read response from stdout
         let mut response_line = String::new();
-        io.stdout
-            .read_line(&mut response_line)
-            .await
-            .map_err(|e| {
-                crate::error::Error::Agent(format!("Failed to read from MCP stdout: {}", e))
-            })?;
+        io.stdout.read_line(&mut response_line).await.map_err(|e| {
+            crate::error::Error::Agent(format!("Failed to read from MCP stdout: {}", e))
+        })?;
 
         if response_line.is_empty() {
             return Err(crate::error::Error::Agent(
@@ -750,11 +763,7 @@ impl HermesTool for McpTool {
         let params = serde_json::to_value(&self.definition.input_schema)
             .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
 
-        ToolSchema::new(
-            &self.definition.name,
-            &self.definition.description,
-            params,
-        )
+        ToolSchema::new(&self.definition.name, &self.definition.description, params)
     }
 
     async fn execute(&self, args: Value, _context: ToolContext) -> ToolResult {
@@ -781,7 +790,12 @@ impl McpManager {
     }
 
     /// Add and connect to an HTTP MCP server
-    pub async fn add_server(&mut self, name: impl Into<String>, url: String, auth_token: Option<String>) -> Result<()> {
+    pub async fn add_server(
+        &mut self,
+        name: impl Into<String>,
+        url: String,
+        auth_token: Option<String>,
+    ) -> Result<()> {
         let name = name.into();
         let client = McpClient::new(url, auth_token);
         client.connect().await?;

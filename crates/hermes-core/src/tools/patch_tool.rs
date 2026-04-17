@@ -6,9 +6,9 @@
 //! whitespace and line endings.
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use schemars::JsonSchema;
 use std::path::PathBuf;
 
 use crate::schema::ToolSchema;
@@ -34,11 +34,7 @@ pub struct PatchTool;
 fn normalize_whitespace(s: &str) -> String {
     s.replace("\r\n", "\n")
         .lines()
-        .map(|line| {
-            line.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -190,12 +186,15 @@ impl HermesTool for PatchTool {
             }
         }
 
-        ToolResult::success("patch", serde_json::json!({
-            "path": args.path,
-            "replacements": replacements,
-            "matchType": match_type,
-            "fileSize": new_content.len(),
-        }))
+        ToolResult::success(
+            "patch",
+            serde_json::json!({
+                "path": args.path,
+                "replacements": replacements,
+                "matchType": match_type,
+                "fileSize": new_content.len(),
+            }),
+        )
     }
 }
 
