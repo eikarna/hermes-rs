@@ -1,4 +1,4 @@
-# Hermes-RS
+![Hermes-RS](assets/banner.png)
 
 A high-performance Rust implementation of the Hermes-Agent orchestration loop for LLM-driven tool execution.
 
@@ -15,7 +15,7 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      HermesAgent                           │
+│                      Hermes-RS                           │
 │  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐  │
 │  │ OpenAI      │  │ XMLParser    │  │ ToolRegistry      │  │
 │  │ Client      │  │ (Tolerant)   │  │ & Execution       │  │
