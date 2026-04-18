@@ -548,6 +548,8 @@ async fn main() -> Result<()> {
             system_prompt: None,
             api_key: None,
             base_url: None,
+            context_window: None,
+            logging: None,
         };
 
         for path in default_paths {
