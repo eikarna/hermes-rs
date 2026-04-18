@@ -230,6 +230,17 @@ struct FileConfig {
     system_prompt: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
+    context_window: Option<usize>,
+    #[serde(default)]
+    logging: Option<LoggingConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoggingConfig {
+    level: Option<String>,
+    format: Option<String>,
+    with_target: Option<bool>,
+    with_thread_ids: Option<bool>,
 }
 
 impl FileConfig {
