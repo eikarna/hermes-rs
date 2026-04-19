@@ -1,7 +1,8 @@
 //! OpenAI-compatible client with SSE streaming support
 //!
-//! A lightweight, custom implementation using `reqwest` and `serde`.
+//! A lightweight, custom implementation using reqwest and serde.
 //! Supports Server-Sent Events for streaming responses.
+//! Supports reasoning_content for extended-thinking models.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -206,7 +207,7 @@ impl OpenAIClient {
                         })
                     })
                     .collect();
-                request["tools"] = json!({ "tools": tools_array });
+                request["tools"] = json!(tools_array);
             }
         }
 
@@ -240,6 +241,7 @@ impl Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    pub reasoning: Option<String>,
     pub name: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -251,6 +253,7 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -277,6 +280,7 @@ impl Message {
         Self {
             role: Role::Tool,
             content: content.into(),
+            reasoning: None,
             tool_call_id: Some(tool_call_id.into()),
             name: None,
             tool_calls: None,
@@ -286,6 +290,15 @@ impl Message {
     /// Add tool calls to the message
     pub fn with_tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
         self.tool_calls = Some(tool_calls);
+        self
+    }
+
+    /// Add reasoning content to the message
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        let reasoning = reasoning.into();
+        if !reasoning.trim().is_empty() {
+            self.reasoning = Some(reasoning);
+        }
         self
     }
 
@@ -330,6 +343,7 @@ impl Default for Message {
         Self {
             role: Role::User,
             content: String::new(),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -375,6 +389,14 @@ pub struct Choice {
 pub struct MessageDelta {
     pub role: Option<Role>,
     pub content: Option<String>,
+    /// Reasoning content from extended-thinking models (e.g. DeepSeek, OpenAI o1)
+    #[serde(
+        default,
+        alias = "reasoning_content",
+        alias = "reasoning",
+        alias = "reasoning_context"
+    )]
+    pub reasoning_content: Option<String>,
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -422,6 +444,14 @@ pub struct StreamingMessageDelta {
     pub role: Option<Role>,
     #[serde(default)]
     pub content: Option<String>,
+    /// Reasoning content from extended-thinking models (e.g. DeepSeek, OpenAI o1)
+    #[serde(
+        default,
+        alias = "reasoning_content",
+        alias = "reasoning",
+        alias = "reasoning_context"
+    )]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<StreamingToolCallDelta>>,
 }
@@ -588,6 +618,22 @@ mod tests {
 
         assert_eq!(value["role"], "tool");
         assert_eq!(value["tool_call_id"], "call_123");
+    }
+
+    #[test]
+    fn test_reasoning_context_alias_deserializes() {
+        let value = serde_json::json!({
+            "role": "assistant",
+            "reasoning_context": "<think>checking</think>"
+        });
+
+        let delta: StreamingMessageDelta =
+            serde_json::from_value(value).expect("streaming delta should deserialize");
+
+        assert_eq!(
+            delta.reasoning_content.as_deref(),
+            Some("<think>checking</think>")
+        );
     }
 
     #[tokio::test]

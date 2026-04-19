@@ -32,6 +32,8 @@ pub struct AgentConfig {
     pub stream: bool,
     /// Context window size for truncation
     pub context_window: usize,
+    /// Max self-healing attempts on tool errors
+    pub max_healing_attempts: usize,
 }
 
 impl Default for AgentConfig {
@@ -44,6 +46,7 @@ impl Default for AgentConfig {
             system_prompt: None,
             stream: true,
             context_window: 128_000,
+            max_healing_attempts: 3,
         }
     }
 }
@@ -53,6 +56,8 @@ impl Default for AgentConfig {
 pub enum AgentEvent {
     /// Thinking/reasoning step
     Thinking { content: String },
+    /// Model reasoning content
+    Reasoning { text: String },
     /// Tool execution started
     ToolStart { name: String, arguments: String },
     /// Tool execution completed
@@ -178,13 +183,15 @@ impl HermesAgent {
 
             // Process streaming response with early tool detection
             match self.process_stream(stream).await {
-                Ok((response_text, tool_calls)) => {
+                Ok((response_text, reasoning_text, tool_calls)) => {
                     // Add assistant message to conversation
-                    let assistant_msg = if tool_calls.is_empty() {
-                        Message::assistant(&response_text)
-                    } else {
-                        Message::assistant(&response_text).with_tool_calls(tool_calls.clone())
-                    };
+                    let mut assistant_msg = Message::assistant(&response_text);
+                    if !reasoning_text.is_empty() {
+                        assistant_msg = assistant_msg.with_reasoning(reasoning_text);
+                    }
+                    if !tool_calls.is_empty() {
+                        assistant_msg = assistant_msg.with_tool_calls(tool_calls.clone());
+                    }
 
                     messages.push(assistant_msg.clone());
                     self.add_message(assistant_msg.clone()).await;
@@ -272,12 +279,14 @@ impl HermesAgent {
     async fn process_stream(
         &self,
         mut stream: ChatStreamResponse,
-    ) -> Result<(String, Vec<ToolCall>)> {
+    ) -> Result<(String, String, Vec<ToolCall>)> {
         let _parser = ToolCallStreamParser::new().on_tool_call(|tc| {
             let tc_id = tc.id.clone();
             debug!(tool_call_id = %tc_id, name = %tc.function.name, "Early tool call detected");
         });
+        let mut content_router = ThinkBlockRouter::default();
         let mut accumulated_text = String::new();
+        let mut accumulated_reasoning = String::new();
         let mut tool_calls = Vec::new();
         let mut has_error = false;
 
@@ -285,9 +294,32 @@ impl HermesAgent {
             match event_result {
                 Ok(event) => {
                     // Process the event
+                    if let Some(reasoning) = extract_reasoning_from_event(&event) {
+                        let reasoning = strip_reasoning_tags(&reasoning);
+                        if !reasoning.is_empty() {
+                            accumulated_reasoning.push_str(&reasoning);
+                            self.emit(AgentEvent::Reasoning { text: reasoning }).await;
+                        }
+                    }
+
                     if let Some(text) = extract_text_from_event(&event) {
-                        accumulated_text.push_str(&text);
-                        self.emit(AgentEvent::Content { text: text.clone() }).await;
+                        let (content_delta, reasoning_delta) = content_router.feed(&text);
+
+                        if !content_delta.is_empty() {
+                            accumulated_text.push_str(&content_delta);
+                            self.emit(AgentEvent::Content {
+                                text: content_delta,
+                            })
+                            .await;
+                        }
+
+                        if !reasoning_delta.is_empty() {
+                            accumulated_reasoning.push_str(&reasoning_delta);
+                            self.emit(AgentEvent::Reasoning {
+                                text: reasoning_delta,
+                            })
+                            .await;
+                        }
                     }
 
                     // Extract any tool calls from this chunk
@@ -308,6 +340,10 @@ impl HermesAgent {
             return Err(Error::Agent("Stream processing failed".to_string()));
         }
 
+        let (remaining_content, remaining_reasoning) = content_router.finish();
+        accumulated_text.push_str(&remaining_content);
+        accumulated_reasoning.push_str(&remaining_reasoning);
+
         // Also try to extract any remaining tool calls from accumulated text
         let mut remaining_parser = ToolCallParser::new();
         let remaining_calls = remaining_parser.parse(&accumulated_text)?;
@@ -319,7 +355,7 @@ impl HermesAgent {
             }
         }
 
-        Ok((accumulated_text, tool_calls))
+        Ok((accumulated_text, accumulated_reasoning, tool_calls))
     }
 
     /// Execute tools and handle self-healing
@@ -331,6 +367,11 @@ impl HermesAgent {
             let args_str = tool_call.function.arguments.clone();
 
             debug!(tool = %name, args = %args_str, "Executing tool");
+            self.emit(AgentEvent::ToolStart {
+                name: name.clone(),
+                arguments: args_str.clone(),
+            })
+            .await;
 
             // Parse arguments
             let args: serde_json::Value = match serde_json::from_str(&args_str) {
@@ -388,7 +429,7 @@ impl HermesAgent {
     /// Run agent and handle self-healing on tool errors
     pub async fn run_with_healing(&self, user_query: String) -> Result<Message> {
         let mut iteration = 0;
-        let max_healing_attempts = 3;
+        let max_healing_attempts = self.config.max_healing_attempts;
 
         loop {
             iteration += 1;
@@ -431,6 +472,126 @@ fn extract_text_from_event(event: &ChatStreamEvent) -> Option<String> {
     } else {
         Some(text)
     }
+}
+
+/// Extract reasoning content from a streaming event
+fn extract_reasoning_from_event(event: &ChatStreamEvent) -> Option<String> {
+    let mut reasoning = String::new();
+
+    for choice in &event.choices {
+        if let Some(content) = &choice.delta.reasoning_content {
+            reasoning.push_str(content);
+        }
+    }
+
+    if reasoning.is_empty() {
+        None
+    } else {
+        Some(reasoning)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ThinkBlockRouter {
+    pending: String,
+    inside_reasoning: bool,
+}
+
+impl ThinkBlockRouter {
+    fn feed(&mut self, chunk: &str) -> (String, String) {
+        self.pending.push_str(chunk);
+        self.drain_ready()
+    }
+
+    fn finish(&mut self) -> (String, String) {
+        let (mut content, mut reasoning) = self.drain_ready();
+        if !self.pending.is_empty() {
+            if self.inside_reasoning {
+                reasoning.push_str(&self.pending);
+            } else {
+                content.push_str(&self.pending);
+            }
+            self.pending.clear();
+        }
+        (content, reasoning)
+    }
+
+    fn drain_ready(&mut self) -> (String, String) {
+        const MAX_TAG_LEN: usize = 23;
+        let mut content = String::new();
+        let mut reasoning = String::new();
+
+        loop {
+            let lowered = self.pending.to_ascii_lowercase();
+            let tag = if self.inside_reasoning {
+                find_first_tag(&lowered, CLOSE_REASONING_TAGS)
+            } else {
+                find_first_tag(&lowered, OPEN_REASONING_TAGS)
+            };
+
+            if let Some((index, marker)) = tag {
+                let segment = self.pending[..index].to_string();
+                if self.inside_reasoning {
+                    reasoning.push_str(&segment);
+                } else {
+                    content.push_str(&segment);
+                }
+                self.pending.drain(..index + marker.len());
+                self.inside_reasoning = !self.inside_reasoning;
+                continue;
+            }
+
+            let keep = self.pending.len().min(MAX_TAG_LEN.saturating_sub(1));
+            let flush_len = self.pending.len().saturating_sub(keep);
+            if flush_len == 0 {
+                break;
+            }
+
+            let segment = self.pending[..flush_len].to_string();
+            if self.inside_reasoning {
+                reasoning.push_str(&segment);
+            } else {
+                content.push_str(&segment);
+            }
+            self.pending.drain(..flush_len);
+        }
+
+        (content, reasoning)
+    }
+}
+
+const OPEN_REASONING_TAGS: &[&str] = &[
+    "<think>",
+    "<thinking>",
+    "<reasoning>",
+    "<thought>",
+    "<reasoning_scratchpad>",
+];
+
+const CLOSE_REASONING_TAGS: &[&str] = &[
+    "</think>",
+    "</thinking>",
+    "</reasoning>",
+    "</thought>",
+    "</reasoning_scratchpad>",
+];
+
+fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    tags.iter()
+        .filter_map(|tag| haystack.find(tag).map(|index| (index, *tag)))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn strip_reasoning_tags(text: &str) -> String {
+    let mut cleaned = text.to_string();
+    for tag in OPEN_REASONING_TAGS
+        .iter()
+        .chain(CLOSE_REASONING_TAGS.iter())
+    {
+        cleaned = cleaned.replace(tag, "");
+        cleaned = cleaned.replace(&tag.to_uppercase(), "");
+    }
+    cleaned
 }
 
 /// Extract tool calls from a streaming event
@@ -591,6 +752,7 @@ mod tests {
                 delta: crate::client::StreamingMessageDelta {
                     role: None,
                     content: Some("Hello ".to_string()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: None,
@@ -599,5 +761,30 @@ mod tests {
 
         let text = extract_text_from_event(&event);
         assert_eq!(text, Some("Hello ".to_string()));
+    }
+
+    #[test]
+    fn think_router_splits_inline_think_blocks() {
+        let mut router = ThinkBlockRouter::default();
+        let (content_a, reasoning_a) = router.feed("Hello<think>plan");
+        let (content_b, reasoning_b) = router.feed(" more</think> world");
+        let (content_c, reasoning_c) = router.finish();
+
+        assert_eq!(content_a, "Hello");
+        assert_eq!(reasoning_a, "");
+        assert_eq!(content_b, "");
+        assert_eq!(reasoning_b, "plan more");
+        assert_eq!(content_c, " world");
+        assert_eq!(reasoning_c, "");
+    }
+
+    #[test]
+    fn strip_reasoning_tags_removes_supported_markers() {
+        assert_eq!(
+            strip_reasoning_tags(
+                "<think>abc</think><REASONING_SCRATCHPAD>def</REASONING_SCRATCHPAD>"
+            ),
+            "abcdef"
+        );
     }
 }

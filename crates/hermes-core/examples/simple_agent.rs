@@ -160,6 +160,7 @@ Use the echo tool to repeat information and the calculate tool for math."
         stream: true,
         context_window: 128_000,
         request_timeout: Duration::from_secs(120),
+        max_healing_attempts: 3,
     };
 
     let agent = HermesAgent::new(agent_config, client, registry);

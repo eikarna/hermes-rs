@@ -29,11 +29,18 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+toml = "0.8"
 
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Terminal UI
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+
 # Utilities
 anyhow = { workspace = true }
 dirs = "5.0"
+console = "0.15"
