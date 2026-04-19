@@ -9,10 +9,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+use crate::config::runtime_config;
 use crate::error::Result;
 
 /// Configuration for the gateway
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GatewayConfig {
     /// Enable Telegram bot
     pub telegram_enabled: bool,
@@ -32,6 +33,23 @@ pub struct GatewayConfig {
     pub webhooks_addr: Option<String>,
     /// Default admin users (user IDs that can access admin commands)
     pub admins: Vec<String>,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        let settings = runtime_config().gateway;
+        Self {
+            telegram_enabled: settings.telegram_enabled,
+            telegram_token: settings.telegram_token,
+            discord_enabled: settings.discord_enabled,
+            discord_token: settings.discord_token,
+            slack_enabled: settings.slack_enabled,
+            slack_token: settings.slack_token,
+            webhooks_enabled: settings.webhooks_enabled,
+            webhooks_addr: settings.webhooks_addr,
+            admins: settings.admins,
+        }
+    }
 }
 
 /// Incoming message from a platform
@@ -292,8 +310,10 @@ impl TelegramAdapter {
     }
 
     fn api_url(&self) -> String {
+        let base = runtime_config().gateway.telegram_api_base;
         format!(
-            "https://api.telegram.org/bot{}",
+            "{}/bot{}",
+            base.trim_end_matches('/'),
             self.token.as_ref().unwrap_or(&String::new())
         )
     }
@@ -428,7 +448,7 @@ impl DiscordAdapter {
     }
 
     fn api_url(&self) -> String {
-        "https://discord.com/api/v10".to_string()
+        runtime_config().gateway.discord_api_base
     }
 }
 
@@ -608,7 +628,13 @@ impl PlatformAdapter for SlackAdapter {
         });
 
         client
-            .post("https://slack.com/api/chat.postMessage")
+            .post(format!(
+                "{}/chat.postMessage",
+                runtime_config()
+                    .gateway
+                    .slack_api_base
+                    .trim_end_matches('/')
+            ))
             .header(
                 "Authorization",
                 format!("Bearer {}", self.token.as_ref().unwrap()),

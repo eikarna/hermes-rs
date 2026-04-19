@@ -7,6 +7,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::config::runtime_config;
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
 
@@ -40,16 +41,18 @@ impl HermesTool for WebSearchTool {
             Err(e) => return ToolResult::error("web_search", format!("Invalid arguments: {}", e)),
         };
 
-        let num_results = args.num_results.unwrap_or(10).min(20);
+        let settings = runtime_config().tools.web;
+        let num_results = args
+            .num_results
+            .unwrap_or(settings.default_results)
+            .min(settings.max_results);
 
-        // Build search URL for DuckDuckGo Lite (lightweight HTML, scraping-friendly)
         let query_encoded = urlencoding::encode(&args.query);
-        let search_url = format!("https://lite.duckduckgo.com/lite/?q={}", query_encoded);
+        let search_url = settings.search_url.replace("{query}", &query_encoded);
 
-        // Fetch the search results page
         let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent("Mozilla/5.0 (compatible; HermesAgent/0.1)")
+            .timeout(std::time::Duration::from_secs(settings.search_timeout_secs))
+            .user_agent(settings.user_agent)
             .build()
         {
             Ok(c) => c,
@@ -130,6 +133,7 @@ impl HermesTool for WebFetchTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error("web_fetch", format!("Invalid arguments: {}", e)),
         };
+        let settings = runtime_config().tools.web;
 
         // Validate URL
         match reqwest::Url::parse(&args.url) {
@@ -145,7 +149,9 @@ impl HermesTool for WebFetchTool {
         }
 
         let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(args.timeout.unwrap_or(30)))
+            .timeout(std::time::Duration::from_secs(
+                args.timeout.unwrap_or(settings.fetch_timeout_secs),
+            ))
             .build()
         {
             Ok(c) => c,

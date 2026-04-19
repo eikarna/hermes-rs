@@ -11,14 +11,9 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::config::runtime_config;
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
-
-/// Maximum allowed execution time in seconds
-const MAX_TIMEOUT_SECS: u64 = 300;
-
-/// Maximum output size in bytes
-const MAX_OUTPUT_SIZE: usize = 1_000_000;
 
 /// Tool for executing shell commands
 pub struct TerminalTool;
@@ -52,13 +47,14 @@ impl HermesTool for TerminalTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error("terminal", format!("Invalid arguments: {}", e)),
         };
+        let settings = runtime_config().tools.terminal;
 
         let timeout = std::time::Duration::from_secs(
             args.timeout
-                .unwrap_or(MAX_TIMEOUT_SECS)
-                .min(MAX_TIMEOUT_SECS),
+                .unwrap_or(settings.max_timeout_secs)
+                .min(settings.max_timeout_secs),
         );
-        let max_output = args.max_output.unwrap_or(MAX_OUTPUT_SIZE);
+        let max_output = args.max_output.unwrap_or(settings.max_output_bytes);
 
         let shell = crate::platform::detect_shell();
         let mut cmd = {

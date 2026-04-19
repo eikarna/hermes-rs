@@ -9,12 +9,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
 
+use crate::config::runtime_config;
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
-
-/// Code execution timeout in seconds
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
-const MAX_TIMEOUT_SECS: u64 = 300;
 
 /// Tool for executing code in various languages
 pub struct CodeExecutionTool;
@@ -55,11 +52,12 @@ impl HermesTool for CodeExecutionTool {
                 return ToolResult::error("code_execution", format!("Invalid arguments: {}", e))
             }
         };
+        let settings = runtime_config().tools.code_execution;
 
         let timeout = std::time::Duration::from_secs(
             args.timeout
-                .unwrap_or(DEFAULT_TIMEOUT_SECS)
-                .min(MAX_TIMEOUT_SECS),
+                .unwrap_or(settings.default_timeout_secs)
+                .min(settings.max_timeout_secs),
         );
 
         let result = match args.language.to_lowercase().as_str() {

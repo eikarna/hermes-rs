@@ -1,0 +1,390 @@
+use std::path::PathBuf;
+
+use hermes_core::agent::AgentEvent;
+use hermes_core::client::Message;
+use hermes_core::config::{AppConfig, BehaviorSettings, McpTransportKind};
+
+use crate::tui::forms::Modal;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Landing,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Wide,
+    Medium,
+    Compact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivePanel {
+    Session,
+    Mcp,
+    Skills,
+    Behavior,
+}
+
+impl ActivePanel {
+    pub fn all() -> [Self; 4] {
+        [Self::Session, Self::Mcp, Self::Skills, Self::Behavior]
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Session => "Session",
+            Self::Mcp => "MCP",
+            Self::Skills => "Skills",
+            Self::Behavior => "Behavior",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Session => Self::Mcp,
+            Self::Mcp => Self::Skills,
+            Self::Skills => Self::Behavior,
+            Self::Behavior => Self::Session,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Session => Self::Behavior,
+            Self::Mcp => Self::Session,
+            Self::Skills => Self::Mcp,
+            Self::Behavior => Self::Skills,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    Prompt,
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivityItem {
+    pub label: String,
+    pub body: String,
+    pub tone: Tone,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptEntry {
+    pub role: &'static str,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionState {
+    pub transcript: Vec<TranscriptEntry>,
+    pub active_query: String,
+    pub streaming_response: String,
+    pub reasoning: String,
+    pub activity: Vec<ActivityItem>,
+    pub status: String,
+    pub current_iteration: usize,
+    pub max_iterations: usize,
+    pub error: Option<String>,
+    pub final_message: Option<String>,
+    pub running: bool,
+}
+
+impl SessionState {
+    pub fn new(max_iterations: usize) -> Self {
+        Self {
+            transcript: Vec::new(),
+            active_query: String::new(),
+            streaming_response: String::new(),
+            reasoning: String::new(),
+            activity: vec![ActivityItem {
+                label: "Ready".to_string(),
+                body: "Waiting for your first prompt.".to_string(),
+                tone: Tone::Info,
+            }],
+            status: "Idle".to_string(),
+            current_iteration: 0,
+            max_iterations,
+            error: None,
+            final_message: None,
+            running: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerItem {
+    pub name: String,
+    pub transport: McpTransportKind,
+    pub endpoint: String,
+    pub enabled: bool,
+    pub connected: bool,
+    pub tool_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillItem {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistentState {
+    pub config: AppConfig,
+    pub behavior: BehaviorSettings,
+    pub skills_root: PathBuf,
+    pub mcp_servers: Vec<McpServerItem>,
+    pub skills: Vec<SkillItem>,
+    pub needs_rebuild: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UiState {
+    pub view: ViewMode,
+    pub layout: LayoutMode,
+    pub active_panel: ActivePanel,
+    pub input_mode: InputMode,
+    pub prompt_input: String,
+    pub selected_mcp: usize,
+    pub selected_skill: usize,
+    pub selected_behavior: usize,
+    pub footer: String,
+    pub modal: Option<Modal>,
+    pub should_quit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppState {
+    pub persistent: PersistentState,
+    pub session: SessionState,
+    pub ui: UiState,
+}
+
+impl AppState {
+    pub fn new(config: AppConfig, prompt: String, start_in_workspace: bool) -> Self {
+        let max_iterations = config.agent.max_iterations;
+        Self {
+            persistent: PersistentState {
+                behavior: config.agent.clone(),
+                skills_root: config.skills.root_dir.clone(),
+                config,
+                mcp_servers: Vec::new(),
+                skills: Vec::new(),
+                needs_rebuild: false,
+            },
+            session: SessionState::new(max_iterations),
+            ui: UiState {
+                view: if start_in_workspace {
+                    ViewMode::Workspace
+                } else {
+                    ViewMode::Landing
+                },
+                layout: LayoutMode::Wide,
+                active_panel: ActivePanel::Session,
+                input_mode: InputMode::Prompt,
+                prompt_input: prompt,
+                selected_mcp: 0,
+                selected_skill: 0,
+                selected_behavior: 0,
+                footer: "i prompt  tab panels  m/s/b views  ctrl+l new session  q quit".to_string(),
+                modal: None,
+                should_quit: false,
+            },
+        }
+    }
+
+    pub fn set_layout_for_width(&mut self, width: u16) {
+        self.ui.layout = if width < self.persistent.config.tui.compact_width {
+            LayoutMode::Compact
+        } else if width < self.persistent.config.tui.medium_width {
+            LayoutMode::Medium
+        } else {
+            LayoutMode::Wide
+        };
+    }
+
+    pub fn behavior_rows(&self) -> Vec<(String, String)> {
+        let behavior = &self.persistent.behavior;
+        vec![
+            ("model".to_string(), behavior.model.clone()),
+            (
+                "system_prompt".to_string(),
+                behavior
+                    .system_prompt
+                    .clone()
+                    .unwrap_or_else(|| "(default)".to_string()),
+            ),
+            (
+                "max_iterations".to_string(),
+                behavior.max_iterations.to_string(),
+            ),
+            (
+                "tool_timeout_secs".to_string(),
+                behavior.tool_timeout_secs.to_string(),
+            ),
+            (
+                "request_timeout_secs".to_string(),
+                behavior.request_timeout_secs.to_string(),
+            ),
+            (
+                "context_window".to_string(),
+                behavior.context_window.to_string(),
+            ),
+            ("stream".to_string(), behavior.stream.to_string()),
+            (
+                "show_reasoning".to_string(),
+                behavior.show_reasoning.to_string(),
+            ),
+            (
+                "max_healing_attempts".to_string(),
+                behavior.max_healing_attempts.to_string(),
+            ),
+        ]
+    }
+
+    pub fn apply_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Thinking { content } => {
+                self.session.status = content.clone();
+                self.push_activity("Thinking", &content, Tone::Info);
+            }
+            AgentEvent::Reasoning { text } => {
+                self.session.reasoning.push_str(&text);
+                self.session.status = "Streaming reasoning".to_string();
+            }
+            AgentEvent::ToolStart { name, arguments } => {
+                self.push_activity(
+                    format!("Tool {}", name),
+                    truncate(&arguments, 140),
+                    Tone::Warning,
+                );
+                self.session.status = format!("Running {}", name);
+            }
+            AgentEvent::ToolComplete { result } => {
+                self.push_activity(
+                    "Tool complete",
+                    truncate(&result.content, 160),
+                    if result.success {
+                        Tone::Success
+                    } else {
+                        Tone::Error
+                    },
+                );
+                self.session.status = "Tool completed".to_string();
+            }
+            AgentEvent::ToolError { name, error } => {
+                self.push_activity(format!("Tool {}", name), error.clone(), Tone::Error);
+                self.session.status = format!("{} failed", name);
+            }
+            AgentEvent::Content { text } => {
+                self.session.streaming_response.push_str(&text);
+                self.session.status = "Streaming response".to_string();
+            }
+            AgentEvent::Done { message } => self.finish_run(message),
+            AgentEvent::IterationComplete { iteration } => {
+                self.session.current_iteration = iteration;
+                self.push_activity(
+                    format!("Iteration {}", iteration),
+                    "Agent loop step finished.",
+                    Tone::Info,
+                );
+            }
+            AgentEvent::Error { error } => {
+                self.session.error = Some(error.clone());
+                self.session.status = "Errored".to_string();
+                self.push_activity("Error", error, Tone::Error);
+            }
+        }
+    }
+
+    pub fn begin_run(&mut self, query: String) {
+        self.ui.view = ViewMode::Workspace;
+        self.ui.active_panel = ActivePanel::Session;
+        self.ui.input_mode = InputMode::Command;
+        self.session.running = true;
+        self.session.error = None;
+        self.session.final_message = None;
+        self.session.active_query = query.clone();
+        self.session.streaming_response.clear();
+        self.session.reasoning.clear();
+        self.session.current_iteration = 0;
+        self.session.status = "Requesting model response".to_string();
+        self.session.transcript.push(TranscriptEntry {
+            role: "User",
+            content: query,
+        });
+    }
+
+    pub fn fail_run(&mut self, error: String) {
+        self.session.running = false;
+        self.session.error = Some(error.clone());
+        self.session.status = "Run failed".to_string();
+        self.push_activity("Run failed", error, Tone::Error);
+    }
+
+    pub fn clear_session(&mut self) {
+        let max_iterations = self.persistent.behavior.max_iterations;
+        self.session = SessionState::new(max_iterations);
+        self.ui.prompt_input.clear();
+        self.ui.view = ViewMode::Landing;
+        self.ui.input_mode = InputMode::Prompt;
+    }
+
+    pub fn push_activity(&mut self, label: impl Into<String>, body: impl Into<String>, tone: Tone) {
+        self.session.activity.push(ActivityItem {
+            label: label.into(),
+            body: body.into(),
+            tone,
+        });
+    }
+
+    fn finish_run(&mut self, message: Message) {
+        let content = if self.session.streaming_response.trim().is_empty() {
+            message.content.clone()
+        } else {
+            self.session.streaming_response.clone()
+        };
+        self.session.streaming_response = content.clone();
+        self.session.running = false;
+        self.session.final_message = Some(content.clone());
+        self.session.status = "Completed".to_string();
+        self.session.transcript.push(TranscriptEntry {
+            role: "Assistant",
+            content,
+        });
+        if self.session.reasoning.is_empty() {
+            if let Some(reasoning) = message.reasoning {
+                self.session.reasoning = reasoning;
+            }
+        }
+        self.push_activity("Done", "Response finished.", Tone::Success);
+    }
+}
+
+pub fn truncate(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let mut out = trimmed
+            .chars()
+            .take(max_chars.saturating_sub(3))
+            .collect::<String>();
+        out.push_str("...");
+        out
+    }
+}

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::config::runtime_config;
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
 
@@ -56,7 +57,10 @@ impl HermesTool for HttpRequestTool {
             return ToolResult::error("http_request", "Only HTTP and HTTPS URLs are supported");
         }
 
-        let timeout = std::time::Duration::from_secs(args.timeout.unwrap_or(30));
+        let timeout = std::time::Duration::from_secs(
+            args.timeout
+                .unwrap_or(runtime_config().tools.http.timeout_secs),
+        );
 
         let client = match reqwest::Client::builder().timeout(timeout).build() {
             Ok(c) => c,

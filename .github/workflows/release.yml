@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag from build run
+        id: tag
+        shell: bash
+        run: |
+          git fetch --force --tags
+          TAG=$(git tag --points-at "${{ github.event.workflow_run.head_sha }}" | head -n 1)
+          if [ -z "$TAG" ]; then
+            echo "No tag points at ${{ github.event.workflow_run.head_sha }}. Skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          gh run download "${{ github.event.workflow_run.id }}" --dir artifacts
+
+      - name: Extract release notes from changelog
+        if: steps.tag.outputs.skip != 'true'
+        id: notes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          tag = "${{ steps.tag.outputs.tag }}"
+          version = tag.lstrip("v")
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = rf"^## \[{re.escape(version)}\] - .*$([\s\S]*?)(?=^## \[|\Z)"
+          match = re.search(pattern, changelog, flags=re.MULTILINE)
+          if not match:
+              print(f"Version {version} not found in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+          pathlib.Path("release_notes.md").write_text(match.group(1).strip() + "\n", encoding="utf-8")
+          PY
+
+      - name: Publish GitHub release
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          find artifacts -type f | sort > artifact_list.txt
+          if gh release view "${{ steps.tag.outputs.tag }}" >/dev/null 2>&1; then
+            gh release edit "${{ steps.tag.outputs.tag }}" --notes-file release_notes.md
+            while IFS= read -r file; do
+              gh release upload "${{ steps.tag.outputs.tag }}" "$file" --clobber
+            done < artifact_list.txt
+          else
+            gh release create "${{ steps.tag.outputs.tag }}" \
+              --title "${{ steps.tag.outputs.tag }}" \
+              --notes-file release_notes.md \
+              $(cat artifact_list.txt)
+          fi

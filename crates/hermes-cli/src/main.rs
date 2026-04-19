@@ -1,74 +1,74 @@
 //! Hermes-RS CLI
-//!
-//! A command-line interface for the Hermes-RS agent framework.
 
 mod tui;
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use console::{style, Emoji};
+use clap::{ArgAction, Parser, Subcommand};
 use hermes_core::agent::{AgentConfig, AgentEvent, HermesAgent};
 use hermes_core::client::{ClientConfig, OpenAIClient};
+use hermes_core::config::{
+    install_runtime_config, load_app_config, AppConfig, BehaviorSettings, LoggingSettings,
+    McpServerConfig, McpTransportKind,
+};
+use hermes_core::mcp::McpManager;
 use hermes_core::tools::{HermesTool, ToolContext, ToolRegistry};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn, Level};
+use tracing::Level;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::tui::LiveRunTui;
+use crate::tui::{LaunchMode, TuiApp};
 
-static DONE: Emoji<'_, '_> = Emoji("✅", "");
-static ERROR: Emoji<'_, '_> = Emoji("❌", "");
-
-/// Hermes-RS CLI arguments
 #[derive(Debug, Parser)]
 #[command(
     name = "hermes",
     about = "Hermes-RS: A high-performance ReAct agent framework",
-    long_about = None,
     version
 )]
 struct Cli {
-    /// Enable verbose output
     #[arg(short, long, global = true)]
     verbose: bool,
 
-    /// Log level (trace, debug, info, warn, error, off)
     #[arg(short, long, global = true)]
     log_level: Option<String>,
 
-    /// Configuration file path
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
-    /// OpenAI API key
     #[arg(long, global = true, env = "OPENAI_API_KEY")]
     api_key: Option<String>,
 
-    /// OpenAI base URL
-    #[arg(
-        long,
-        global = true,
-        env = "OPENAI_BASE_URL",
-        default_value = "https://api.openai.com/v1"
-    )]
-    base_url: String,
+    #[arg(long, global = true, env = "OPENAI_BASE_URL")]
+    base_url: Option<String>,
 
-    /// Model to use
-    #[arg(long, global = true, default_value = "gpt-4")]
-    model: String,
+    #[arg(long, global = true)]
+    model: Option<String>,
 
-    /// Maximum iterations
-    #[arg(long, global = true, default_value = "20")]
-    max_iterations: usize,
+    #[arg(long, global = true)]
+    max_iterations: Option<usize>,
 
-    /// Tool timeout in seconds
-    #[arg(long, global = true, default_value = "30")]
-    tool_timeout: u64,
+    #[arg(long, global = true)]
+    tool_timeout: Option<u64>,
+
+    #[arg(long, global = true)]
+    request_timeout: Option<u64>,
+
+    #[arg(long, global = true)]
+    context_window: Option<usize>,
+
+    #[arg(long, global = true)]
+    max_healing_attempts: Option<usize>,
+
+    #[arg(long, global = true, action = ArgAction::SetTrue, conflicts_with = "no_stream")]
+    stream: bool,
+
+    #[arg(long = "no-stream", global = true, action = ArgAction::SetTrue, conflicts_with = "stream")]
+    no_stream: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -76,330 +76,269 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run the agent interactively
     Run {
-        /// System prompt
         #[arg(short, long)]
         system: Option<String>,
 
-        /// Initial query (if not interactive)
         #[arg(short, long)]
         query: Option<String>,
     },
-
-    /// List available tools
     Tools {
-        /// Show full schema for each tool
         #[arg(short, long)]
         verbose: bool,
     },
-
-    /// Chat mode (interactive conversation)
     Chat {
-        /// System prompt
         #[arg(short, long)]
         system: Option<String>,
     },
-
-    /// Test a specific tool
     Test {
-        /// Tool name
         #[arg()]
         tool_name: String,
 
-        /// Tool arguments as JSON
         #[arg(short, long)]
         args: Option<String>,
     },
 }
 
-/// Configuration from file
-#[derive(Debug, Default, Deserialize)]
-struct FileConfig {
-    model: Option<String>,
-    max_iterations: Option<usize>,
-    tool_timeout: Option<u64>,
-    system_prompt: Option<String>,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    request_timeout: Option<u64>,
-    context_window: Option<usize>,
-    stream: Option<bool>,
-    max_healing_attempts: Option<usize>,
-    tool_registry_timeout: Option<u64>,
-    event_channel_size: Option<usize>,
-    #[serde(default)]
-    logging: LoggingConfig,
-    #[serde(default)]
-    ui: UiConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoggingConfig {
-    level: Option<String>,
-    format: Option<String>,
-    log_file: Option<String>,
-    with_target: Option<bool>,
-    with_thread_ids: Option<bool>,
-    with_file: Option<bool>,
-    with_line_number: Option<bool>,
-}
-
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: Some("info".to_string()),
-            format: Some("pretty".to_string()),
-            log_file: None,
-            with_target: Some(false),
-            with_thread_ids: Some(false),
-            with_file: Some(false),
-            with_line_number: Some(false),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct UiConfig {
-    #[allow(dead_code)]
-    theme: Option<String>,
-    show_thinking: Option<bool>,
-    show_tool_calls: Option<bool>,
-    show_iterations: Option<bool>,
-    rich_output: Option<bool>,
-}
-
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            theme: Some("dark".to_string()),
-            show_thinking: Some(true),
-            show_tool_calls: Some(true),
-            show_iterations: Some(true),
-            rich_output: Some(true),
-        }
-    }
-}
-
-impl FileConfig {
-    fn merge_with(&self, cli: &Cli) -> ClientConfig {
-        let timeout_secs = self.request_timeout.unwrap_or(120);
-        ClientConfig {
-            base_url: self
-                .base_url
-                .clone()
-                .unwrap_or_else(|| cli.base_url.clone()),
-            api_key: self.api_key.clone().or(cli.api_key.clone()),
-            timeout: Duration::from_secs(timeout_secs),
-            max_context_length: self.context_window.unwrap_or(128_000),
-        }
-    }
-
-    fn agent_config(&self, cli: &Cli, system_prompt: Option<&str>) -> AgentConfig {
-        let tool_timeout_secs = self.tool_timeout.unwrap_or(cli.tool_timeout);
-        AgentConfig {
-            model: self.model.clone().unwrap_or_else(|| cli.model.clone()),
-            max_iterations: self.max_iterations.unwrap_or(cli.max_iterations),
-            tool_timeout: Duration::from_secs(tool_timeout_secs),
-            request_timeout: Duration::from_secs(self.request_timeout.unwrap_or(120)),
-            system_prompt: self
-                .system_prompt
-                .clone()
-                .or_else(|| system_prompt.map(String::from)),
-            stream: self.stream.unwrap_or(true),
-            context_window: self.context_window.unwrap_or(128_000),
-            max_healing_attempts: self.max_healing_attempts.unwrap_or(3),
-        }
-    }
-
-    fn tool_registry_timeout(&self) -> Duration {
-        Duration::from_secs(self.tool_registry_timeout.unwrap_or(30))
-    }
-
-    fn event_channel_size(&self) -> usize {
-        self.event_channel_size.unwrap_or(100)
-    }
-}
-
-fn is_log_level_off(s: &str) -> bool {
-    let s = s.to_lowercase();
-    s == "off" || s == "none"
-}
-
-fn build_file_env_filter(file_config: &LoggingConfig) -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if let Some(ref level) = file_config.level {
-            if is_log_level_off(level) {
-                EnvFilter::new("off")
-            } else {
-                EnvFilter::new(level)
-            }
-        } else {
-            EnvFilter::new(format!("{}", Level::INFO))
-        }
-    })
-}
-
-/// Initialize logging — all logs go to stderr, completely separate from chat stdout
-fn init_logging(verbose: bool, cli_log_level: Option<&str>, file_config: &LoggingConfig) {
+fn init_logging(verbose: bool, cli_log_level: Option<&str>, logging: &LoggingSettings) {
     let env_filter = if verbose {
         EnvFilter::new(format!("{}", Level::DEBUG))
-    } else if let Some(cli_lvl) = cli_log_level {
-        if !cli_lvl.is_empty() && is_log_level_off(cli_lvl) {
-            EnvFilter::new("off")
-        } else if !cli_lvl.is_empty() {
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(cli_lvl))
-        } else {
-            build_file_env_filter(file_config)
-        }
+    } else if let Some(level) = cli_log_level {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level))
     } else {
-        build_file_env_filter(file_config)
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(logging.level.clone()))
     };
 
-    let format = file_config.format.as_deref().unwrap_or("pretty");
-
     let subscriber = tracing_subscriber::registry().with(env_filter);
+    let layer = fmt::layer()
+        .with_target(logging.with_target)
+        .with_thread_ids(logging.with_thread_ids)
+        .with_file(logging.with_file)
+        .with_line_number(logging.with_line_number);
 
-    if let Some(ref log_file) = file_config.log_file {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-            .expect("Failed to open log file");
-        let file_writer = std::sync::Mutex::new(file);
-        let file_layer = fmt::layer()
-            .with_writer(file_writer)
-            .with_ansi(false)
-            .json();
-        match format {
-            "compact" => subscriber.with(file_layer.compact()).init(),
-            _ => subscriber.with(file_layer).init(),
+    match logging.format.as_str() {
+        "json" => subscriber.with(layer.json()).init(),
+        "compact" => subscriber.with(layer.compact()).init(),
+        _ => subscriber.with(layer.pretty()).init(),
+    }
+}
+
+fn apply_cli_overrides(cli: &Cli, config: &mut AppConfig) {
+    if let Some(api_key) = &cli.api_key {
+        config.client.api_key = Some(api_key.clone());
+    }
+    if let Some(base_url) = &cli.base_url {
+        config.client.base_url = base_url.clone();
+    }
+    if let Some(model) = &cli.model {
+        config.agent.model = model.clone();
+    }
+    if let Some(max_iterations) = cli.max_iterations {
+        config.agent.max_iterations = max_iterations;
+    }
+    if let Some(timeout) = cli.tool_timeout {
+        config.agent.tool_timeout_secs = timeout;
+    }
+    if let Some(timeout) = cli.request_timeout {
+        config.agent.request_timeout_secs = timeout;
+        config.client.timeout_secs = timeout;
+    }
+    if let Some(window) = cli.context_window {
+        config.agent.context_window = window;
+        config.client.max_context_length = window;
+    }
+    if let Some(healing) = cli.max_healing_attempts {
+        config.agent.max_healing_attempts = healing;
+    }
+    if cli.stream {
+        config.agent.stream = true;
+    }
+    if cli.no_stream {
+        config.agent.stream = false;
+    }
+}
+
+fn client_config(config: &AppConfig) -> ClientConfig {
+    ClientConfig::from(&config.client)
+}
+
+fn agent_config(
+    config: &AppConfig,
+    behavior: &BehaviorSettings,
+    system_prompt: Option<&str>,
+) -> AgentConfig {
+    let mut agent = AgentConfig::from(behavior);
+    if let Some(prompt) = system_prompt {
+        agent.system_prompt = Some(prompt.to_string());
+    }
+    agent.request_timeout = Duration::from_secs(config.agent.request_timeout_secs);
+    agent
+}
+
+pub(crate) async fn build_registry(
+    config: &AppConfig,
+    mcp_manager: &mut McpManager,
+) -> Result<ToolRegistry> {
+    let registry = ToolRegistry::new(Duration::from_secs(config.tools.registry_timeout_secs));
+    hermes_core::tools::register_builtin_tools(&registry).await?;
+    registry.register(EchoTool::new()).await?;
+    registry.register(CalculatorTool::new()).await?;
+
+    if config.mcp.autoload {
+        for server in config.mcp.servers.iter().filter(|server| server.enabled) {
+            if mcp_manager.get(&server.name).is_none() {
+                connect_mcp_server(mcp_manager, server).await?;
+            }
         }
-    } else {
-        let layer = fmt::layer()
-            .with_target(file_config.with_target.unwrap_or(false))
-            .with_thread_ids(file_config.with_thread_ids.unwrap_or(false))
-            .with_file(file_config.with_file.unwrap_or(false))
-            .with_line_number(file_config.with_line_number.unwrap_or(false));
-        match format {
-            "json" => subscriber.with(layer.json()).init(),
-            "compact" => subscriber.with(layer.compact()).init(),
-            _ => subscriber.with(layer.pretty()).init(),
+
+        for tool in mcp_manager.get_all_tools().await {
+            registry.register(tool).await?;
         }
     }
+
+    Ok(registry)
 }
 
-/// Print the Hermes banner
-fn print_banner() {
-    let banner = r#"
-╔═══════════════════════════════════════════════════════════════════════════╗
-║                                                                           ║
-║ ██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗      ██████╗ ███████╗ ║
-║ ██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝      ██╔══██╗██╔════╝ ║
-║ ███████║█████╗  ██████╔╝██╔████╔██║█████╗  ███████╗█████╗██████╔╝███████╗ ║
-║ ██╔══██║██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══╝  ╚════██║╚════╝██╔══██╗╚════██║ ║
-║ ██║  ██║███████╗██║  ██║██║ ╚═╝ ██║███████╗███████║      ██║  ██║███████║ ║
-║ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝      ╚═╝  ╚═╝╚══════╝ ║
-║                                                                           ║
-╚═══════════════════════════════════════════════════════════════════════════╝
-                    High-Performance AI Agent Framework
-"#;
-    println!("{}", style(banner).cyan());
-    println!();
-}
-
-fn print_assistant_message(text: &str) {
-    println!("{}", style("Assistant:").cyan().bold());
-    let lines: Vec<&str> = text.lines().collect();
-    for line in lines {
-        println!("  {}", line);
+async fn connect_mcp_server(mcp_manager: &mut McpManager, server: &McpServerConfig) -> Result<()> {
+    match server.transport {
+        McpTransportKind::Http => {
+            let url = server
+                .url
+                .clone()
+                .context("Configured HTTP MCP server is missing a URL")?;
+            mcp_manager
+                .add_server(server.name.clone(), url, server.auth_token.clone())
+                .await?;
+        }
+        McpTransportKind::Stdio => {
+            let command = server
+                .command
+                .clone()
+                .context("Configured stdio MCP server is missing a command")?;
+            mcp_manager
+                .add_stdio_server(
+                    server.name.clone(),
+                    command,
+                    server.args.clone(),
+                    server.env.clone(),
+                )
+                .await?;
+        }
     }
-    println!();
+    Ok(())
 }
 
-fn print_done(message: &str) {
-    println!("\n{}", style("═".repeat(60)).dim());
-    println!("{}", style("Final Response:").cyan().bold());
-    let lines: Vec<&str> = message.lines().collect();
-    for line in lines {
-        println!("  {}", line);
-    }
-    println!("{}\n", style("═".repeat(60)).dim());
+pub(crate) async fn create_runtime_agent(
+    config: &AppConfig,
+    behavior: &BehaviorSettings,
+    system_prompt: Option<&str>,
+    event_tx: mpsc::Sender<AgentEvent>,
+    mcp_manager: &mut McpManager,
+) -> Result<HermesAgent> {
+    let client = OpenAIClient::new(client_config(config));
+    let registry = build_registry(config, mcp_manager).await?;
+    let agent_config = agent_config(config, behavior, system_prompt);
+    Ok(HermesAgent::with_events(
+        agent_config,
+        client,
+        registry,
+        event_tx,
+    ))
 }
 
-fn print_error(text: &str) {
-    eprintln!(
-        "{} {}",
-        style(format!("{}", ERROR)).red(),
-        style(text).red()
-    );
+async fn create_agent_without_events(
+    config: &AppConfig,
+    system_prompt: Option<&str>,
+    mcp_manager: &mut McpManager,
+) -> Result<HermesAgent> {
+    let client = OpenAIClient::new(client_config(config));
+    let registry = build_registry(config, mcp_manager).await?;
+    let agent_config = agent_config(config, &config.agent, system_prompt);
+    Ok(HermesAgent::new(agent_config, client, registry))
 }
 
-async fn run_with_tui(
-    agent: &HermesAgent,
-    event_rx: &mut mpsc::Receiver<AgentEvent>,
-    query: &str,
-    model: &str,
-    max_iterations: usize,
-    ui: &UiConfig,
-) -> Result<hermes_core::client::Message> {
-    while event_rx.try_recv().is_ok() {}
+async fn run_non_tui(config: &AppConfig, system_prompt: Option<&str>, query: &str) -> Result<()> {
+    let mut mcp_manager = McpManager::new();
+    let agent = create_agent_without_events(config, system_prompt, &mut mcp_manager).await?;
+    let response = agent.run(query.to_string()).await?;
+    println!("{}", response.content);
+    Ok(())
+}
 
-    let mut tui = LiveRunTui::enter(
-        model,
-        query,
-        max_iterations,
-        ui.show_thinking.unwrap_or(true),
-        ui.show_tool_calls.unwrap_or(true),
-        ui.show_iterations.unwrap_or(true),
-    )?;
-
-    let run_future = agent.run(query.to_string());
-    tokio::pin!(run_future);
-    let mut ticker = tokio::time::interval(Duration::from_millis(80));
-    let mut result: Option<
-        std::result::Result<hermes_core::client::Message, hermes_core::error::Error>,
-    > = None;
+async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result<()> {
+    let mut mcp_manager = McpManager::new();
+    let agent = create_agent_without_events(config, system_prompt, &mut mcp_manager).await?;
 
     loop {
-        tokio::select! {
-            maybe_event = event_rx.recv() => {
-                if let Some(event) = maybe_event {
-                    tui.apply_event(&event);
-                }
-            }
-            response = &mut run_future, if result.is_none() => {
-                result = Some(response);
-            }
-            _ = ticker.tick() => {}
+        print!("You: ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        if input.is_empty() {
+            continue;
+        }
+        if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
+            break;
+        }
+        if input.eq_ignore_ascii_case("clear") {
+            agent.clear_history().await;
+            println!("Conversation cleared.");
+            continue;
         }
 
-        tui.draw()?;
-
-        if result.is_some() && event_rx.is_empty() {
-            break;
+        match agent.run(input.to_string()).await {
+            Ok(response) => println!("Assistant: {}\n", response.content),
+            Err(error) => eprintln!("Error: {}\n", error),
         }
     }
 
-    tui.exit()?;
-
-    result
-        .context("agent run did not produce a result")?
-        .map_err(anyhow::Error::from)
+    Ok(())
 }
 
-/// Build the tool registry with built-in tools
-async fn build_registry(timeout: Duration) -> ToolRegistry {
-    let registry = ToolRegistry::new(timeout);
-    hermes_core::tools::register_builtin_tools(&registry)
-        .await
-        .unwrap();
-    registry.register(EchoTool::new()).await.unwrap();
-    registry.register(CalculatorTool::new()).await.unwrap();
-    registry
+async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
+    let mut mcp_manager = McpManager::new();
+    let registry = build_registry(config, &mut mcp_manager).await?;
+    let tools = registry.get_schemas().await;
+
+    for tool in tools {
+        println!("{}: {}", tool.name, tool.description);
+        if verbose {
+            println!("{}", serde_json::to_string_pretty(&tool.parameters)?);
+        }
+    }
+
+    Ok(())
 }
 
-/// Simple echo tool for testing
+async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> Result<()> {
+    let mut mcp_manager = McpManager::new();
+    let registry = build_registry(config, &mut mcp_manager).await?;
+    let parsed_args: Value = if let Some(args) = args {
+        serde_json::from_str(args).context("Failed to parse tool arguments as JSON")?
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+
+    let result = registry
+        .execute(
+            tool_name,
+            &format!("test_{}", tool_name),
+            parsed_args,
+            ToolContext::default(),
+        )
+        .await?;
+
+    println!("success: {}", result.success);
+    println!("content: {}", result.content);
+    if let Some(error) = result.error {
+        println!("error: {}", error);
+    }
+
+    Ok(())
+}
+
 struct EchoTool;
 
 impl EchoTool {
@@ -435,7 +374,7 @@ impl HermesTool for EchoTool {
     }
 
     async fn execute(&self, args: Value, _context: ToolContext) -> hermes_core::tools::ToolResult {
-        if let Some(msg) = args.get("message").and_then(|v| v.as_str()) {
+        if let Some(msg) = args.get("message").and_then(|value| value.as_str()) {
             hermes_core::tools::ToolResult::success("echo", serde_json::json!({ "echoed": msg }))
         } else {
             hermes_core::tools::ToolResult::error("echo", "Missing 'message' argument")
@@ -443,7 +382,6 @@ impl HermesTool for EchoTool {
     }
 }
 
-/// Calculator tool
 struct CalculatorTool;
 
 impl CalculatorTool {
@@ -459,7 +397,7 @@ impl HermesTool for CalculatorTool {
     }
 
     fn description(&self) -> &str {
-        "Perform a calculation. Supports basic operations: add, subtract, multiply, divide."
+        "Perform a calculation. Supports add, subtract, multiply, and divide."
     }
 
     fn schema(&self) -> hermes_core::schema::ToolSchema {
@@ -478,18 +416,24 @@ impl HermesTool for CalculatorTool {
     }
 
     async fn execute(&self, args: Value, _context: ToolContext) -> hermes_core::tools::ToolResult {
-        let op = args
+        let operation = args
             .get("operation")
-            .and_then(|v| v.as_str())
+            .and_then(|value| value.as_str())
             .unwrap_or("add");
-        let a = args.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let b = args.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let a = args
+            .get("a")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        let b = args
+            .get("b")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
 
-        let result = match op {
-            "add" | "addition" | "+" => a + b,
-            "subtract" | "subtraction" | "-" => a - b,
-            "multiply" | "multiplication" | "*" | "x" => a * b,
-            "divide" | "division" | "/" => {
+        let result = match operation {
+            "add" | "+" => a + b,
+            "subtract" | "-" => a - b,
+            "multiply" | "*" | "x" => a * b,
+            "divide" | "/" => {
                 if b == 0.0 {
                     return hermes_core::tools::ToolResult::error("calculate", "Division by zero");
                 }
@@ -498,15 +442,15 @@ impl HermesTool for CalculatorTool {
             _ => {
                 return hermes_core::tools::ToolResult::error(
                     "calculate",
-                    format!("Unknown operation: {}", op),
-                );
+                    format!("Unknown operation: {}", operation),
+                )
             }
         };
 
         hermes_core::tools::ToolResult::success(
             "calculate",
             serde_json::json!({
-                "operation": op,
+                "operation": operation,
                 "operand_a": a,
                 "operand_b": b,
                 "result": result
@@ -515,384 +459,53 @@ impl HermesTool for CalculatorTool {
     }
 }
 
-/// Run the agent with a single query, streaming events
-async fn run_agent(
-    cli: &Cli,
-    config: &FileConfig,
-    system_prompt: Option<&str>,
-    query: &str,
-) -> Result<()> {
-    let client_config = config.merge_with(cli);
-    let client = OpenAIClient::new(client_config);
-    let registry = build_registry(config.tool_registry_timeout()).await;
-    let agent_config = config.agent_config(cli, system_prompt);
-    let max_iterations = agent_config.max_iterations;
-
-    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(config.event_channel_size());
-    let agent = HermesAgent::with_events(agent_config.clone(), client, registry, event_tx);
-
-    let ui = &config.ui;
-    let rich = ui.rich_output.unwrap_or(true);
-    let show_thinking = ui.show_thinking.unwrap_or(true);
-    let show_tool_calls = ui.show_tool_calls.unwrap_or(true);
-    let show_iterations = ui.show_iterations.unwrap_or(true);
-
-    if rich {
-        let response = run_with_tui(
-            &agent,
-            &mut event_rx,
-            query,
-            &agent_config.model,
-            max_iterations,
-            ui,
-        )
-        .await?;
-        print_done(&response.content);
-    } else {
-        let _agent_handle = tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                match event {
-                    AgentEvent::Thinking { content } => {
-                        if show_thinking {
-                            println!("[Thinking] {}", content);
-                        }
-                    }
-                    AgentEvent::Reasoning { text } => {
-                        if show_thinking {
-                            println!("[Reasoning] {}", text);
-                        }
-                    }
-                    AgentEvent::ToolStart { name, arguments } => {
-                        if show_tool_calls {
-                            println!("\n[Tool] Calling: {} with {}", name, arguments);
-                        }
-                    }
-                    AgentEvent::ToolComplete { result } => {
-                        if show_tool_calls {
-                            if result.success {
-                                println!("[Tool] Result: {}\n", result.content);
-                            } else {
-                                println!(
-                                    "[Tool] Error: {}\n",
-                                    result.error.clone().unwrap_or_default()
-                                );
-                            }
-                        }
-                    }
-                    AgentEvent::ToolError { name, error } => {
-                        if show_tool_calls {
-                            println!("[Tool] {} failed: {}\n", name, error);
-                        }
-                    }
-                    AgentEvent::Content { text } => {
-                        print!("{}", text);
-                        use std::io::Write;
-                        let _ = std::io::stdout().flush();
-                    }
-                    AgentEvent::Done { message } => {
-                        println!("\n\n[Done] Final response: {}\n", message.content);
-                    }
-                    AgentEvent::IterationComplete { iteration } => {
-                        if show_iterations {
-                            println!("\n[Iteration {} complete]", iteration);
-                        }
-                    }
-                    AgentEvent::Error { error } => {
-                        eprintln!("\n[Error] {}\n", error);
-                    }
-                }
-            }
-        });
-
-        match agent.run(query.to_string()).await {
-            Ok(response) => {
-                println!("\nAgent Response:\n{}", response.content);
-            }
-            Err(e) => {
-                error!("Agent failed: {}", e);
-                anyhow::bail!("Agent error: {}", e);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// List available tools
-async fn list_tools(config: &FileConfig, verbose: bool) -> Result<()> {
-    let registry = build_registry(config.tool_registry_timeout()).await;
-    let tools = registry.get_schemas().await;
-
-    if tools.is_empty() {
-        println!("No tools registered.");
-        return Ok(());
-    }
-
-    println!(
-        "\n{} Available tools ({} total):\n",
-        style("🔧").yellow(),
-        tools.len()
-    );
-
-    for (i, tool) in tools.iter().enumerate() {
-        println!(
-            "  {}. {}: {}",
-            style(i + 1).cyan().bold(),
-            style(&tool.name).white().bold(),
-            style(&tool.description).dim()
-        );
-
-        if verbose {
-            println!(
-                "     Schema: {}",
-                serde_json::to_string_pretty(&tool.parameters).unwrap_or_default()
-            );
-        }
-        println!();
-    }
-
-    Ok(())
-}
-
-/// Interactive chat mode
-async fn chat_mode(cli: &Cli, config: &FileConfig, system_prompt: Option<&str>) -> Result<()> {
-    use std::io::{self, Write};
-
-    let rich = config.ui.rich_output.unwrap_or(true);
-
-    if rich {
-        print_banner();
-        println!(
-            "  {} Type 'exit' or 'quit' to end the conversation.",
-            style("💡").dim()
-        );
-        println!(
-            "  {} Type 'clear' to clear conversation history.\n",
-            style("💡").dim()
-        );
-        println!("{}", style("─".repeat(60)).dim());
-    } else {
-        println!("Hermes-RS Chat Mode");
-        println!("Type 'exit' or 'quit' to end the conversation.\n");
-    }
-
-    let client_config = config.merge_with(cli);
-    let client = OpenAIClient::new(client_config);
-    let registry = build_registry(config.tool_registry_timeout()).await;
-    let agent_config = config.agent_config(cli, system_prompt);
-
-    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(config.event_channel_size());
-    let agent = HermesAgent::with_events(agent_config.clone(), client, registry, event_tx);
-
-    loop {
-        if rich {
-            print!("{} ", style("You:").green().bold());
-        } else {
-            print!("You: ");
-        }
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-
-        if input.is_empty() {
-            continue;
-        }
-
-        if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
-            if rich {
-                println!("\n{}", style("Goodbye! 👋").cyan());
-            } else {
-                println!("Goodbye!");
-            }
-            break;
-        }
-
-        if input.eq_ignore_ascii_case("clear") {
-            agent.clear_history().await;
-            if rich {
-                println!("\n{} Conversation history cleared.\n", style(DONE).green());
-            } else {
-                println!("Conversation history cleared.\n");
-            }
-            continue;
-        }
-
-        match if rich {
-            run_with_tui(
-                &agent,
-                &mut event_rx,
-                input,
-                &agent_config.model,
-                agent_config.max_iterations,
-                &config.ui,
-            )
-            .await
-        } else {
-            agent
-                .run(input.to_string())
-                .await
-                .map_err(anyhow::Error::from)
-        } {
-            Ok(response) => {
-                if rich {
-                    println!("{}", style("─".repeat(60)).dim());
-                    print_assistant_message(&response.content);
-                } else {
-                    println!("\nAssistant: {}\n", response.content);
-                }
-            }
-            Err(e) => {
-                if rich {
-                    print_error(&format!("Agent error: {}", e));
-                } else {
-                    eprintln!("Error: {}\n", e);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Test a specific tool
-async fn test_tool(
-    _cli: &Cli,
-    config: &FileConfig,
-    tool_name: &str,
-    args: Option<&str>,
-) -> Result<()> {
-    let registry = build_registry(config.tool_registry_timeout()).await;
-
-    if !registry.contains(tool_name).await {
-        anyhow::bail!("Tool '{}' not found", tool_name);
-    }
-
-    println!("\nTesting tool: {}", style(tool_name).cyan().bold());
-    println!(
-        "Arguments: {}",
-        serde_json::to_string_pretty(&args.map(String::from).unwrap_or_default())
-            .unwrap_or_default()
-    );
-
-    let parsed_args: Value = if let Some(args_str) = args {
-        serde_json::from_str(args_str).context("Failed to parse tool arguments as JSON")?
-    } else {
-        Value::Object(serde_json::Map::new())
-    };
-
-    let result = registry
-        .execute(
-            tool_name,
-            &format!("test_{}", tool_name),
-            parsed_args,
-            ToolContext::default(),
-        )
-        .await?;
-
-    println!("\n{} Result:", style("📋").yellow());
-    println!("  Success: {}", result.success);
-    println!("  Content: {}", result.content);
-    if let Some(error) = result.error {
-        println!("  Error: {}", style(error).red());
-    }
-
-    Ok(())
-}
-
-/// Load configuration from file or defaults
-fn load_config(cli: &Cli) -> FileConfig {
-    if let Some(ref config_path) = cli.config {
-        let contents = match std::fs::read_to_string(config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    "Failed to read config file {}: {}",
-                    config_path.display(),
-                    e
-                );
-                return FileConfig::default();
-            }
-        };
-
-        let ext = config_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("yaml");
-
-        match ext {
-            "json" => serde_json::from_str(&contents).unwrap_or_else(|e| {
-                warn!("Failed to parse JSON config: {}", e);
-                FileConfig::default()
-            }),
-            "toml" => toml::from_str(&contents).unwrap_or_else(|e| {
-                warn!("Failed to parse TOML config: {}", e);
-                FileConfig::default()
-            }),
-            _ => serde_yaml::from_str(&contents).unwrap_or_else(|e| {
-                warn!("Failed to parse YAML config: {}", e);
-                FileConfig::default()
-            }),
-        }
-    } else {
-        let default_paths = vec![
-            PathBuf::from("hermes.toml"),
-            PathBuf::from(".hermes.toml"),
-            dirs::config_dir()
-                .map(|p| p.join("hermes").join("config.toml"))
-                .unwrap_or_default(),
-        ];
-
-        for path in default_paths {
-            if path.exists() {
-                let contents = match std::fs::read_to_string(&path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let file_config: FileConfig = match ext {
-                    "toml" => toml::from_str(&contents).unwrap_or_else(|_| FileConfig::default()),
-                    "json" => {
-                        serde_json::from_str(&contents).unwrap_or_else(|_| FileConfig::default())
-                    }
-                    _ => serde_yaml::from_str(&contents).unwrap_or_else(|_| FileConfig::default()),
-                };
-                info!("Loaded config from: {}", path.display());
-                return file_config;
-            }
-        }
-
-        FileConfig::default()
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = load_config(&cli);
+    let mut loaded = load_app_config(cli.config.as_deref())?;
+    loaded.config.apply_env_overrides()?;
+    apply_cli_overrides(&cli, &mut loaded.config);
+    install_runtime_config(loaded.config.clone());
 
-    init_logging(cli.verbose, cli.log_level.as_deref(), &config.logging);
-
-    debug!("Hermes-RS CLI starting");
-    debug!("Arguments: {:?}", cli);
-    debug!("Config: {:?}", config);
+    init_logging(
+        cli.verbose,
+        cli.log_level.as_deref(),
+        &loaded.config.logging,
+    );
 
     match &cli.command {
         Commands::Run { system, query } => {
             let query = query
                 .as_ref()
-                .context("No query provided. Use --query or enter interactive mode.")?;
-            run_agent(&cli, &config, system.as_deref(), query).await?;
-        }
-        Commands::Tools { verbose } => {
-            list_tools(&config, *verbose).await?;
+                .context("No query provided. Use --query or start chat mode.")?;
+            if loaded.config.tui.rich_output {
+                TuiApp::enter(
+                    loaded.config.clone(),
+                    system.clone(),
+                    LaunchMode::Query(query.clone()),
+                )
+                .await?
+                .run()
+                .await?;
+            } else {
+                run_non_tui(&loaded.config, system.as_deref(), query).await?;
+            }
         }
         Commands::Chat { system } => {
-            chat_mode(&cli, &config, system.as_deref()).await?;
+            if loaded.config.tui.rich_output {
+                TuiApp::enter(loaded.config.clone(), system.clone(), LaunchMode::Landing)
+                    .await?
+                    .run()
+                    .await?;
+            } else {
+                chat_non_tui(&loaded.config, system.as_deref()).await?;
+            }
+        }
+        Commands::Tools { verbose } => {
+            list_tools(&loaded.config, *verbose).await?;
         }
         Commands::Test { tool_name, args } => {
-            test_tool(&cli, &config, tool_name, args.as_deref()).await?;
+            test_tool(&loaded.config, tool_name, args.as_deref()).await?;
         }
     }
 

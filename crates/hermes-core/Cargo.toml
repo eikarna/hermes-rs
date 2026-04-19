@@ -25,6 +25,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
+toml = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -37,6 +38,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 regex = "1.10"
 lazy_static = "1.4"
+dirs = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

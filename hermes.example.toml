@@ -1,26 +1,99 @@
-# Hermes-RS Configuration Example
+# Hermes-RS configuration example
 
-# Model configuration
+[client]
+base_url = "https://api.openai.com/v1"
+# api_key = "set me or use OPENAI_API_KEY"
+timeout_secs = 60
+max_context_length = 128000
+
+[agent]
 model = "gpt-4"
 max_iterations = 20
-tool_timeout = 30
-
-# API configuration (can also use environment variables)
-# api_key = "your_api_key_here"
-base_url = "https://api.openai.com/v1"
-
-# Context window size
+tool_timeout_secs = 30
+request_timeout_secs = 120
+stream = true
 context_window = 128000
+max_healing_attempts = 3
+show_reasoning = true
+# system_prompt = "You are Hermes."
 
-# System prompt (optional)
-# system_prompt = """
-# You are Hermes, an advanced AI assistant with access to various tools.
-# Use tools when needed to help the user accomplish their goals.
-# """
-
-# Logging configuration
 [logging]
 level = "info"
-format = "json"  # or "pretty"
-with_target = true
-with_thread_ids = true
+format = "pretty"
+with_target = false
+with_thread_ids = false
+with_file = false
+with_line_number = false
+
+[tui]
+theme = "opencode"
+rich_output = true
+show_tool_calls = true
+show_iterations = true
+landing_title = "HERMES"
+prompt_placeholder = "Ask anything... \"Fix a TODO in the codebase\""
+refresh_rate_ms = 80
+compact_width = 96
+medium_width = 140
+
+[mcp]
+autoload = true
+
+[[mcp.servers]]
+name = "filesystem-demo"
+transport = "http"
+url = "http://127.0.0.1:8080/mcp"
+# auth_token = "optional"
+enabled = false
+
+[[mcp.servers]]
+name = "stdio-demo"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+enabled = false
+[mcp.servers.env]
+# EXAMPLE_ROOT = "C:/workspace"
+
+[skills]
+root_dir = "C:/Users/Administrator/.config/hermes/skills"
+autoload = true
+template_name = "new-skill"
+template_description = "Describe what this skill does."
+
+[gateway]
+telegram_enabled = false
+# telegram_token = ""
+telegram_api_base = "https://api.telegram.org"
+discord_enabled = false
+# discord_token = ""
+discord_api_base = "https://discord.com/api/v10"
+slack_enabled = false
+# slack_token = ""
+slack_api_base = "https://slack.com/api"
+webhooks_enabled = false
+# webhooks_addr = "127.0.0.1:8080"
+admins = []
+
+[tools]
+registry_timeout_secs = 30
+event_channel_size = 100
+
+[tools.web]
+search_url = "https://lite.duckduckgo.com/lite/?q={query}"
+search_timeout_secs = 15
+fetch_timeout_secs = 30
+user_agent = "Mozilla/5.0 (compatible; HermesAgent/0.1)"
+default_results = 10
+max_results = 20
+
+[tools.http]
+timeout_secs = 30
+
+[tools.terminal]
+max_timeout_secs = 300
+max_output_bytes = 1000000
+
+[tools.code_execution]
+default_timeout_secs = 60
+max_timeout_secs = 300

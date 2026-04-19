@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -13,7 +14,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ─── Native builds (compile + run on same arch) ───────────────────
   native:
     name: Native (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -25,16 +25,20 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: hermes-linux-x86_64
-
+            bin: hermes
+            archive: tar.gz
           - name: macOS ARM64
             os: macos-latest
             target: aarch64-apple-darwin
             artifact: hermes-macos-arm64
-
+            bin: hermes
+            archive: tar.gz
           - name: Windows x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: hermes-windows-x86_64
+            bin: hermes.exe
+            archive: zip
 
     steps:
       - uses: actions/checkout@v4
@@ -47,19 +51,33 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build (release)
+      - name: Build
         run: cargo build --workspace --release --target ${{ matrix.target }}
 
-      - name: Upload binary
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.bin }}"
+          rm "dist/${{ matrix.bin }}"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
+          Compress-Archive -Path "dist/${{ matrix.bin }}" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
+          Remove-Item "dist/${{ matrix.bin }}"
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            target/${{ matrix.target }}/release/hermes
-            target/${{ matrix.target }}/release/hermes.exe
-          if-no-files-found: ignore
+          path: dist/${{ matrix.artifact }}.${{ matrix.archive }}
 
-  # ─── Cross-compiled builds (exotic targets via `cross`) ───────────
   cross:
     name: Cross (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -67,34 +85,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Alpine / Static binaries (musl) ──
-          # Production Docker scratch containers, minimal distros
           - name: Linux x86_64 musl
             target: x86_64-unknown-linux-musl
             artifact: hermes-linux-x86_64-musl
-
           - name: Linux ARM64 musl
             target: aarch64-unknown-linux-musl
             artifact: hermes-linux-arm64-musl
-
-          # ── Raspberry Pi / ARM servers ──
-          # RPi 4/5, AWS Graviton, Oracle Ampere, Hetzner ARM
-          - name: Linux ARM64 (RPi4/5, Graviton)
+          - name: Linux ARM64
             target: aarch64-unknown-linux-gnu
             artifact: hermes-linux-arm64
-
-          # RPi 2/3, older ARM SBCs
-          - name: Linux ARMv7 (RPi2/3)
+          - name: Linux ARMv7
             target: armv7-unknown-linux-gnueabihf
             artifact: hermes-linux-armv7
-
-          # ── Android ──
           - name: Android ARM64
             target: aarch64-linux-android
             artifact: hermes-android-arm64
-
-          # ── FreeBSD ──
-          # Server/NAS deployments, TrueNAS, OPNsense
           - name: FreeBSD x86_64
             target: x86_64-unknown-freebsd
             artifact: hermes-freebsd-x86_64
@@ -113,12 +118,19 @@ jobs:
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build (release)
+      - name: Build
         run: cross build --workspace --release --target ${{ matrix.target }}
 
-      - name: Upload binary
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/hermes" "dist/hermes"
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" hermes
+          rm "dist/hermes"
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/hermes
-          if-no-files-found: ignore
+          path: dist/${{ matrix.artifact }}.tar.gz

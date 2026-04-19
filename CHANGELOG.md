@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-04-19
+
+### Added
+
+- Shared TOML-backed `AppConfig` runtime configuration across `hermes-cli` and `hermes-core`
+- Config discovery with precedence `defaults < hermes.toml/.hermes.toml/config.toml < env vars < CLI flags`
+- Config sections for client, agent behavior, TUI, MCP, skills, gateway, and tool/runtime defaults
+- Responsive ratatui application architecture with landing and workspace views split across dedicated state, action, form, render, and app modules
+- In-TUI panels for Session, MCP, Skills, and Behavior management, including modal forms for MCP server creation, skill creation, and behavior editing
+- Example-config parse coverage to keep `hermes.example.toml` synchronized with the Rust config schema
+- GitHub release workflow that extracts matching release notes from `CHANGELOG.md` and publishes tagged build artifacts to GitHub Releases
+
+### Changed
+
+- Replaced ad hoc CLI-only config parsing with shared core config loading and runtime installation
+- Moved runtime-tunable defaults and provider/tool endpoints out of scattered literals in `client`, `agent`, `gateway`, `web_tools`, `http_tool`, `terminal_tool`, and `code_execution`
+- Reworked rich `run` and `chat` flows to launch the new TUI instead of the previous single-screen live monitor
+- Updated build workflow artifact naming so tag builds can be promoted directly into release assets
+- Bumped crate versioning to `0.1.1`
+
+### Fixed
+
+- Reasoning, MCP, skills, and behavior state now render as dedicated TUI surfaces instead of raw merged text
+- Missing or invalid TOML configuration files now fail with user-facing diagnostics instead of silently falling back
+
 ## [0.1.0] - 2026-04-17
 
 ### Added
@@ -42,3 +67,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `schemars` 0.8, `tracing` 0.1, `anyhow` 1.0, `thiserror` 1.0
 
 [0.1.0]: https://github.com/nousresearch/hermes-rs/releases/tag/v0.1.0
+[0.1.1]: https://github.com/nousresearch/hermes-rs/releases/tag/v0.1.1

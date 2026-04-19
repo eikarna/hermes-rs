@@ -11,6 +11,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::client::{ChatStreamEvent, ChatStreamResponse, Message, OpenAIClient, ToolCall};
+use crate::config::{runtime_config, BehaviorSettings};
 use crate::error::{Error, Result};
 use crate::parser::{ToolCallParser, ToolCallStreamParser};
 use crate::tools::{ToolContext, ToolRegistry, ToolResult};
@@ -38,15 +39,21 @@ pub struct AgentConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
+        Self::from(&runtime_config().agent)
+    }
+}
+
+impl From<&BehaviorSettings> for AgentConfig {
+    fn from(settings: &BehaviorSettings) -> Self {
         Self {
-            model: "gpt-4".to_string(),
-            max_iterations: 20,
-            tool_timeout: Duration::from_secs(30),
-            request_timeout: Duration::from_secs(120),
-            system_prompt: None,
-            stream: true,
-            context_window: 128_000,
-            max_healing_attempts: 3,
+            model: settings.model.clone(),
+            max_iterations: settings.max_iterations,
+            tool_timeout: Duration::from_secs(settings.tool_timeout_secs),
+            request_timeout: Duration::from_secs(settings.request_timeout_secs),
+            system_prompt: settings.system_prompt.clone(),
+            stream: settings.stream,
+            context_window: settings.context_window,
+            max_healing_attempts: settings.max_healing_attempts,
         }
     }
 }

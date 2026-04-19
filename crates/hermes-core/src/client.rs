@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, instrument};
 
+use crate::config::{runtime_config, ClientSettings};
 use crate::error::{Error, Result};
 use crate::schema::ToolSchema;
 
@@ -36,11 +37,17 @@ pub struct ClientConfig {
 
 impl Default for ClientConfig {
     fn default() -> Self {
+        Self::from(&runtime_config().client)
+    }
+}
+
+impl From<&ClientSettings> for ClientConfig {
+    fn from(settings: &ClientSettings) -> Self {
         Self {
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: None,
-            timeout: Duration::from_secs(60),
-            max_context_length: 128_000,
+            base_url: settings.base_url.clone(),
+            api_key: settings.api_key.clone(),
+            timeout: Duration::from_secs(settings.timeout_secs),
+            max_context_length: settings.max_context_length,
         }
     }
 }
@@ -68,17 +75,18 @@ impl OpenAIClient {
 
     /// Create from environment variables
     pub fn from_env() -> Result<Self> {
+        let base = runtime_config();
         let api_key = std::env::var("OPENAI_API_KEY")
             .ok()
             .filter(|k| !k.is_empty());
 
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+        let base_url = std::env::var("OPENAI_BASE_URL").unwrap_or(base.client.base_url);
 
         Ok(Self::new(ClientConfig {
             base_url,
-            api_key,
-            ..Default::default()
+            api_key: api_key.or(base.client.api_key),
+            timeout: Duration::from_secs(base.client.timeout_secs),
+            max_context_length: base.client.max_context_length,
         }))
     }
 
