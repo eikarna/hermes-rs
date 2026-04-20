@@ -18,9 +18,7 @@ pub enum Action {
     UpdateModal(Modal),
     StartRun(String),
     AgentEvent(AgentEvent),
-    RunFailed(String),
     ClearSession,
-    SetFooter(String),
     SyncMcp(Vec<McpServerItem>),
     SyncSkills(Vec<SkillItem>),
     SelectNext,
@@ -46,9 +44,7 @@ impl AppState {
             Action::UpdateModal(modal) => self.ui.modal = Some(modal),
             Action::StartRun(query) => self.begin_run(query),
             Action::AgentEvent(event) => self.apply_agent_event(event),
-            Action::RunFailed(error) => self.fail_run(error),
             Action::ClearSession => self.clear_session(),
-            Action::SetFooter(footer) => self.ui.footer = footer,
             Action::SyncMcp(servers) => {
                 self.persistent.mcp_servers = servers;
                 self.ui.selected_mcp = self

@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
 use crate::tui::state::{
@@ -14,13 +14,15 @@ const PANEL_ALT: Color = Color::Rgb(18, 17, 15);
 const ACCENT: Color = Color::Rgb(232, 165, 54);
 const TEXT: Color = Color::Rgb(230, 228, 222);
 const MUTED: Color = Color::Rgb(134, 132, 126);
+const HELP: Color = Color::Rgb(188, 184, 176);
 const SUCCESS: Color = Color::Rgb(115, 185, 115);
 const ERROR: Color = Color::Rgb(220, 98, 87);
 const WARN: Color = Color::Rgb(208, 170, 82);
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(background_fill(area, BG), area);
 
     match state.ui.view {
         crate::tui::state::ViewMode::Landing => render_landing(frame, state, area),
@@ -40,6 +42,11 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
 }
 
 fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    if area.width < 100 {
+        render_landing_compact(frame, state, area);
+        return;
+    }
+
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -54,15 +61,14 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let title = Paragraph::new(Text::from(vec![
         Line::from(Span::styled(
             state.persistent.config.tui.landing_title.clone(),
-            Style::default()
-                .fg(TEXT)
-                .add_modifier(Modifier::BOLD | Modifier::RAPID_BLINK),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "prompt-first terminal agent",
             Style::default().fg(MUTED),
         )),
     ]))
+    .style(Style::default().bg(BG))
     .alignment(Alignment::Center);
     frame.render_widget(title, vertical[1]);
 
@@ -109,37 +115,159 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let prompt_area = centered_rect(52, 8, area);
     frame.render_widget(prompt, prompt_area);
 
+    let footer_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(vertical[4]);
+
     let footer = Paragraph::new(Text::from(vec![Line::from(vec![
         Span::styled(
             "tab",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" panels   ", Style::default().fg(MUTED)),
-        Span::styled("i", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
-        Span::styled(" prompt   ", Style::default().fg(MUTED)),
+        Span::styled(" panels   ", Style::default().fg(HELP)),
+        Span::styled(
+            "i",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" prompt   ", Style::default().fg(HELP)),
         Span::styled(
             "enter",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" run", Style::default().fg(MUTED)),
+        Span::styled(" run", Style::default().fg(HELP)),
     ])]))
+    .style(Style::default().bg(BG))
     .alignment(Alignment::Right);
-    frame.render_widget(footer, vertical[3]);
+    frame.render_widget(footer, footer_row[1]);
 
-    let status = Paragraph::new(Line::from(vec![
-        Span::styled(state.session.status.clone(), Style::default().fg(MUTED)),
-        Span::raw("  "),
-        Span::styled(
-            if state.session.running {
-                "live"
-            } else {
-                "idle"
-            },
-            Style::default().fg(ACCENT),
-        ),
-    ]))
+    let status = Paragraph::new(Line::from(vec![Span::styled(
+        status_summary(state),
+        Style::default()
+            .fg(status_color(state))
+            .add_modifier(Modifier::BOLD),
+    )]))
+    .style(Style::default().bg(BG))
     .alignment(Alignment::Left);
-    frame.render_widget(status, vertical[4]);
+    frame.render_widget(status, footer_row[0]);
+}
+
+fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let is_portrait_like = area.width < 56;
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if is_portrait_like {
+            [
+                Constraint::Length(4),
+                Constraint::Length(7),
+                Constraint::Length(4),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ]
+        } else {
+            [
+                Constraint::Length(4),
+                Constraint::Length(7),
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ]
+        })
+        .split(area);
+
+    let title = Paragraph::new(Text::from(vec![
+        Line::from(Span::styled(
+            state.persistent.config.tui.landing_title.clone(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "prompt-first terminal agent",
+            Style::default().fg(MUTED),
+        )),
+    ]))
+    .style(Style::default().bg(BG))
+    .alignment(Alignment::Center);
+    frame.render_widget(title, outer[0]);
+
+    let prompt_text = if state.ui.prompt_input.is_empty() {
+        state.persistent.config.tui.prompt_placeholder.clone()
+    } else {
+        state.ui.prompt_input.clone()
+    };
+    let prompt = Paragraph::new(Text::from(vec![
+        Line::from(Span::styled(
+            prompt_text,
+            Style::default()
+                .fg(if state.ui.prompt_input.is_empty() {
+                    MUTED
+                } else {
+                    TEXT
+                })
+                .add_modifier(if matches!(state.ui.input_mode, InputMode::Prompt) {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Plan",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" · "),
+            Span::styled(
+                state.persistent.behavior.model.clone(),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+    ]))
+    .block(panel_block("Prompt"))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(prompt, outer[1]);
+
+    let controls = if is_portrait_like {
+        vec![
+            Line::from(vec![
+                keycap("q"),
+                label(" quit   "),
+                keycap("i"),
+                label(" prompt"),
+            ]),
+            Line::from(vec![
+                keycap("Enter"),
+                label(" run   "),
+                keycap("Tab"),
+                label(" panels"),
+            ]),
+        ]
+    } else {
+        vec![Line::from(vec![
+            keycap("q"),
+            label(" quit   "),
+            keycap("i"),
+            label(" prompt   "),
+            keycap("Enter"),
+            label(" run   "),
+            keycap("Tab"),
+            label(" panels"),
+        ])]
+    };
+    let help = Paragraph::new(Text::from(controls))
+        .style(Style::default().bg(BG))
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(help, outer[2]);
+
+    let status = Paragraph::new(Line::from(vec![Span::styled(
+        status_summary(state),
+        Style::default()
+            .fg(status_color(state))
+            .add_modifier(Modifier::BOLD),
+    )]))
+    .style(Style::default().bg(BG))
+    .alignment(Alignment::Left);
+    frame.render_widget(status, outer[4]);
 }
 
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
@@ -307,8 +435,8 @@ fn reasoning_widget(state: &AppState) -> Paragraph<'_> {
         .wrap(Wrap { trim: false })
 }
 
-fn activity_widget(state: &AppState) -> List<'_> {
-    let items = state
+fn activity_widget(state: &AppState) -> Paragraph<'_> {
+    let mut lines = state
         .session
         .activity
         .iter()
@@ -316,26 +444,29 @@ fn activity_widget(state: &AppState) -> List<'_> {
         .take(6)
         .rev()
         .map(|entry| {
-            let color = match entry.tone {
-                Tone::Info => ACCENT,
-                Tone::Success => SUCCESS,
-                Tone::Warning => WARN,
-                Tone::Error => ERROR,
-            };
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled("> ", Style::default().fg(color)),
-                    Span::styled(
-                        entry.label.clone(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(Span::styled(entry.body.clone(), Style::default().fg(TEXT))),
+            let color = tone_color(entry.tone);
+            Line::from(vec![
+                Span::styled("• ", Style::default().fg(color)),
+                Span::styled(
+                    entry.label.clone(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(": ", Style::default().fg(MUTED)),
+                Span::styled(truncate_text(&entry.body, 72), Style::default().fg(TEXT)),
             ])
         })
         .collect::<Vec<_>>();
 
-    List::new(items).block(panel_block("Activity"))
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No activity yet.",
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    Paragraph::new(Text::from(lines))
+        .block(panel_block("Activity"))
+        .wrap(Wrap { trim: true })
 }
 
 fn footer_widget(state: &AppState) -> Paragraph<'_> {
@@ -344,6 +475,32 @@ fn footer_widget(state: &AppState) -> Paragraph<'_> {
     } else {
         state.ui.prompt_input.clone()
     };
+    let mut footer_line = vec![Span::styled(
+        state.ui.footer_help.clone(),
+        Style::default().fg(MUTED),
+    )];
+    let status = status_summary(state);
+    if let Some(notice) = &state.ui.footer_notice {
+        if !notice.text.eq_ignore_ascii_case(&status) {
+            footer_line.push(Span::raw("  "));
+            footer_line.push(Span::styled("•", Style::default().fg(MUTED)));
+            footer_line.push(Span::raw(" "));
+            footer_line.push(Span::styled(
+                notice.text.clone(),
+                Style::default()
+                    .fg(tone_color(notice.tone))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    footer_line.push(Span::raw("  "));
+    footer_line.push(Span::styled(
+        status,
+        Style::default()
+            .fg(status_color(state))
+            .add_modifier(Modifier::BOLD),
+    ));
+
     Paragraph::new(Text::from(vec![
         Line::from(vec![
             Span::styled(
@@ -364,20 +521,47 @@ fn footer_widget(state: &AppState) -> Paragraph<'_> {
                 }),
             ),
         ]),
-        Line::from(vec![
-            Span::styled(state.ui.footer.clone(), Style::default().fg(MUTED)),
-            Span::raw("  "),
-            Span::styled(
-                format!(
-                    "iter {}/{}",
-                    state.session.current_iteration, state.persistent.behavior.max_iterations
-                ),
-                Style::default().fg(TEXT),
-            ),
-        ]),
+        Line::from(footer_line),
     ]))
     .block(panel_block("Input"))
     .wrap(Wrap { trim: true })
+}
+
+fn status_summary(state: &AppState) -> String {
+    if state.session.running {
+        format!(
+            "step {} of {}",
+            state.session.current_iteration.max(1),
+            state.persistent.behavior.max_iterations
+        )
+    } else if state.session.error.is_some() {
+        "run failed".to_string()
+    } else if state.session.final_message.is_some() {
+        "completed".to_string()
+    } else {
+        "idle".to_string()
+    }
+}
+
+fn status_color(state: &AppState) -> Color {
+    if state.session.running {
+        ACCENT
+    } else if state.session.error.is_some() {
+        ERROR
+    } else if state.session.final_message.is_some() {
+        SUCCESS
+    } else {
+        HELP
+    }
+}
+
+fn tone_color(tone: Tone) -> Color {
+    match tone {
+        Tone::Info => ACCENT,
+        Tone::Success => SUCCESS,
+        Tone::Warning => WARN,
+        Tone::Error => ERROR,
+    }
 }
 
 fn panel_tabs(state: &AppState) -> Tabs<'_> {
@@ -753,6 +937,26 @@ fn panel_block(title: &str) -> Block<'static> {
         .style(Style::default().bg(PANEL))
 }
 
+fn keycap(text: &str) -> Span<'static> {
+    Span::styled(
+        text.to_string(),
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn label(text: &str) -> Span<'static> {
+    Span::styled(text.to_string(), Style::default().fg(HELP))
+}
+
+fn background_fill(area: Rect, color: Color) -> Paragraph<'static> {
+    let blank_line = " ".repeat(area.width as usize);
+    let lines = (0..area.height)
+        .map(|_| Line::raw(blank_line.clone()))
+        .collect::<Vec<_>>();
+
+    Paragraph::new(Text::from(lines)).style(Style::default().bg(color))
+}
+
 fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -786,6 +990,7 @@ fn truncate_text(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::Terminal;
 
     use hermes_core::config::AppConfig;
@@ -806,12 +1011,81 @@ mod tests {
             .join("")
     }
 
+    fn buffer(state: &AppState, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
     #[test]
     fn landing_layout_renders_prompt_first_shell() {
         let state = AppState::new(AppConfig::default(), String::new(), false);
         let text = buffer_text(&state, 120, 36);
         assert!(text.contains("HERMES"));
         assert!(text.contains("prompt"));
+    }
+
+    #[test]
+    fn compact_portrait_landing_wraps_controls() {
+        let state = AppState::new(AppConfig::default(), String::new(), false);
+        let text = buffer_text(&state, 40, 28);
+        assert!(text.contains("quit"));
+        assert!(text.contains("prompt"));
+        assert!(text.contains("run"));
+        assert!(text.contains("idle"));
+    }
+
+    #[test]
+    fn compact_landscape_landing_keeps_controls_below_prompt() {
+        let state = AppState::new(AppConfig::default(), String::new(), false);
+        let text = buffer_text(&state, 72, 24);
+        assert!(text.contains("panels"));
+        assert!(text.contains("quit"));
+        assert!(!text.contains("iter 0/"));
+    }
+
+    #[test]
+    fn wide_landing_renders_single_idle_and_visible_helpers() {
+        let state = AppState::new(AppConfig::default(), String::new(), false);
+        let buffer = buffer(&state, 120, 36);
+        let footer_row = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .find(|line| line.contains("idle") && line.contains("tab"))
+            .unwrap();
+        let idle_index = footer_row.find("idle").unwrap();
+        let tab_index = footer_row.find("tab").unwrap();
+
+        assert_eq!(footer_row.matches("idle").count(), 1);
+        assert!(tab_index > idle_index);
+        assert!(footer_row.contains("enter"));
+    }
+
+    #[test]
+    fn landing_canvas_uses_black_background() {
+        let state = AppState::new(AppConfig::default(), String::new(), false);
+        let buffer = buffer(&state, 120, 36);
+        assert!(buffer
+            .content
+            .iter()
+            .all(|cell| cell.bg == BG || cell.bg == PANEL));
+    }
+
+    #[test]
+    fn activity_panel_renders_run_failures() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.fail_run("OpenAI 401 unauthorized".to_string());
+
+        let text = buffer_text(&state, 160, 40);
+        assert!(text.contains("Activity"));
+        assert!(text.contains("Run failed: OpenAI 401 unauthorized"));
     }
 
     #[test]
@@ -843,5 +1117,7 @@ mod tests {
         let text = buffer_text(&state, 80, 32);
         assert!(text.contains("Session"));
         assert!(text.contains("Input"));
+        assert!(text.contains("idle"));
+        assert!(!text.contains("iter 0/"));
     }
 }

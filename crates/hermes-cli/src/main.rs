@@ -2,8 +2,10 @@
 
 mod tui;
 
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -23,6 +25,13 @@ use tracing::Level;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::tui::{LaunchMode, TuiApp};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogTarget {
+    Stderr,
+    Sink,
+    File,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -100,7 +109,12 @@ enum Commands {
     },
 }
 
-fn init_logging(verbose: bool, cli_log_level: Option<&str>, logging: &LoggingSettings) {
+fn init_logging(
+    verbose: bool,
+    cli_log_level: Option<&str>,
+    logging: &LoggingSettings,
+    rich_output: bool,
+) {
     let env_filter = if verbose {
         EnvFilter::new(format!("{}", Level::DEBUG))
     } else if let Some(level) = cli_log_level {
@@ -116,10 +130,52 @@ fn init_logging(verbose: bool, cli_log_level: Option<&str>, logging: &LoggingSet
         .with_file(logging.with_file)
         .with_line_number(logging.with_line_number);
 
-    match logging.format.as_str() {
-        "json" => subscriber.with(layer.json()).init(),
-        "compact" => subscriber.with(layer.compact()).init(),
-        _ => subscriber.with(layer.pretty()).init(),
+    match select_log_target(logging, rich_output) {
+        LogTarget::File => {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(logging.log_file.as_ref().expect("log file should exist"))
+                .expect("failed to open log file");
+            let writer = Mutex::new(file);
+            match logging.format.as_str() {
+                "json" => subscriber
+                    .with(layer.with_writer(writer).with_ansi(false).json())
+                    .init(),
+                "compact" => subscriber
+                    .with(layer.with_writer(writer).with_ansi(false).compact())
+                    .init(),
+                _ => subscriber
+                    .with(layer.with_writer(writer).with_ansi(false).pretty())
+                    .init(),
+            }
+        }
+        LogTarget::Sink => match logging.format.as_str() {
+            "json" => subscriber
+                .with(layer.with_writer(io::sink).with_ansi(false).json())
+                .init(),
+            "compact" => subscriber
+                .with(layer.with_writer(io::sink).with_ansi(false).compact())
+                .init(),
+            _ => subscriber
+                .with(layer.with_writer(io::sink).with_ansi(false).pretty())
+                .init(),
+        },
+        LogTarget::Stderr => match logging.format.as_str() {
+            "json" => subscriber.with(layer.json()).init(),
+            "compact" => subscriber.with(layer.compact()).init(),
+            _ => subscriber.with(layer.pretty()).init(),
+        },
+    }
+}
+
+fn select_log_target(logging: &LoggingSettings, rich_output: bool) -> LogTarget {
+    if logging.log_file.is_some() {
+        LogTarget::File
+    } else if rich_output {
+        LogTarget::Sink
+    } else {
+        LogTarget::Stderr
     }
 }
 
@@ -471,6 +527,7 @@ async fn main() -> Result<()> {
         cli.verbose,
         cli.log_level.as_deref(),
         &loaded.config.logging,
+        loaded.config.tui.rich_output,
     );
 
     match &cli.command {
@@ -510,4 +567,24 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rich_tui_without_log_file_uses_sink() {
+        let logging = LoggingSettings::default();
+        assert_eq!(select_log_target(&logging, true), LogTarget::Sink);
+    }
+
+    #[test]
+    fn log_file_overrides_sink() {
+        let logging = LoggingSettings {
+            log_file: Some("hermes.log".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(select_log_target(&logging, true), LogTarget::File);
+    }
 }

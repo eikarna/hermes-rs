@@ -82,6 +82,12 @@ pub struct ActivityItem {
 }
 
 #[derive(Debug, Clone)]
+pub struct FooterNotice {
+    pub text: String,
+    pub tone: Tone,
+}
+
+#[derive(Debug, Clone)]
 pub struct TranscriptEntry {
     pub role: &'static str,
     pub content: String,
@@ -162,7 +168,8 @@ pub struct UiState {
     pub selected_mcp: usize,
     pub selected_skill: usize,
     pub selected_behavior: usize,
-    pub footer: String,
+    pub footer_help: String,
+    pub footer_notice: Option<FooterNotice>,
     pub modal: Option<Modal>,
     pub should_quit: bool,
 }
@@ -195,12 +202,17 @@ impl AppState {
                 },
                 layout: LayoutMode::Wide,
                 active_panel: ActivePanel::Session,
-                input_mode: InputMode::Prompt,
+                input_mode: if start_in_workspace {
+                    InputMode::Prompt
+                } else {
+                    InputMode::Command
+                },
                 prompt_input: prompt,
                 selected_mcp: 0,
                 selected_skill: 0,
                 selected_behavior: 0,
-                footer: "i prompt  tab panels  m/s/b views  ctrl+l new session  q quit".to_string(),
+                footer_help: "tab panels  w/m/s/b views  ctrl+l new session  q quit".to_string(),
+                footer_notice: None,
                 modal: None,
                 should_quit: false,
             },
@@ -315,6 +327,7 @@ impl AppState {
         self.ui.view = ViewMode::Workspace;
         self.ui.active_panel = ActivePanel::Session;
         self.ui.input_mode = InputMode::Command;
+        self.clear_footer_notice();
         self.session.running = true;
         self.session.error = None;
         self.session.final_message = None;
@@ -333,7 +346,13 @@ impl AppState {
         self.session.running = false;
         self.session.error = Some(error.clone());
         self.session.status = "Run failed".to_string();
-        self.push_activity("Run failed", error, Tone::Error);
+        self.ui.input_mode = InputMode::Prompt;
+        self.record_app_event(
+            "Run failed",
+            error,
+            Tone::Error,
+            Some("follow-up prompt ready".to_string()),
+        );
     }
 
     pub fn clear_session(&mut self) {
@@ -341,7 +360,8 @@ impl AppState {
         self.session = SessionState::new(max_iterations);
         self.ui.prompt_input.clear();
         self.ui.view = ViewMode::Landing;
-        self.ui.input_mode = InputMode::Prompt;
+        self.ui.input_mode = InputMode::Command;
+        self.clear_footer_notice();
     }
 
     pub fn push_activity(&mut self, label: impl Into<String>, body: impl Into<String>, tone: Tone) {
@@ -350,6 +370,30 @@ impl AppState {
             body: body.into(),
             tone,
         });
+    }
+
+    pub fn record_app_event(
+        &mut self,
+        label: impl Into<String>,
+        body: impl Into<String>,
+        tone: Tone,
+        notice: Option<String>,
+    ) {
+        self.push_activity(label, body, tone);
+        if let Some(text) = notice {
+            self.set_footer_notice(text, tone);
+        }
+    }
+
+    pub fn set_footer_notice(&mut self, text: impl Into<String>, tone: Tone) {
+        self.ui.footer_notice = Some(FooterNotice {
+            text: text.into(),
+            tone,
+        });
+    }
+
+    pub fn clear_footer_notice(&mut self) {
+        self.ui.footer_notice = None;
     }
 
     fn finish_run(&mut self, message: Message) {
@@ -362,6 +406,7 @@ impl AppState {
         self.session.running = false;
         self.session.final_message = Some(content.clone());
         self.session.status = "Completed".to_string();
+        self.ui.input_mode = InputMode::Prompt;
         self.session.transcript.push(TranscriptEntry {
             role: "Assistant",
             content,
@@ -372,6 +417,7 @@ impl AppState {
             }
         }
         self.push_activity("Done", "Response finished.", Tone::Success);
+        self.set_footer_notice("follow-up prompt ready", Tone::Success);
     }
 }
 
@@ -386,5 +432,93 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
             .collect::<String>();
         out.push_str("...");
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hermes_core::config::AppConfig;
+
+    use super::*;
+
+    #[test]
+    fn landing_starts_in_command_mode() {
+        let state = AppState::new(AppConfig::default(), String::new(), false);
+        assert_eq!(state.ui.view, ViewMode::Landing);
+        assert_eq!(state.ui.input_mode, InputMode::Command);
+    }
+
+    #[test]
+    fn run_failures_stay_in_tui_state() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), false);
+        state.begin_run("hello".to_string());
+        state.fail_run("api failed".to_string());
+
+        assert_eq!(state.session.status, "Run failed");
+        assert_eq!(state.session.error.as_deref(), Some("api failed"));
+        assert!(!state.session.running);
+        assert_eq!(state.ui.input_mode, InputMode::Prompt);
+        assert_eq!(
+            state
+                .ui
+                .footer_notice
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some("follow-up prompt ready")
+        );
+        assert_eq!(
+            state.session.activity.last().map(|item| item.body.as_str()),
+            Some("api failed")
+        );
+    }
+
+    #[test]
+    fn operational_events_use_activity_and_short_notice() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.record_app_event(
+            "Skill reload failed",
+            "Skill reload failed: bad manifest",
+            Tone::Error,
+            Some("skill reload failed".to_string()),
+        );
+
+        assert_eq!(state.session.status, "Idle");
+        assert_eq!(state.session.error, None);
+        assert_eq!(
+            state
+                .ui
+                .footer_notice
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some("skill reload failed")
+        );
+        assert_eq!(
+            state
+                .session
+                .activity
+                .last()
+                .map(|item| item.label.as_str()),
+            Some("Skill reload failed")
+        );
+    }
+
+    #[test]
+    fn completed_runs_return_to_prompt_mode_for_follow_up() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), false);
+        state.begin_run("hello".to_string());
+        state.apply_agent_event(AgentEvent::Done {
+            message: Message::assistant("all done"),
+        });
+
+        assert_eq!(state.session.status, "Completed");
+        assert_eq!(state.ui.input_mode, InputMode::Prompt);
+        assert_eq!(
+            state
+                .ui
+                .footer_notice
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some("follow-up prompt ready")
+        );
     }
 }

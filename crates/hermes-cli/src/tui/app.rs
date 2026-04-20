@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,7 +23,9 @@ use crate::create_runtime_agent;
 use crate::tui::action::Action;
 use crate::tui::forms::{Modal, SubmittedMcpForm};
 use crate::tui::render;
-use crate::tui::state::{ActivePanel, AppState, InputMode, McpServerItem, SkillItem, ViewMode};
+use crate::tui::state::{
+    ActivePanel, AppState, InputMode, McpServerItem, SkillItem, Tone, ViewMode,
+};
 
 pub enum LaunchMode {
     Landing,
@@ -52,7 +54,8 @@ impl TuiApp {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        let mut terminal = Terminal::new(backend)?;
+        terminal.clear()?;
         let (event_tx, event_rx) = mpsc::channel(config.tools.event_channel_size);
         let prompt = match &launch {
             LaunchMode::Landing => String::new(),
@@ -73,10 +76,24 @@ impl TuiApp {
             mcp_manager: McpManager::new(),
             skill_manager: SkillManager::new(config.skills.root_dir.clone()),
         };
-        app.refresh_skills()?;
-        app.refresh_mcp().await?;
+        if let Err(error) = app.refresh_skills() {
+            app.record_operational_event(
+                "Skill load failed",
+                format!("Skill load failed: {}", error),
+                Tone::Error,
+                "skill load failed",
+            );
+        }
+        if let Err(error) = app.refresh_mcp().await {
+            app.record_operational_event(
+                "MCP refresh failed",
+                format!("MCP refresh failed: {}", error),
+                Tone::Error,
+                "mcp refresh failed",
+            );
+        }
         if matches!(launch, LaunchMode::Query(_)) {
-            app.start_run().await?;
+            app.start_run().await;
         }
         Ok(app)
     }
@@ -99,7 +116,9 @@ impl TuiApp {
                 self.state.persistent.config.tui.refresh_rate_ms,
             ))? {
                 if let Event::Key(key) = event::read()? {
-                    self.handle_key(key).await?;
+                    if should_process_key_event(key) {
+                        self.handle_key(key).await?;
+                    }
                 }
             }
         }
@@ -125,14 +144,9 @@ impl TuiApp {
             if handle.is_finished() {
                 let handle = self.run_handle.take().unwrap();
                 match handle.await.context("agent task join failed")? {
-                    Ok(_) => {
-                        self.state.reduce(Action::SetFooter(
-                            "Run complete. Press i for next prompt or tab for management panels."
-                                .to_string(),
-                        ));
-                    }
+                    Ok(_) => {}
                     Err(error) => {
-                        self.state.reduce(Action::RunFailed(error.to_string()));
+                        self.handle_runtime_error("Run failed", anyhow::Error::new(error));
                     }
                 }
             }
@@ -141,6 +155,11 @@ impl TuiApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if is_global_quit_key(key) {
+            self.state.reduce(Action::Quit);
+            return Ok(());
+        }
+
         if self.state.ui.modal.is_some() {
             return self.handle_modal_key(key).await;
         }
@@ -153,9 +172,8 @@ impl TuiApp {
             if self.state.persistent.needs_rebuild {
                 self.agent = None;
             }
-            self.state.reduce(Action::SetFooter(
-                "New session ready. Pending behavior and MCP changes will apply now.".to_string(),
-            ));
+            self.state
+                .set_footer_notice("new session ready", Tone::Info);
             return Ok(());
         }
 
@@ -168,7 +186,7 @@ impl TuiApp {
     async fn handle_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => self.state.reduce(Action::SetInputMode(InputMode::Command)),
-            KeyCode::Enter => self.start_run().await?,
+            KeyCode::Enter => self.start_run().await,
             KeyCode::Backspace => self.state.reduce(Action::PromptBackspace),
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.reduce(Action::AppendPrompt(ch));
@@ -179,9 +197,24 @@ impl TuiApp {
     }
 
     async fn handle_command_key(&mut self, key: KeyEvent) -> Result<()> {
+        if let Some(ch) = landing_prompt_bootstrap_char(&self.state, key) {
+            self.state.reduce(Action::SetInputMode(InputMode::Prompt));
+            self.state.reduce(Action::AppendPrompt(ch));
+            self.state.clear_footer_notice();
+            return Ok(());
+        }
+
         match key.code {
-            KeyCode::Char('q') => self.state.reduce(Action::Quit),
             KeyCode::Char('i') => self.state.reduce(Action::SetInputMode(InputMode::Prompt)),
+            KeyCode::Enter if self.state.ui.view == ViewMode::Landing => {
+                if landing_enter_starts_prompt(&self.state) {
+                    self.state.reduce(Action::SetInputMode(InputMode::Prompt));
+                    self.state
+                        .set_footer_notice("type prompt, then press Enter to run", Tone::Info);
+                } else {
+                    self.start_run().await;
+                }
+            }
             KeyCode::Tab => self.state.reduce(Action::CyclePanelForward),
             KeyCode::BackTab => self.state.reduce(Action::CyclePanelBackward),
             KeyCode::Char('w') => self
@@ -203,15 +236,25 @@ impl TuiApp {
                 self.state.reduce(Action::OpenModal(Modal::create_skill()));
             }
             KeyCode::Char('r') if self.state.ui.active_panel == ActivePanel::Skills => {
-                self.refresh_skills()?;
-                self.state
-                    .reduce(Action::SetFooter("Skills reloaded from disk.".to_string()));
+                match self.refresh_skills() {
+                    Ok(()) => self.record_operational_event(
+                        "Skills reloaded",
+                        "Skills reloaded from disk.",
+                        Tone::Success,
+                        "skills reloaded",
+                    ),
+                    Err(error) => self.handle_runtime_error("Skill reload failed", error),
+                }
             }
             KeyCode::Char('d') if self.state.ui.active_panel == ActivePanel::Mcp => {
-                self.remove_selected_mcp().await?;
+                if let Err(error) = self.remove_selected_mcp().await {
+                    self.handle_runtime_error("MCP remove failed", error);
+                }
             }
             KeyCode::Char('d') if self.state.ui.active_panel == ActivePanel::Skills => {
-                self.remove_selected_skill()?;
+                if let Err(error) = self.remove_selected_skill() {
+                    self.handle_runtime_error("Skill delete failed", error);
+                }
             }
             KeyCode::Char('e') if self.state.ui.active_panel == ActivePanel::Behavior => {
                 self.open_behavior_editor();
@@ -236,7 +279,9 @@ impl TuiApp {
             KeyCode::BackTab => modal.previous_field(),
             KeyCode::Backspace => modal.backspace(),
             KeyCode::Enter => {
-                self.submit_modal(modal).await?;
+                if let Err(error) = self.submit_modal(modal).await {
+                    self.handle_runtime_error("Form submit failed", error);
+                }
                 self.state.reduce(Action::CloseModal);
                 return Ok(());
             }
@@ -270,13 +315,17 @@ impl TuiApp {
                 let description = form.fields[1].value.trim();
                 if name.is_empty() {
                     self.state
-                        .reduce(Action::SetFooter("Skill name cannot be empty.".to_string()));
+                        .set_footer_notice("skill name cannot be empty", Tone::Error);
                 } else {
                     let content = default_skill_content(name, description);
                     self.skill_manager.create(name, &content)?;
                     self.refresh_skills()?;
-                    self.state
-                        .reduce(Action::SetFooter(format!("Created skill '{}'.", name)));
+                    self.record_operational_event(
+                        "Skill created",
+                        format!("Created skill '{}'.", name),
+                        Tone::Success,
+                        "skill created",
+                    );
                 }
             }
             Modal::EditBehavior(form) => {
@@ -288,17 +337,16 @@ impl TuiApp {
         Ok(())
     }
 
-    async fn start_run(&mut self) -> Result<()> {
+    async fn start_run(&mut self) {
         if self.state.session.running {
-            return Ok(());
+            return;
         }
 
         let query = self.state.ui.prompt_input.trim().to_string();
         if query.is_empty() {
-            self.state.reduce(Action::SetFooter(
-                "Prompt is empty. Press i and type something first.".to_string(),
-            ));
-            return Ok(());
+            self.state
+                .set_footer_notice("prompt is empty", Tone::Warning);
+            return;
         }
 
         if self.state.persistent.needs_rebuild && !self.state.session.transcript.is_empty() {
@@ -309,14 +357,22 @@ impl TuiApp {
         }
 
         if self.agent.is_none() || self.state.persistent.needs_rebuild {
-            self.rebuild_agent().await?;
+            if let Err(error) = self.rebuild_agent().await {
+                self.handle_runtime_error("Agent rebuild failed", error);
+                return;
+            }
         }
 
-        let agent = self.agent.clone().context("agent was not available")?;
+        let Some(agent) = self.agent.clone() else {
+            self.handle_runtime_error(
+                "Agent start failed",
+                anyhow::anyhow!("agent was not available"),
+            );
+            return;
+        };
         self.state.reduce(Action::StartRun(query.clone()));
         self.state.reduce(Action::ClearPrompt);
         self.run_handle = Some(tokio::spawn(async move { agent.run(query).await }));
-        Ok(())
     }
 
     async fn rebuild_agent(&mut self) -> Result<()> {
@@ -381,6 +437,20 @@ impl TuiApp {
         Ok(())
     }
 
+    fn handle_runtime_error(&mut self, prefix: &str, error: anyhow::Error) {
+        let message = format!("{}: {}", prefix, error);
+        if self.state.session.running {
+            self.state.fail_run(message);
+        } else {
+            self.record_operational_event(
+                prefix,
+                message,
+                Tone::Error,
+                &prefix.to_ascii_lowercase(),
+            );
+        }
+    }
+
     async fn upsert_mcp_server(
         &mut self,
         config: McpServerConfig,
@@ -427,9 +497,12 @@ impl TuiApp {
         }
         self.state.persistent.needs_rebuild = true;
         self.refresh_mcp().await?;
-        self.state.reduce(Action::SetFooter(
-            "MCP server saved. Press ctrl+l for a fresh session with updated tools.".to_string(),
-        ));
+        self.record_operational_event(
+            "MCP server saved",
+            "MCP server saved. Press ctrl+l for a fresh session with updated tools.",
+            Tone::Success,
+            "mcp server saved",
+        );
         Ok(())
     }
 
@@ -450,10 +523,12 @@ impl TuiApp {
                 .retain(|item| item.name != server.name);
             self.state.persistent.needs_rebuild = true;
             self.refresh_mcp().await?;
-            self.state.reduce(Action::SetFooter(format!(
-                "Removed MCP server '{}'.",
-                server.name
-            )));
+            self.record_operational_event(
+                "MCP server removed",
+                format!("Removed MCP server '{}'.", server.name),
+                Tone::Warning,
+                "mcp server removed",
+            );
         }
         Ok(())
     }
@@ -468,10 +543,12 @@ impl TuiApp {
         {
             self.skill_manager.delete(&skill.name)?;
             self.refresh_skills()?;
-            self.state.reduce(Action::SetFooter(format!(
-                "Deleted skill '{}'.",
-                skill.name
-            )));
+            self.record_operational_event(
+                "Skill deleted",
+                format!("Deleted skill '{}'.", skill.name),
+                Tone::Warning,
+                "skill deleted",
+            );
         }
         Ok(())
     }
@@ -490,10 +567,8 @@ impl TuiApp {
             if value == "true" || value == "false" {
                 let next = if value == "true" { "false" } else { "true" };
                 if self.apply_behavior_edit(field, next).is_ok() {
-                    self.state.reduce(Action::SetFooter(format!(
-                        "Updated {}. Press ctrl+l to apply to a fresh session.",
-                        field
-                    )));
+                    self.state
+                        .set_footer_notice(format!("updated {}", field), Tone::Success);
                 }
             }
         }
@@ -523,11 +598,27 @@ impl TuiApp {
         self.state.persistent.config.agent = behavior.clone();
         self.state.session.max_iterations = behavior.max_iterations;
         self.state.persistent.needs_rebuild = true;
-        self.state.reduce(Action::SetFooter(format!(
-            "Updated {}. Press ctrl+l to start a fresh session with new behavior.",
-            field
-        )));
+        self.record_operational_event(
+            "Behavior updated",
+            format!(
+                "Updated {}. Press ctrl+l to start a fresh session with new behavior.",
+                field
+            ),
+            Tone::Success,
+            format!("updated {}", field).as_str(),
+        );
         Ok(())
+    }
+
+    fn record_operational_event(
+        &mut self,
+        label: &str,
+        body: impl Into<String>,
+        tone: Tone,
+        notice: &str,
+    ) {
+        self.state
+            .record_app_event(label, body, tone, Some(notice.to_string()));
     }
 }
 
@@ -600,5 +691,114 @@ fn parse_bool(value: &str) -> Result<bool> {
         "true" | "1" | "yes" | "on" => Ok(true),
         "false" | "0" | "no" | "off" => Ok(false),
         _ => anyhow::bail!("Expected a boolean value."),
+    }
+}
+
+fn is_global_quit_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('q')
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+}
+
+fn landing_enter_starts_prompt(state: &AppState) -> bool {
+    state.ui.view == ViewMode::Landing && state.ui.prompt_input.trim().is_empty()
+}
+
+fn landing_prompt_bootstrap_char(state: &AppState, key: KeyEvent) -> Option<char> {
+    if state.ui.view != ViewMode::Landing {
+        return None;
+    }
+
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char(ch) => Some(ch),
+        _ => None,
+    }
+}
+
+fn should_process_key_event(key: KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use hermes_core::config::AppConfig;
+
+    use super::*;
+
+    #[test]
+    fn quit_keys_are_global() {
+        assert!(is_global_quit_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_global_quit_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!is_global_quit_key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn landing_enter_switches_to_prompt_only_when_empty() {
+        let empty = AppState::new(AppConfig::default(), String::new(), false);
+        assert!(landing_enter_starts_prompt(&empty));
+
+        let filled = AppState::new(AppConfig::default(), "hello".to_string(), false);
+        assert!(!landing_enter_starts_prompt(&filled));
+    }
+
+    #[test]
+    fn landing_typing_bootstraps_prompt_input() {
+        let state = AppState::new(AppConfig::default(), String::new(), false);
+        let key = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        assert_eq!(landing_prompt_bootstrap_char(&state, key), Some('a'));
+    }
+
+    #[test]
+    fn workspace_typing_does_not_bootstrap_prompt_input() {
+        let state = AppState::new(AppConfig::default(), String::new(), true);
+        let key = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        assert_eq!(landing_prompt_bootstrap_char(&state, key), None);
+    }
+
+    #[test]
+    fn ignores_key_release_events() {
+        let release = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        };
+        let press = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        assert!(!should_process_key_event(release));
+        assert!(should_process_key_event(press));
     }
 }
