@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-04-20
+
+### Added
+
+- Workspace follow-up prompting now returns to prompt mode automatically after both completed and failed runs, so a user can continue the same session without clearing history
+- Regression coverage for Windows key handling, landing prompt bootstrap, follow-up prompting after errors, and activity-pane failure rendering
+
+### Changed
+
+- Runtime and operational errors in the rich TUI are now summarized in the footer while their detailed text is rendered in the `Activity` pane
+- Activity entries now render as compact single-line log rows so failures stay visible in narrow panel heights
+- README now documents the TOML configuration model, `hermes.example.toml`, and the current ratatui-based interactive workflow
+
+### Fixed
+
+- Windows and PowerShell landing screen now paints an explicit dark canvas instead of inheriting a gray terminal background
+- Landing prompt entry now accepts immediate typing on the first screen while still preventing duplicated characters from key-release events
+- Landing status/footer no longer duplicates `idle` or `run failed`
+- Current chat sessions can accept a new prompt after runtime errors without conflicting with agent self-healing logic
+
+Full Changelog: [v0.1.1...v0.1.2](https://github.com/eikarna/hermes-rs/compare/v0.1.1...v0.1.2)
+
 ## [0.1.1] - 2026-04-19
 
 ### Added
@@ -66,5 +88,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tokio` 1.36, `reqwest` 0.12 (rustls), `serde` 1.0, `clap` 4.5
 - `schemars` 0.8, `tracing` 0.1, `anyhow` 1.0, `thiserror` 1.0
 
-[0.1.0]: https://github.com/nousresearch/hermes-rs/releases/tag/v0.1.0
-[0.1.1]: https://github.com/nousresearch/hermes-rs/releases/tag/v0.1.1
+[0.1.0]: https://github.com/eikarna/hermes-rs/releases/tag/v0.1.0
+[0.1.1]: https://github.com/eikarna/hermes-rs/releases/tag/v0.1.1
+[0.1.2]: https://github.com/eikarna/hermes-rs/releases/tag/v0.1.2

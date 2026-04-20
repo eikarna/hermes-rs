@@ -9,6 +9,8 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 - **Early Tool Detection**: Initiate tool execution as soon as `</tool_call>` is detected
 - **Self-Healing**: Automatically re-prompt LLM with error context on failures
 - **Dynamic Schema Generation**: Automatically generate JSON Schema from Rust structs
+- **Shared TOML Configuration**: One runtime config model across `hermes-cli` and `hermes-core`
+- **Ratatui TUI**: Prompt-first landing view, responsive workspace panes, reasoning display, MCP/Skills/Behavior management
 - **Structured Logging**: Comprehensive observability via the `tracing` crate
 
 ## Architecture
@@ -33,21 +35,23 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 # Build from source
 cargo build --release
 
-# Or install via cargo
+# Or install the CLI crate directly
 cargo install --path crates/hermes-cli
 ```
+
+Tagged releases publish per-platform binaries automatically in the repository's GitHub Releases tab.
 
 ## Quick Start
 
 ```bash
 # Set your API key
-export OPENAI_API_KEY=your_api_key_here
+export OPENAI_API_KEY=your_api_key_here   # PowerShell: $env:OPENAI_API_KEY="..."
 
-# Run a simple query
-hermes run --query "What is 2 + 2?"
-
-# Interactive chat mode
+# Start the prompt-first TUI
 hermes chat
+
+# Run a one-shot query
+hermes run --query "What is 2 + 2?"
 
 # List available tools
 hermes tools
@@ -58,20 +62,41 @@ hermes test echo --args '{"message": "Hello, World!"}'
 
 ## Configuration
 
-Create a `hermes.toml` or `hermes.yaml` configuration file:
+Hermes reads configuration in this order:
 
-```yaml
-# Model configuration
+1. `--config <path>`
+2. `./hermes.toml`
+3. `./.hermes.toml`
+4. OS config directory (for example `~/.config/hermes/config.toml` on Linux)
+5. Environment variables
+6. CLI flags
+
+Start from the checked-in example file:
+
+```bash
+cp hermes.example.toml hermes.toml
+```
+
+Configuration is TOML, not YAML. Example:
+
+```toml
+[client]
+base_url = "https://api.openai.com/v1"
+timeout_secs = 60
+# api_key = "set me or use OPENAI_API_KEY"
+
+[agent]
 model = "gpt-4"
 max_iterations = 20
-tool_timeout = 30
+tool_timeout_secs = 30
+request_timeout_secs = 120
+stream = true
+show_reasoning = true
 
-# API configuration
-api_key = "your_api_key_here"
-base_url = "https://api.openai.com/v1"
-
-# System prompt (optional)
-system_prompt = "You are a helpful assistant with access to tools."
+[tui]
+rich_output = true
+landing_title = "HERMES"
+prompt_placeholder = "Ask anything... \"Fix a TODO in the codebase\""
 ```
 
 Or use environment variables:
@@ -79,7 +104,19 @@ Or use environment variables:
 ```bash
 export OPENAI_API_KEY=your_api_key_here
 export OPENAI_BASE_URL=https://api.openai.com/v1
+export HERMES_MODEL=gpt-4
 ```
+
+See [hermes.example.toml](hermes.example.toml) for the full schema, including MCP, Skills, gateway, and tool/runtime defaults.
+
+## TUI Overview
+
+- `hermes chat` starts on a prompt-first landing screen
+- `i` enters prompt editing, and typing on landing also bootstraps prompt entry immediately
+- `Enter` runs the current prompt
+- `Tab` cycles workspace panels
+- `Ctrl+L` starts a fresh session when you want to discard the current conversation history
+- After a run completes or fails, the workspace returns to prompt mode so you can send a follow-up in the same session
 
 ## Library Usage
 
@@ -143,7 +180,11 @@ Options:
   --base-url <URL>       OpenAI base URL
   -m, --model <MODEL>    Model to use [default: gpt-4]
   -i, --max-iterations <N>  Maximum iterations [default: 20]
-  -t, --tool-timeout <SECS>  Tool timeout in seconds [default: 30]
+  --tool-timeout <SECS>  Tool timeout in seconds [default: 30]
+  --request-timeout <SECS>  Request timeout in seconds
+  --context-window <TOKENS> Context window size
+  --max-healing-attempts <N> Maximum self-healing retries
+  --stream / --no-stream  Force streaming on or off
 ```
 
 ## Tool Definition
