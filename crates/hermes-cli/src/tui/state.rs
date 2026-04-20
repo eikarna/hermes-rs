@@ -164,7 +164,12 @@ pub struct UiState {
     pub layout: LayoutMode,
     pub active_panel: ActivePanel,
     pub input_mode: InputMode,
+    pub conversation_scroll: u16,
+    pub conversation_follow_tail: bool,
     pub prompt_input: String,
+    pub prompt_history: Vec<String>,
+    pub prompt_history_index: Option<usize>,
+    pub prompt_history_draft: Option<String>,
     pub selected_mcp: usize,
     pub selected_skill: usize,
     pub selected_behavior: usize,
@@ -207,7 +212,12 @@ impl AppState {
                 } else {
                     InputMode::Command
                 },
+                conversation_scroll: 0,
+                conversation_follow_tail: true,
                 prompt_input: prompt,
+                prompt_history: Vec::new(),
+                prompt_history_index: None,
+                prompt_history_draft: None,
                 selected_mcp: 0,
                 selected_skill: 0,
                 selected_behavior: 0,
@@ -327,6 +337,9 @@ impl AppState {
         self.ui.view = ViewMode::Workspace;
         self.ui.active_panel = ActivePanel::Session;
         self.ui.input_mode = InputMode::Command;
+        self.ui.conversation_scroll = 0;
+        self.ui.conversation_follow_tail = true;
+        self.remember_prompt(&query);
         self.clear_footer_notice();
         self.session.running = true;
         self.session.error = None;
@@ -361,7 +374,73 @@ impl AppState {
         self.ui.prompt_input.clear();
         self.ui.view = ViewMode::Landing;
         self.ui.input_mode = InputMode::Command;
+        self.ui.conversation_scroll = 0;
+        self.ui.conversation_follow_tail = true;
+        self.ui.prompt_history_index = None;
+        self.ui.prompt_history_draft = None;
         self.clear_footer_notice();
+    }
+
+    pub fn scroll_conversation_up(&mut self, amount: u16) {
+        self.ui.conversation_follow_tail = false;
+        self.ui.conversation_scroll = self.ui.conversation_scroll.saturating_sub(amount);
+    }
+
+    pub fn scroll_conversation_down(&mut self, amount: u16) {
+        self.ui.conversation_follow_tail = false;
+        self.ui.conversation_scroll = self.ui.conversation_scroll.saturating_add(amount);
+    }
+
+    pub fn scroll_conversation_to_top(&mut self) {
+        self.ui.conversation_follow_tail = false;
+        self.ui.conversation_scroll = 0;
+    }
+
+    pub fn conversation_scroll(&self) -> u16 {
+        self.ui.conversation_scroll
+    }
+
+    pub fn follow_conversation_tail(&self) -> bool {
+        self.ui.conversation_follow_tail
+    }
+
+    pub fn prompt_history_previous(&mut self) {
+        if self.ui.prompt_history.is_empty() {
+            return;
+        }
+
+        match self.ui.prompt_history_index {
+            Some(index) if index > 0 => {
+                self.ui.prompt_history_index = Some(index - 1);
+                self.ui.prompt_input = self.ui.prompt_history[index - 1].clone();
+            }
+            Some(_) => {}
+            None => {
+                self.ui.prompt_history_draft = Some(self.ui.prompt_input.clone());
+                let index = self.ui.prompt_history.len() - 1;
+                self.ui.prompt_history_index = Some(index);
+                self.ui.prompt_input = self.ui.prompt_history[index].clone();
+            }
+        }
+    }
+
+    pub fn prompt_history_next(&mut self) {
+        let Some(index) = self.ui.prompt_history_index else {
+            return;
+        };
+
+        if index + 1 < self.ui.prompt_history.len() {
+            self.ui.prompt_history_index = Some(index + 1);
+            self.ui.prompt_input = self.ui.prompt_history[index + 1].clone();
+        } else {
+            self.ui.prompt_history_index = None;
+            self.ui.prompt_input = self.ui.prompt_history_draft.take().unwrap_or_default();
+        }
+    }
+
+    pub fn detach_prompt_history_navigation(&mut self) {
+        self.ui.prompt_history_index = None;
+        self.ui.prompt_history_draft = None;
     }
 
     pub fn push_activity(&mut self, label: impl Into<String>, body: impl Into<String>, tone: Tone) {
@@ -396,29 +475,84 @@ impl AppState {
         self.ui.footer_notice = None;
     }
 
+    fn remember_prompt(&mut self, prompt: &str) {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return;
+        }
+        if self
+            .ui
+            .prompt_history
+            .last()
+            .is_some_and(|last| last == prompt)
+        {
+            self.detach_prompt_history_navigation();
+            return;
+        }
+        self.ui.prompt_history.push(prompt.to_string());
+        self.detach_prompt_history_navigation();
+    }
+
     fn finish_run(&mut self, message: Message) {
-        let content = if self.session.streaming_response.trim().is_empty() {
-            message.content.clone()
-        } else {
-            self.session.streaming_response.clone()
-        };
+        let content = choose_final_content(&self.session.streaming_response, &message.content);
+        let reasoning = choose_final_reasoning(
+            &self.session.reasoning,
+            message.reasoning.as_deref().unwrap_or(""),
+        );
         self.session.streaming_response = content.clone();
         self.session.running = false;
         self.session.final_message = Some(content.clone());
         self.session.status = "Completed".to_string();
         self.ui.input_mode = InputMode::Prompt;
+        self.ui.conversation_scroll = 0;
+        self.ui.conversation_follow_tail = true;
         self.session.transcript.push(TranscriptEntry {
             role: "Assistant",
             content,
         });
-        if self.session.reasoning.is_empty() {
-            if let Some(reasoning) = message.reasoning {
-                self.session.reasoning = reasoning;
-            }
+        if !reasoning.is_empty() {
+            self.session.reasoning = reasoning;
         }
         self.push_activity("Done", "Response finished.", Tone::Success);
         self.set_footer_notice("follow-up prompt ready", Tone::Success);
     }
+}
+
+fn choose_final_content(streamed: &str, final_message: &str) -> String {
+    let streamed = streamed.trim();
+    let final_message = final_message.trim();
+
+    if streamed.is_empty() {
+        return final_message.to_string();
+    }
+    if final_message.is_empty() {
+        return streamed.to_string();
+    }
+
+    if final_message.chars().count() > streamed.chars().count()
+        && final_message.starts_with(streamed)
+    {
+        return final_message.to_string();
+    }
+
+    streamed.to_string()
+}
+
+fn choose_final_reasoning(streamed: &str, final_reasoning: &str) -> String {
+    let streamed = streamed.trim();
+    let final_reasoning = final_reasoning.trim();
+
+    if streamed.is_empty() {
+        return final_reasoning.to_string();
+    }
+    if final_reasoning.is_empty() {
+        return streamed.to_string();
+    }
+    if final_reasoning.chars().count() > streamed.chars().count() {
+        return final_reasoning.to_string();
+    }
+
+    streamed.to_string()
 }
 
 pub fn truncate(text: &str, max_chars: usize) -> String {
@@ -520,5 +654,95 @@ mod tests {
                 .map(|notice| notice.text.as_str()),
             Some("follow-up prompt ready")
         );
+    }
+
+    #[test]
+    fn completed_runs_prefer_longer_final_message_over_partial_stream() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), false);
+        state.begin_run("hello".to_string());
+        state.session.streaming_response = "Apa yang bis".to_string();
+        state.apply_agent_event(AgentEvent::Done {
+            message: Message::assistant("Apa yang bisa saya bantu?"),
+        });
+
+        assert_eq!(
+            state.session.final_message.as_deref(),
+            Some("Apa yang bisa saya bantu?")
+        );
+        assert_eq!(
+            state
+                .session
+                .transcript
+                .last()
+                .map(|entry| entry.content.as_str()),
+            Some("Apa yang bisa saya bantu?")
+        );
+    }
+
+    #[test]
+    fn completed_runs_prefer_longer_final_reasoning_over_partial_stream() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), false);
+        state.begin_run("hello".to_string());
+        state.session.reasoning = "Let me use the echo tool to simply echo the".to_string();
+        state.apply_agent_event(AgentEvent::Done {
+            message: Message::assistant("done")
+                .with_reasoning("Let me use the echo tool to simply echo the greeting back."),
+        });
+
+        assert_eq!(
+            state.session.reasoning,
+            "Let me use the echo tool to simply echo the greeting back."
+        );
+    }
+
+    #[test]
+    fn conversation_scroll_moves_and_resets() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), true);
+        state.scroll_conversation_down(10);
+        state.scroll_conversation_up(3);
+        assert!(!state.follow_conversation_tail());
+        assert_eq!(state.conversation_scroll(), 7);
+
+        state.begin_run("hello".to_string());
+        assert_eq!(state.conversation_scroll(), 0);
+        assert!(state.follow_conversation_tail());
+
+        state.scroll_conversation_down(5);
+        state.apply_agent_event(AgentEvent::Done {
+            message: Message::assistant("done"),
+        });
+        assert_eq!(state.conversation_scroll(), 0);
+        assert!(state.follow_conversation_tail());
+    }
+
+    #[test]
+    fn prompt_history_cycles_latest_first_and_restores_draft() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+
+        state.begin_run("first".to_string());
+        state.begin_run("second".to_string());
+        state.ui.prompt_input = "draft".to_string();
+
+        state.prompt_history_previous();
+        assert_eq!(state.ui.prompt_input, "second");
+
+        state.prompt_history_previous();
+        assert_eq!(state.ui.prompt_input, "first");
+
+        state.prompt_history_next();
+        assert_eq!(state.ui.prompt_input, "second");
+
+        state.prompt_history_next();
+        assert_eq!(state.ui.prompt_input, "draft");
+    }
+
+    #[test]
+    fn prompt_history_deduplicates_consecutive_entries() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+
+        state.begin_run("repeat".to_string());
+        state.begin_run("repeat".to_string());
+
+        assert_eq!(state.ui.prompt_history, vec!["repeat".to_string()]);
     }
 }

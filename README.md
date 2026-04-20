@@ -60,6 +60,16 @@ hermes tools
 hermes test echo --args '{"message": "Hello, World!"}'
 ```
 
+## Screenshots
+
+Prompt-first landing screen:
+
+![Hermes landing screen](assets/main.png)
+
+Workspace session with conversation, reasoning, and activity panes:
+
+![Hermes workspace chat screen](assets/chat.png)
+
 ## Configuration
 
 Hermes reads configuration in this order:
@@ -114,9 +124,13 @@ See [hermes.example.toml](hermes.example.toml) for the full schema, including MC
 - `hermes chat` starts on a prompt-first landing screen
 - `i` enters prompt editing, and typing on landing also bootstraps prompt entry immediately
 - `Enter` runs the current prompt
+- `Up` / `Down` in prompt mode replay recent prompts from history
 - `Tab` cycles workspace panels
+- `Up` / `Down` scroll the chat in command mode
+- `PageUp`, `PageDown`, `Home`, and `End` scroll the conversation even while prompt mode is active
 - `Ctrl+L` starts a fresh session when you want to discard the current conversation history
 - After a run completes or fails, the workspace returns to prompt mode so you can send a follow-up in the same session
+- `stream = false` now uses the non-streaming response path instead of the streaming parser
 
 ## Library Usage
 
@@ -246,6 +260,13 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE).
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for coding conventions, testing requirements, and the PR process.
+
+Documentation and release hygiene for maintainers:
+
+- keep `hermes.example.toml` in sync with runtime config changes
+- add every user-facing change to `CHANGELOG.md` before cutting a tag
+- update README screenshots or keybinding docs when TUI behavior changes
+- update `AGENTS.md` / `CLAUDE.md` when the project context changes enough that an agent would otherwise rediscover it from scratch
 
 - [Security Policy](SECURITY.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)

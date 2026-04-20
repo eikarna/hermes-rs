@@ -143,12 +143,7 @@ impl TuiApp {
         if let Some(handle) = &self.run_handle {
             if handle.is_finished() {
                 let handle = self.run_handle.take().unwrap();
-                match handle.await.context("agent task join failed")? {
-                    Ok(_) => {}
-                    Err(error) => {
-                        self.handle_runtime_error("Run failed", anyhow::Error::new(error));
-                    }
-                }
+                apply_run_result(&mut self.state, handle.await);
             }
         }
         Ok(())
@@ -184,10 +179,16 @@ impl TuiApp {
     }
 
     async fn handle_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
+        if handle_prompt_scroll_key(&mut self.state, key) {
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc => self.state.reduce(Action::SetInputMode(InputMode::Command)),
             KeyCode::Enter => self.start_run().await,
             KeyCode::Backspace => self.state.reduce(Action::PromptBackspace),
+            KeyCode::Up => self.state.prompt_history_previous(),
+            KeyCode::Down => self.state.prompt_history_next(),
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.reduce(Action::AppendPrompt(ch));
             }
@@ -201,6 +202,10 @@ impl TuiApp {
             self.state.reduce(Action::SetInputMode(InputMode::Prompt));
             self.state.reduce(Action::AppendPrompt(ch));
             self.state.clear_footer_notice();
+            return Ok(());
+        }
+
+        if handle_conversation_scroll_key(&mut self.state, key) {
             return Ok(());
         }
 
@@ -438,17 +443,7 @@ impl TuiApp {
     }
 
     fn handle_runtime_error(&mut self, prefix: &str, error: anyhow::Error) {
-        let message = format!("{}: {}", prefix, error);
-        if self.state.session.running {
-            self.state.fail_run(message);
-        } else {
-            self.record_operational_event(
-                prefix,
-                message,
-                Tone::Error,
-                &prefix.to_ascii_lowercase(),
-            );
-        }
+        apply_runtime_error(&mut self.state, prefix, error);
     }
 
     async fn upsert_mcp_server(
@@ -725,10 +720,72 @@ fn should_process_key_event(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+fn handle_conversation_scroll_key(state: &mut AppState, key: KeyEvent) -> bool {
+    if state.ui.view != ViewMode::Workspace || state.ui.active_panel != ActivePanel::Session {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Up => state.scroll_conversation_up(1),
+        KeyCode::Down => state.scroll_conversation_down(1),
+        KeyCode::PageUp => state.scroll_conversation_up(8),
+        KeyCode::PageDown => state.scroll_conversation_down(8),
+        KeyCode::Home => state.scroll_conversation_to_top(),
+        KeyCode::End => state.scroll_conversation_down(u16::MAX),
+        _ => return false,
+    }
+
+    true
+}
+
+fn handle_prompt_scroll_key(state: &mut AppState, key: KeyEvent) -> bool {
+    if state.ui.view != ViewMode::Workspace || state.ui.active_panel != ActivePanel::Session {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::PageUp => state.scroll_conversation_up(8),
+        KeyCode::PageDown => state.scroll_conversation_down(8),
+        KeyCode::Home => state.scroll_conversation_to_top(),
+        KeyCode::End => state.scroll_conversation_down(u16::MAX),
+        _ => return false,
+    }
+
+    true
+}
+
+fn apply_runtime_error(state: &mut AppState, prefix: &str, error: anyhow::Error) {
+    let message = format!("{}: {}", prefix, error);
+    if state.session.running {
+        state.fail_run(message);
+    } else {
+        state.record_app_event(
+            prefix,
+            message,
+            Tone::Error,
+            Some(prefix.to_ascii_lowercase()),
+        );
+    }
+}
+
+fn apply_run_result(
+    state: &mut AppState,
+    result: std::result::Result<hermes_core::Result<Message>, tokio::task::JoinError>,
+) {
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => apply_runtime_error(state, "Run failed", anyhow::Error::new(error)),
+        Err(error) => {
+            apply_runtime_error(state, "Agent task join failed", anyhow::Error::new(error))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use hermes_core::config::AppConfig;
+    use tokio::task;
 
     use super::*;
 
@@ -800,5 +857,65 @@ mod tests {
 
         assert!(!should_process_key_event(release));
         assert!(should_process_key_event(press));
+    }
+
+    #[test]
+    fn session_panel_scroll_keys_adjust_conversation_offset() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.ui.active_panel = ActivePanel::Session;
+
+        assert!(handle_conversation_scroll_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+        ));
+        assert_eq!(state.conversation_scroll(), 1);
+
+        assert!(handle_conversation_scroll_key(
+            &mut state,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)
+        ));
+        assert_eq!(state.conversation_scroll(), 9);
+
+        assert!(handle_conversation_scroll_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)
+        ));
+        assert_eq!(state.conversation_scroll(), 0);
+    }
+
+    #[test]
+    fn prompt_mode_keeps_page_scroll_for_session() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.ui.active_panel = ActivePanel::Session;
+        state.ui.input_mode = InputMode::Prompt;
+
+        assert!(handle_prompt_scroll_key(
+            &mut state,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)
+        ));
+        assert_eq!(state.conversation_scroll(), 8);
+    }
+
+    #[tokio::test]
+    async fn join_errors_stay_inside_tui_state() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.begin_run("hello".to_string());
+        let run_handle = task::spawn(async move {
+            panic!("boom");
+            #[allow(unreachable_code)]
+            Ok(hermes_core::client::Message::assistant("never"))
+        });
+        tokio::task::yield_now().await;
+
+        apply_run_result(&mut state, run_handle.await);
+
+        assert_eq!(state.session.status, "Run failed");
+        assert!(state
+            .session
+            .activity
+            .iter()
+            .any(|item| item.label == "Run failed" || item.label == "Agent task join failed"));
     }
 }

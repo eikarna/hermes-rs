@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-04-20
+
+### Added
+
+- Prompt history in the TUI input box, with `Up` / `Down` navigation that replays recent prompts and restores the current draft when you leave history browsing
+- New README screenshots for the landing screen and workspace chat flow in `assets/main.png` and `assets/chat.png`
+- Project-context sections in `AGENTS.md` and `CLAUDE.md` so future coding agents can immediately understand the current config, TUI, and release workflow expectations
+
+### Changed
+
+- Conversation rendering now follows the newest assistant output by default while still allowing manual scrolling with `Up`, `Down`, `PageUp`, `PageDown`, `Home`, and `End`
+- Prompt mode keeps chat scrolling available through paging keys, so long replies remain readable even while the input box is focused
+- Workspace UI now labels active assistant output as `responding` when `stream = false` instead of incorrectly showing `streaming`
+- README now documents the prompt history keys, conversation scrolling behavior, screenshots, and release-driven documentation sync expectations
+
+### Fixed
+
+- Streaming provider tool-call deltas now tolerate missing `index` fields, which prevented some NVIDIA NIM tool runs from completing in `stream = true` mode
+- Streaming tool-call parsing now merges incremental argument chunks and strips split `<tool_call>` XML tags from visible conversation output more reliably
+- Non-streaming mode now parses XML tool calls embedded in assistant content instead of leaving tool execution text stranded in the reasoning pane
+- Final assistant replies and tool outputs now land in the conversation pane more consistently instead of leaving the workspace stuck on older chat content
+- Non-Windows CI and tarpaulin coverage now pass the join-error TUI test by using terminal-free run-result assertions instead of any real TTY-backed terminal setup
+
+Full Changelog: [v0.1.2...v0.1.3](https://github.com/eikarna/hermes-rs/compare/v0.1.2...v0.1.3)
+
 ## [0.1.2] - 2026-04-20
 
 ### Added
@@ -91,3 +116,4 @@ Full Changelog: [v0.1.1...v0.1.2](https://github.com/eikarna/hermes-rs/compare/v
 [0.1.0]: https://github.com/eikarna/hermes-rs/releases/tag/v0.1.0
 [0.1.1]: https://github.com/eikarna/hermes-rs/releases/tag/v0.1.1
 [0.1.2]: https://github.com/eikarna/hermes-rs/releases/tag/v0.1.2
+[0.1.3]: https://github.com/eikarna/hermes-rs/releases/tag/v0.1.3

@@ -301,7 +301,7 @@ fn render_workspace_wide(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         .split(body[1]);
 
     frame.render_widget(header_widget(state), outer[0]);
-    frame.render_widget(conversation_widget(state), body[0]);
+    render_conversation_widget(frame, state, body[0]);
     frame.render_widget(panel_widget(state), right[0]);
     frame.render_widget(reasoning_widget(state), right[1]);
     frame.render_widget(activity_widget(state), right[2]);
@@ -322,7 +322,7 @@ fn render_workspace_medium(frame: &mut Frame<'_>, state: &AppState, area: Rect) 
         .split(area);
 
     frame.render_widget(header_widget(state), outer[0]);
-    frame.render_widget(conversation_widget(state), outer[1]);
+    render_conversation_widget(frame, state, outer[1]);
     frame.render_widget(panel_tabs(state), outer[2]);
     frame.render_widget(panel_widget(state), outer[3]);
     frame.render_widget(reasoning_widget(state), outer[4]);
@@ -383,11 +383,29 @@ fn header_widget(state: &AppState) -> Paragraph<'_> {
     )
 }
 
-fn conversation_widget(state: &AppState) -> Paragraph<'_> {
+fn render_conversation_widget(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let lines = conversation_lines(state);
+    let block = panel_block("Conversation");
+    let inner = block.inner(area);
+    let max_scroll = max_wrapped_scroll(&lines, inner.width, inner.height);
+    let scroll = if state.follow_conversation_tail() {
+        max_scroll
+    } else {
+        state.conversation_scroll().min(max_scroll)
+    };
+
+    let widget = Paragraph::new(Text::from(lines))
+        .block(block)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
+}
+
+fn conversation_lines(state: &AppState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in state.session.transcript.iter().rev().take(8).rev() {
         lines.push(role_line(entry));
-        lines.push(Line::from(entry.content.clone()));
+        lines.extend(render_message_body(&entry.content));
         lines.push(Line::from(""));
     }
 
@@ -398,13 +416,22 @@ fn conversation_widget(state: &AppState) -> Paragraph<'_> {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled("(streaming)", Style::default().fg(MUTED)),
+            Span::styled(
+                if state.persistent.behavior.stream {
+                    "(streaming)"
+                } else {
+                    "(responding)"
+                },
+                Style::default().fg(MUTED),
+            ),
         ]));
-        lines.push(Line::from(if state.session.streaming_response.is_empty() {
-            "Waiting for visible assistant output...".to_string()
-        } else {
-            state.session.streaming_response.clone()
-        }));
+        lines.extend(render_message_body(
+            if state.session.streaming_response.is_empty() {
+                "Waiting for visible assistant output..."
+            } else {
+                &state.session.streaming_response
+            },
+        ));
     }
 
     if lines.is_empty() {
@@ -414,9 +441,7 @@ fn conversation_widget(state: &AppState) -> Paragraph<'_> {
         )));
     }
 
-    Paragraph::new(Text::from(lines))
-        .block(panel_block("Conversation"))
-        .wrap(Wrap { trim: false })
+    lines
 }
 
 fn reasoning_widget(state: &AppState) -> Paragraph<'_> {
@@ -642,7 +667,7 @@ fn session_compact_widget(state: &AppState) -> Paragraph<'_> {
     )));
     for entry in state.session.transcript.iter().rev().take(4).rev() {
         lines.push(role_line(entry));
-        lines.push(Line::from(entry.content.clone()));
+        lines.extend(render_message_body(&entry.content));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -658,9 +683,33 @@ fn session_compact_widget(state: &AppState) -> Paragraph<'_> {
         300,
     )));
 
+    let max_scroll = max_wrapped_scroll(&lines, 78, 12);
+    let scroll = if state.follow_conversation_tail() {
+        max_scroll
+    } else {
+        state.conversation_scroll().min(max_scroll)
+    };
+
     Paragraph::new(Text::from(lines))
         .block(panel_block("Session"))
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false })
+}
+
+fn max_wrapped_scroll(lines: &[Line<'_>], width: u16, height: u16) -> u16 {
+    if width == 0 || height == 0 {
+        return 0;
+    }
+
+    let available_width = usize::from(width.max(1));
+    let total_rows = lines
+        .iter()
+        .map(|line| {
+            let width = line.width();
+            width.max(1).div_ceil(available_width)
+        })
+        .sum::<usize>();
+    total_rows.saturating_sub(usize::from(height)) as u16
 }
 
 fn mcp_widget(servers: &[McpServerItem], selected: usize) -> Paragraph<'_> {
@@ -957,6 +1006,287 @@ fn background_fill(area: Rect, color: Color) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines)).style(Style::default().bg(color))
 }
 
+fn render_message_body(text: &str) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return vec![Line::from("")];
+    }
+
+    let lines = text
+        .split('\n')
+        .map(|raw_line| raw_line.trim_end_matches('\r'))
+        .collect::<Vec<_>>();
+    let mut rendered = Vec::new();
+    let mut table_mode = false;
+
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            table_mode = false;
+            rendered.push(Line::from(""));
+            continue;
+        }
+
+        if is_table_alignment_row(line) {
+            table_mode = true;
+            continue;
+        }
+
+        let next_is_alignment = lines
+            .get(index + 1)
+            .is_some_and(|next| is_table_alignment_row(next));
+
+        if looks_like_table_row(line) {
+            rendered.push(render_table_row(line, next_is_alignment));
+            table_mode = next_is_alignment || table_mode;
+            continue;
+        }
+
+        if table_mode {
+            if looks_like_table_row(line) {
+                rendered.push(render_table_row(line, false));
+                continue;
+            }
+            table_mode = false;
+        }
+
+        rendered.push(render_markdown_line(line));
+    }
+
+    rendered
+}
+
+fn render_markdown_line(line: &str) -> Line<'static> {
+    if line.trim().is_empty() {
+        return Line::from("");
+    }
+
+    if is_horizontal_rule(line) {
+        return Line::from(Span::styled("─".repeat(24), Style::default().fg(MUTED)));
+    }
+
+    if let Some(rest) = heading_text(line) {
+        return Line::from(vec![Span::styled(
+            rest.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )]);
+    }
+
+    if let Some(rest) = blockquote_text(line) {
+        let mut spans = vec![Span::styled("▎ ", Style::default().fg(MUTED))];
+        spans.extend(parse_inline_markdown(rest, InlineStyle::Quote));
+        return Line::from(spans);
+    }
+
+    if let Some((checked, body)) = task_list_item(line) {
+        return Line::from(vec![
+            Span::styled(
+                if checked { "☑ " } else { "☐ " },
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(body.to_string(), Style::default().fg(TEXT)),
+        ]);
+    }
+
+    if let Some((prefix, body)) = list_prefix(line) {
+        let mut spans = vec![Span::styled(
+            prefix.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(parse_inline_markdown(body, InlineStyle::Default));
+        return Line::from(spans);
+    }
+
+    Line::from(parse_inline_markdown(line, InlineStyle::Default))
+}
+
+fn heading_text(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let marker_count = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if marker_count == 0 {
+        return None;
+    }
+
+    let remainder = trimmed[marker_count..].trim_start();
+    if remainder.is_empty() {
+        None
+    } else {
+        Some(remainder)
+    }
+}
+
+fn list_prefix(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        return Some(("• ", rest));
+    }
+
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits > 0 && trimmed[digits..].starts_with(". ") {
+        let prefix = &trimmed[..digits + 2];
+        let body = &trimmed[digits + 2..];
+        return Some((prefix, body));
+    }
+
+    None
+}
+
+#[derive(Clone, Copy)]
+enum InlineStyle {
+    Default,
+    Quote,
+    TableHeader,
+    TableCell,
+}
+
+fn parse_inline_markdown(line: &str, style: InlineStyle) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut remaining = line;
+
+    while !remaining.is_empty() {
+        let bold_index = remaining.find("**").map(|index| (index, "**"));
+        let italic_index = remaining.find('*').map(|index| (index, "*"));
+        let code_index = remaining.find('`').map(|index| (index, "`"));
+        let marker = [bold_index, italic_index, code_index]
+            .into_iter()
+            .flatten()
+            .filter(|(index, token)| *token != "*" || !remaining[*index..].starts_with("**"))
+            .min_by_key(|(index, _)| *index);
+
+        let Some((index, token)) = marker else {
+            spans.push(plain_span(remaining, style));
+            break;
+        };
+
+        if index > 0 {
+            spans.push(plain_span(&remaining[..index], style));
+        }
+
+        if token == "**" {
+            let inner = &remaining[index + 2..];
+            if let Some(end) = inner.find("**") {
+                spans.push(Span::styled(
+                    inner[..end].to_string(),
+                    base_style(style).add_modifier(Modifier::BOLD),
+                ));
+                remaining = &inner[end + 2..];
+                continue;
+            }
+        } else if token == "*" {
+            let inner = &remaining[index + 1..];
+            if let Some(end) = inner.find('*') {
+                spans.push(Span::styled(
+                    inner[..end].to_string(),
+                    base_style(style).add_modifier(Modifier::ITALIC),
+                ));
+                remaining = &inner[end + 1..];
+                continue;
+            }
+        } else {
+            let inner = &remaining[index + 1..];
+            if let Some(end) = inner.find('`') {
+                spans.push(Span::styled(
+                    inner[..end].to_string(),
+                    Style::default()
+                        .fg(ACCENT)
+                        .bg(PANEL_ALT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                remaining = &inner[end + 1..];
+                continue;
+            }
+        }
+
+        spans.push(plain_span(token, style));
+        remaining = &remaining[index + token.len()..];
+    }
+
+    spans
+}
+
+fn plain_span(text: &str, style: InlineStyle) -> Span<'static> {
+    Span::styled(text.to_string(), base_style(style))
+}
+
+fn base_style(style: InlineStyle) -> Style {
+    match style {
+        InlineStyle::Default => Style::default().fg(TEXT),
+        InlineStyle::Quote => Style::default().fg(HELP),
+        InlineStyle::TableHeader => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        InlineStyle::TableCell => Style::default().fg(TEXT),
+    }
+}
+
+fn is_horizontal_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.len() >= 3
+        && trimmed
+            .chars()
+            .all(|ch| ch == '-' || ch == '*' || ch == '_')
+}
+
+fn blockquote_text(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix("> ").map(str::trim_start)
+}
+
+fn task_list_item(line: &str) -> Option<(bool, &str)> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed
+        .strip_prefix("- [x] ")
+        .or_else(|| trimmed.strip_prefix("* [x] "))
+    {
+        return Some((true, rest));
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("- [ ] ")
+        .or_else(|| trimmed.strip_prefix("* [ ] "))
+    {
+        return Some((false, rest));
+    }
+    None
+}
+
+fn looks_like_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.matches('|').count() >= 2 && !is_horizontal_rule(trimmed)
+}
+
+fn is_table_alignment_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    looks_like_table_row(trimmed)
+        && trimmed.trim_matches('|').split('|').all(|cell| {
+            let cell = cell.trim();
+            !cell.is_empty() && cell.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')
+        })
+}
+
+fn render_table_row(line: &str, header: bool) -> Line<'static> {
+    let cells = line
+        .trim()
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+
+    let mut spans = Vec::new();
+    for (index, cell) in cells.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
+        }
+        spans.extend(parse_inline_markdown(
+            cell,
+            if header {
+                InlineStyle::TableHeader
+            } else {
+                InlineStyle::TableCell
+            },
+        ));
+    }
+
+    Line::from(spans)
+}
+
 fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1119,5 +1449,75 @@ mod tests {
         assert!(text.contains("Input"));
         assert!(text.contains("idle"));
         assert!(!text.contains("iter 0/"));
+    }
+
+    #[test]
+    fn conversation_preserves_line_breaks() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.transcript.push(TranscriptEntry {
+            role: "Assistant",
+            content: "Line one\n\nLine two\n- item".to_string(),
+        });
+
+        let text = buffer_text(&state, 160, 40);
+        assert!(text.contains("Line one"));
+        assert!(text.contains("Line two"));
+        assert!(text.contains("• item"));
+    }
+
+    #[test]
+    fn conversation_strips_common_markdown_markers() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.transcript.push(TranscriptEntry {
+            role: "Assistant",
+            content: "## Heading\n**Bold** and `code`".to_string(),
+        });
+
+        let text = buffer_text(&state, 160, 40);
+        assert!(text.contains("Heading"));
+        assert!(text.contains("Bold and code"));
+        assert!(!text.contains("## Heading"));
+        assert!(!text.contains("**Bold**"));
+        assert!(!text.contains("`code`"));
+    }
+
+    #[test]
+    fn conversation_scroll_reveals_later_lines() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.transcript.push(TranscriptEntry {
+            role: "Assistant",
+            content: "entry 01\nentry 02\nentry 03\nentry 04\nentry 05\nentry 06\nentry 07\nentry 08\nentry 09\nentry 10\nentry 11\nentry 12".to_string(),
+        });
+        state.scroll_conversation_down(6);
+
+        let text = buffer_text(&state, 160, 22);
+        assert!(text.contains("entry 08"));
+        assert!(!text.contains("entry 01"));
+    }
+
+    #[test]
+    fn conversation_formats_tables_quotes_and_rules() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.transcript.push(TranscriptEntry {
+            role: "Assistant",
+            content:
+                "---\n> quoted line\n| Tool | Use |\n| --- | --- |\n| echo | test |\n- [x] done"
+                    .to_string(),
+        });
+
+        let text = buffer_text(&state, 160, 40);
+        assert!(text.contains("quoted line"));
+        assert!(text.contains("Tool │ Use"));
+        assert!(text.contains("echo │ test"));
+        assert!(text.contains("☑ done"));
+        assert!(!text.contains("| --- | --- |"));
     }
 }

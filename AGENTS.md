@@ -1,5 +1,20 @@
 # AGENTS.md
 
+## Hermes-RS Project Context
+
+- Current release line: `0.1.3`
+- Runtime config is TOML-first and shared through `crates/hermes-core/src/config.rs`
+- Rich CLI/TUI uses `ratatui` and lives under `crates/hermes-cli/src/tui/`
+- The workspace view has `Conversation`, `Reasoning`, `Activity`, and management panels for `MCP`, `Skills`, and `Behavior`
+- When config fields change, update `hermes.example.toml` in the repo root in the same change
+- When user-facing behavior changes, update `README.md`, `CHANGELOG.md`, and screenshots in `assets/` if the UI changed materially
+- Tagged releases are created from `CHANGELOG.md`: push `vX.Y.Z`, then GitHub Actions builds artifacts and publishes the GitHub Release from the matching changelog section
+- Preferred verification commands:
+  - `cargo fmt --all`
+  - `cargo check --workspace`
+  - `cargo test --workspace`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.

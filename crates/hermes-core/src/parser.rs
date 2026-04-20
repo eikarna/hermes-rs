@@ -374,10 +374,15 @@ fn generate_id() -> u64 {
 
 /// Truncate a string for display
 fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        format!(
+            "{}...",
+            s.chars()
+                .take(max_len.saturating_sub(3))
+                .collect::<String>()
+        )
     }
 }
 
@@ -433,6 +438,11 @@ impl ToolCallStreamParser {
         }
 
         tool_calls
+    }
+
+    /// Flush currently accumulated visible text and return it.
+    pub fn take_text(&mut self) -> String {
+        std::mem::take(&mut self.pending_text)
     }
 
     /// Get accumulated text content
@@ -570,5 +580,19 @@ Some text here
 
         parser.feed("</tool_call>");
         assert_eq!(detected.lock().unwrap().len(), 1); // Now detected
+    }
+
+    #[test]
+    fn test_stream_parser_filters_tool_call_markup_from_visible_text() {
+        let mut parser = ToolCallStreamParser::new();
+
+        let tool_calls = parser.process_chunk(
+            "Before <tool_call>{\"name\": \"echo\", \"arguments\": \"{}\"}</tool_call> after",
+        );
+        let text = parser.take_text();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "echo");
+        assert_eq!(text, "");
     }
 }

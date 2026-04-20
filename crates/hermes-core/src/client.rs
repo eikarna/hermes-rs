@@ -387,6 +387,7 @@ pub struct ChatResponse {
 /// A completion choice
 #[derive(Debug, Clone, Deserialize)]
 pub struct Choice {
+    #[serde(default)]
     pub index: usize,
     pub message: MessageDelta,
     pub finish_reason: Option<String>,
@@ -411,6 +412,7 @@ pub struct MessageDelta {
 /// Tool call delta
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolCallDelta {
+    #[serde(default)]
     pub index: usize,
     pub id: Option<String>,
     #[serde(rename = "type")]
@@ -439,6 +441,7 @@ pub struct ChatStreamEvent {
 /// A streaming choice
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamChoice {
+    #[serde(default)]
     pub index: usize,
     pub delta: StreamingMessageDelta,
     #[serde(default)]
@@ -467,6 +470,7 @@ pub struct StreamingMessageDelta {
 /// Tool call delta for streaming
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamingToolCallDelta {
+    #[serde(default)]
     pub index: usize,
     #[serde(default)]
     pub id: Option<String>,
@@ -499,73 +503,78 @@ impl Stream for ChatStreamResponse {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        while let Some(event_end) = this.buffer.find("\n\n") {
-            let event_data = this.buffer[..event_end].to_string();
-            this.buffer = this.buffer[event_end + 2..].to_string();
+        loop {
+            if let Some(event) = try_parse_next_sse_event(&mut this.buffer, false) {
+                return Poll::Ready(Some(Ok(event)));
+            }
 
-            // Parse SSE event format: "data: {...}\n\n"
-            for line in event_data.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        return Poll::Ready(None);
-                    }
-
-                    match serde_json::from_str::<ChatStreamEvent>(data.trim()) {
-                        Ok(event) => return Poll::Ready(Some(Ok(event))),
-                        Err(e) => {
-                            // Try to recover by looking for partial JSON
-                            if let Some(json_start) = data.find('{') {
-                                let potential_json = &data[json_start..];
-                                if let Ok(event) =
-                                    serde_json::from_str::<ChatStreamEvent>(potential_json)
-                                {
-                                    return Poll::Ready(Some(Ok(event)));
-                                }
-                            }
-                            // If parsing fails, continue to get more data
-                            debug!(error = %e, "Failed to parse SSE event, will retry");
-                        }
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => {
+                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                        this.buffer.push_str(&text);
                     }
                 }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(Error::Network(e)))),
+                Poll::Ready(None) => {
+                    return Poll::Ready(try_parse_next_sse_event(&mut this.buffer, true).map(Ok));
+                }
+                Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
 
-        // Poll the underlying stream for more data
-        match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                // Append new data to buffer and try again
-                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                    this.buffer.push_str(&text);
+fn try_parse_next_sse_event(buffer: &mut String, allow_partial: bool) -> Option<ChatStreamEvent> {
+    normalize_sse_buffer(buffer);
+
+    let event_end = if let Some(index) = buffer.find("\n\n") {
+        index
+    } else if allow_partial && !buffer.trim().is_empty() {
+        buffer.len()
+    } else {
+        return None;
+    };
+
+    let event_data = buffer[..event_end].to_string();
+    let drain_len = if event_end < buffer.len() {
+        event_end + 2
+    } else {
+        event_end
+    };
+    buffer.drain(..drain_len);
+
+    let payload = event_data
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if payload.is_empty() {
+        return None;
+    }
+
+    if payload.trim() == "[DONE]" {
+        return None;
+    }
+
+    match serde_json::from_str::<ChatStreamEvent>(payload.trim()) {
+        Ok(event) => Some(event),
+        Err(e) => {
+            if let Some(json_start) = payload.find('{') {
+                let potential_json = &payload[json_start..];
+                if let Ok(event) = serde_json::from_str::<ChatStreamEvent>(potential_json.trim()) {
+                    return Some(event);
                 }
-                // Schedule wakeup and try to process
-                cx.waker().wake_by_ref();
-                Poll::Ready(Some(Ok(ChatStreamEvent {
-                    id: String::new(),
-                    object: String::new(),
-                    created: 0,
-                    model: String::new(),
-                    choices: vec![],
-                })))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Error::Network(e)))),
-            Poll::Ready(None) => {
-                // Try to parse any remaining data in buffer
-                if !this.buffer.is_empty() {
-                    let remaining = this.buffer.clone();
-                    this.buffer.clear();
-                    if let Some(data) = remaining.strip_prefix("data: ") {
-                        if data != "[DONE]" {
-                            match serde_json::from_str::<ChatStreamEvent>(data.trim()) {
-                                Ok(event) => return Poll::Ready(Some(Ok(event))),
-                                Err(_) => return Poll::Ready(None),
-                            }
-                        }
-                    }
-                }
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
+            debug!(error = %e, payload = %payload, "Failed to parse SSE event");
+            None
         }
+    }
+}
+
+fn normalize_sse_buffer(buffer: &mut String) {
+    if buffer.contains('\r') {
+        *buffer = buffer.replace("\r\n", "\n").replace('\r', "\n");
     }
 }
 
@@ -642,6 +651,26 @@ mod tests {
             delta.reasoning_content.as_deref(),
             Some("<think>checking</think>")
         );
+    }
+
+    #[test]
+    fn streaming_parser_handles_crlf_events() {
+        let mut buffer = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"demo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\r\n\r\n".to_string();
+        let event = try_parse_next_sse_event(&mut buffer, false).expect("event should parse");
+
+        assert_eq!(event.choices.len(), 1);
+        assert_eq!(event.choices[0].delta.content.as_deref(), Some("Hello"));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn streaming_parser_handles_partial_final_event() {
+        let mut buffer = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"demo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Done\"},\"finish_reason\":\"stop\"}]}".to_string();
+        let event =
+            try_parse_next_sse_event(&mut buffer, true).expect("trailing event should parse");
+
+        assert_eq!(event.choices[0].delta.content.as_deref(), Some("Done"));
+        assert!(buffer.is_empty());
     }
 
     #[tokio::test]

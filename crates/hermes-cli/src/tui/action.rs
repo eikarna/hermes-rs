@@ -33,12 +33,24 @@ impl AppState {
             Action::SetActivePanel(panel) => self.ui.active_panel = panel,
             Action::CyclePanelForward => self.ui.active_panel = self.ui.active_panel.next(),
             Action::CyclePanelBackward => self.ui.active_panel = self.ui.active_panel.previous(),
-            Action::SetInputMode(mode) => self.ui.input_mode = mode,
-            Action::AppendPrompt(ch) => self.ui.prompt_input.push(ch),
+            Action::SetInputMode(mode) => {
+                self.ui.input_mode = mode;
+                if mode != InputMode::Prompt {
+                    self.detach_prompt_history_navigation();
+                }
+            }
+            Action::AppendPrompt(ch) => {
+                self.detach_prompt_history_navigation();
+                self.ui.prompt_input.push(ch);
+            }
             Action::PromptBackspace => {
+                self.detach_prompt_history_navigation();
                 self.ui.prompt_input.pop();
             }
-            Action::ClearPrompt => self.ui.prompt_input.clear(),
+            Action::ClearPrompt => {
+                self.detach_prompt_history_navigation();
+                self.ui.prompt_input.clear();
+            }
             Action::OpenModal(modal) => self.ui.modal = Some(modal),
             Action::CloseModal => self.ui.modal = None,
             Action::UpdateModal(modal) => self.ui.modal = Some(modal),

@@ -10,7 +10,9 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::client::{ChatStreamEvent, ChatStreamResponse, Message, OpenAIClient, ToolCall};
+use crate::client::{
+    ChatResponse, ChatStreamEvent, ChatStreamResponse, Message, OpenAIClient, ToolCall,
+};
 use crate::config::{runtime_config, BehaviorSettings};
 use crate::error::{Error, Result};
 use crate::parser::{ToolCallParser, ToolCallStreamParser};
@@ -182,14 +184,21 @@ impl HermesAgent {
             // Get tool schemas
             let tools = self.registry.get_schemas().await;
 
-            // Make streaming request
-            let stream = self
-                .client
-                .chat_streaming(&self.config.model, &messages, Some(&tools))
-                .await?;
+            let response = if self.config.stream {
+                let stream = self
+                    .client
+                    .chat_streaming(&self.config.model, &messages, Some(&tools))
+                    .await?;
+                self.process_stream(stream).await
+            } else {
+                let response = self
+                    .client
+                    .chat(&self.config.model, &messages, Some(&tools))
+                    .await?;
+                self.process_response(response).await
+            };
 
-            // Process streaming response with early tool detection
-            match self.process_stream(stream).await {
+            match response {
                 Ok((response_text, reasoning_text, tool_calls)) => {
                     // Add assistant message to conversation
                     let mut assistant_msg = Message::assistant(&response_text);
@@ -287,14 +296,15 @@ impl HermesAgent {
         &self,
         mut stream: ChatStreamResponse,
     ) -> Result<(String, String, Vec<ToolCall>)> {
-        let _parser = ToolCallStreamParser::new().on_tool_call(|tc| {
+        let mut parser = ToolCallStreamParser::new().on_tool_call(|tc| {
             let tc_id = tc.id.clone();
             debug!(tool_call_id = %tc_id, name = %tc.function.name, "Early tool call detected");
         });
         let mut content_router = ThinkBlockRouter::default();
+        let mut tool_call_router = ToolCallContentRouter::default();
         let mut accumulated_text = String::new();
         let mut accumulated_reasoning = String::new();
-        let mut tool_calls = Vec::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut has_error = false;
 
         while let Some(event_result) = stream.next().await {
@@ -313,11 +323,18 @@ impl HermesAgent {
                         let (content_delta, reasoning_delta) = content_router.feed(&text);
 
                         if !content_delta.is_empty() {
-                            accumulated_text.push_str(&content_delta);
-                            self.emit(AgentEvent::Content {
-                                text: content_delta,
-                            })
-                            .await;
+                            let chunk_tool_calls = parser.process_chunk(&content_delta);
+                            for tc in chunk_tool_calls {
+                                if !tool_calls.iter().any(|existing| existing.id == tc.id) {
+                                    tool_calls.push(tc);
+                                }
+                            }
+
+                            let visible_text = tool_call_router.feed(&content_delta);
+                            if !visible_text.is_empty() {
+                                accumulated_text.push_str(&visible_text);
+                                self.emit(AgentEvent::Content { text: visible_text }).await;
+                            }
                         }
 
                         if !reasoning_delta.is_empty() {
@@ -329,10 +346,10 @@ impl HermesAgent {
                         }
                     }
 
-                    // Extract any tool calls from this chunk
+                    // Extract any tool calls from native provider tool-call deltas
                     let chunk_tool_calls = extract_tool_calls_from_event(&event);
                     for tc in chunk_tool_calls {
-                        tool_calls.push(tc);
+                        merge_stream_tool_call(&mut tool_calls, tc);
                     }
                 }
                 Err(e) => {
@@ -348,7 +365,14 @@ impl HermesAgent {
         }
 
         let (remaining_content, remaining_reasoning) = content_router.finish();
-        accumulated_text.push_str(&remaining_content);
+        if !remaining_content.is_empty() {
+            let remaining_calls = parser.process_chunk(&remaining_content);
+            for tc in remaining_calls {
+                merge_stream_tool_call(&mut tool_calls, tc);
+            }
+            accumulated_text.push_str(&tool_call_router.feed(&remaining_content));
+        }
+        accumulated_text.push_str(&tool_call_router.finish());
         accumulated_reasoning.push_str(&remaining_reasoning);
 
         // Also try to extract any remaining tool calls from accumulated text
@@ -357,12 +381,51 @@ impl HermesAgent {
 
         // Merge tool calls, avoiding duplicates
         for tc in remaining_calls {
-            if !tool_calls.iter().any(|existing| existing.id == tc.id) {
-                tool_calls.push(tc);
-            }
+            merge_stream_tool_call(&mut tool_calls, tc);
         }
 
         Ok((accumulated_text, accumulated_reasoning, tool_calls))
+    }
+
+    async fn process_response(
+        &self,
+        response: ChatResponse,
+    ) -> Result<(String, String, Vec<ToolCall>)> {
+        let choice = response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::ParseResponse("response had no choices".to_string()))?;
+
+        let message = choice.message;
+        let raw_content = message.content.unwrap_or_default();
+        let content = strip_tool_call_markup(&raw_content);
+        let reasoning = message
+            .reasoning_content
+            .map(|value| strip_reasoning_tags(&value))
+            .unwrap_or_default();
+        let mut tool_calls = extract_tool_calls_from_choice(message.tool_calls);
+        let mut xml_parser = ToolCallParser::new();
+        if let Ok(xml_tool_calls) = xml_parser.parse(&raw_content) {
+            for tool_call in xml_tool_calls {
+                merge_stream_tool_call(&mut tool_calls, tool_call);
+            }
+        }
+
+        if !content.is_empty() {
+            self.emit(AgentEvent::Content {
+                text: content.clone(),
+            })
+            .await;
+        }
+        if !reasoning.is_empty() {
+            self.emit(AgentEvent::Reasoning {
+                text: reasoning.clone(),
+            })
+            .await;
+        }
+
+        Ok((content, reasoning, tool_calls))
     }
 
     /// Execute tools and handle self-healing
@@ -515,6 +578,9 @@ impl ThinkBlockRouter {
         if !self.pending.is_empty() {
             if self.inside_reasoning {
                 reasoning.push_str(&self.pending);
+                if content.trim().is_empty() {
+                    content.push_str(&self.pending);
+                }
             } else {
                 content.push_str(&self.pending);
             }
@@ -549,7 +615,8 @@ impl ThinkBlockRouter {
             }
 
             let keep = self.pending.len().min(MAX_TAG_LEN.saturating_sub(1));
-            let flush_len = self.pending.len().saturating_sub(keep);
+            let flush_len =
+                floor_char_boundary(&self.pending, self.pending.len().saturating_sub(keep));
             if flush_len == 0 {
                 break;
             }
@@ -589,6 +656,14 @@ fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a
         .min_by_key(|(index, _)| *index)
 }
 
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut boundary = index.min(text.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
 fn strip_reasoning_tags(text: &str) -> String {
     let mut cleaned = text.to_string();
     for tag in OPEN_REASONING_TAGS
@@ -610,10 +685,9 @@ fn extract_tool_calls_from_event(event: &ChatStreamEvent) -> Vec<ToolCall> {
             for delta in delta_tool_calls {
                 if let Some(ref function) = delta.function {
                     // Extract the tool call ID
-                    let id = delta
-                        .id
-                        .clone()
-                        .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
+                    let id = delta.id.clone().unwrap_or_else(|| {
+                        format!("call_stream_{}_{}", delta.index, function.name)
+                    });
 
                     // Create or update tool call
                     if let Some(last) = tool_calls.last_mut() {
@@ -638,6 +712,144 @@ fn extract_tool_calls_from_event(event: &ChatStreamEvent) -> Vec<ToolCall> {
     }
 
     tool_calls
+}
+
+fn extract_tool_calls_from_choice(
+    deltas: Option<Vec<crate::client::ToolCallDelta>>,
+) -> Vec<ToolCall> {
+    deltas
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|delta| {
+            let function = delta.function?;
+            Some(ToolCall {
+                id: delta
+                    .id
+                    .unwrap_or_else(|| format!("call_choice_{}_{}", delta.index, function.name)),
+                function,
+            })
+        })
+        .collect()
+}
+
+fn merge_stream_tool_call(tool_calls: &mut Vec<ToolCall>, tool_call: ToolCall) {
+    if let Some(existing) = tool_calls
+        .iter_mut()
+        .find(|existing| existing.id == tool_call.id)
+    {
+        if existing.function.name.is_empty() {
+            existing.function.name = tool_call.function.name;
+        }
+        if !tool_call.function.arguments.is_empty() {
+            existing
+                .function
+                .arguments
+                .push_str(&tool_call.function.arguments);
+        }
+    } else {
+        tool_calls.push(tool_call);
+    }
+}
+
+#[derive(Default)]
+struct ToolCallContentRouter {
+    pending: String,
+    inside_tool_call: bool,
+}
+
+impl ToolCallContentRouter {
+    fn feed(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        self.drain_ready(false)
+    }
+
+    fn finish(&mut self) -> String {
+        self.drain_ready(true)
+    }
+
+    fn drain_ready(&mut self, flush_all: bool) -> String {
+        const OPEN: &str = "<tool_call";
+        const CLOSE: &str = "</tool_call";
+        let mut content = String::new();
+
+        loop {
+            if self.inside_tool_call {
+                if let Some(index) = find_ascii_case_insensitive(&self.pending, CLOSE) {
+                    let close_end = self.pending[index..]
+                        .find('>')
+                        .map(|offset| index + offset + 1);
+                    if let Some(close_end) = close_end {
+                        self.pending.drain(..close_end);
+                        self.inside_tool_call = false;
+                        continue;
+                    }
+                }
+
+                if flush_all {
+                    self.pending.clear();
+                }
+                break;
+            }
+
+            if let Some(index) = find_ascii_case_insensitive(&self.pending, OPEN) {
+                content.push_str(&self.pending[..index]);
+                if let Some(open_end) = self.pending[index..]
+                    .find('>')
+                    .map(|offset| index + offset + 1)
+                {
+                    self.pending.drain(..open_end);
+                    self.inside_tool_call = false;
+                    self.inside_tool_call = true;
+                    continue;
+                }
+
+                self.pending.drain(..index);
+                break;
+            }
+
+            let keep = if flush_all {
+                0
+            } else {
+                longest_suffix_prefix_match_case_insensitive(&self.pending, OPEN)
+            };
+            let flush_len = self.pending.len().saturating_sub(keep);
+            if flush_len == 0 {
+                break;
+            }
+
+            content.push_str(&self.pending[..flush_len]);
+            self.pending.drain(..flush_len);
+            break;
+        }
+
+        content
+    }
+}
+
+fn longest_suffix_prefix_match(value: &str, marker: &str) -> usize {
+    let max = value.len().min(marker.len().saturating_sub(1));
+    for len in (1..=max).rev() {
+        if value.ends_with(&marker[..len]) {
+            return len;
+        }
+    }
+    0
+}
+
+fn longest_suffix_prefix_match_case_insensitive(value: &str, marker: &str) -> usize {
+    let lowered = value.to_ascii_lowercase();
+    longest_suffix_prefix_match(&lowered, marker)
+}
+
+fn find_ascii_case_insensitive(value: &str, marker: &str) -> Option<usize> {
+    value.to_ascii_lowercase().find(marker)
+}
+
+fn strip_tool_call_markup(content: &str) -> String {
+    let mut router = ToolCallContentRouter::default();
+    let mut visible = router.feed(content);
+    visible.push_str(&router.finish());
+    visible
 }
 
 /// Builder for creating a HermesAgent
@@ -793,5 +1005,161 @@ mod tests {
             ),
             "abcdef"
         );
+    }
+
+    #[test]
+    fn think_router_does_not_split_multibyte_characters() {
+        let mut router = ThinkBlockRouter::default();
+        let (_content, _reasoning) = router.feed("Halo! 🧑‍💻 Senang bertemu");
+        let (_content, _reasoning) = router.finish();
+    }
+
+    #[test]
+    fn think_router_falls_back_to_content_for_unclosed_reasoning() {
+        let mut router = ThinkBlockRouter::default();
+        let (content, reasoning) = router.feed("<think>Visible answer");
+        let (rest_content, rest_reasoning) = router.finish();
+
+        assert_eq!(content, "");
+        assert_eq!(reasoning, "");
+        assert_eq!(rest_content, "Visible answer");
+        assert_eq!(rest_reasoning, "Visible answer");
+    }
+
+    #[test]
+    fn tool_call_router_hides_xml_from_visible_content() {
+        let mut router = ToolCallContentRouter::default();
+
+        let first = router.feed("Before <tool_call>{\"name\":\"datetime\"}");
+        let second = router.feed("{\"arguments\":{}}</tool_call> after");
+        let rest = router.finish();
+
+        assert_eq!(first, "Before ");
+        assert_eq!(second, " after");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn tool_call_router_keeps_plain_text_streaming() {
+        let mut router = ToolCallContentRouter::default();
+
+        let first = router.feed("Halo ");
+        let second = router.feed("hermes!");
+        let rest = router.finish();
+
+        assert_eq!(first, "Halo ");
+        assert_eq!(second, "hermes!");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn extract_tool_calls_from_choice_handles_non_streaming_calls() {
+        let tool_calls = extract_tool_calls_from_choice(Some(vec![crate::client::ToolCallDelta {
+            index: 0,
+            id: Some("call_1".to_string()),
+            call_type: Some("function".to_string()),
+            function: Some(crate::client::ToolCallFunction {
+                name: "datetime".to_string(),
+                arguments: "{\"timezone\":\"UTC\"}".to_string(),
+            }),
+        }]));
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].function.name, "datetime");
+    }
+
+    #[test]
+    fn extract_tool_calls_from_choice_ignores_empty_entries() {
+        let tool_calls = extract_tool_calls_from_choice(Some(vec![crate::client::ToolCallDelta {
+            index: 0,
+            id: None,
+            call_type: None,
+            function: None,
+        }]));
+
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn merge_stream_tool_call_appends_incremental_arguments() {
+        let mut tool_calls = vec![ToolCall {
+            id: "call_0_datetime".to_string(),
+            function: crate::client::ToolCallFunction {
+                name: "datetime".to_string(),
+                arguments: "{\"format\":".to_string(),
+            },
+        }];
+
+        merge_stream_tool_call(
+            &mut tool_calls,
+            ToolCall {
+                id: "call_0_datetime".to_string(),
+                function: crate::client::ToolCallFunction {
+                    name: "datetime".to_string(),
+                    arguments: "\"%Y-%m-%d\"}".to_string(),
+                },
+            },
+        );
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].function.arguments,
+            "{\"format\":\"%Y-%m-%d\"}"
+        );
+    }
+
+    #[test]
+    fn tool_call_router_hides_split_tool_call_open_tag() {
+        let mut router = ToolCallContentRouter::default();
+
+        let first = router.feed("Before <tool_ca");
+        let second = router.feed("ll>{\"name\":\"datetime\"}</tool_call> after");
+        let rest = router.finish();
+
+        assert_eq!(first, "Before ");
+        assert_eq!(second, " after");
+        assert_eq!(rest, "");
+    }
+
+    #[tokio::test]
+    async fn process_response_parses_xml_tool_calls_in_non_stream_mode() {
+        let agent = HermesAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+
+        let response = ChatResponse {
+            id: "resp_1".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "demo".to_string(),
+            choices: vec![crate::client::Choice {
+                index: 0,
+                message: crate::client::MessageDelta {
+                    role: Some(crate::client::Role::Assistant),
+                    content: Some(
+                        "<tool_call>{\"name\":\"datetime\",\"arguments\":\"{}\"}</tool_call>"
+                            .to_string(),
+                    ),
+                    reasoning_content: Some("need tool".to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: crate::client::Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        };
+
+        let (content, reasoning, tool_calls) = agent.process_response(response).await.unwrap();
+
+        assert_eq!(content, "");
+        assert_eq!(reasoning, "need tool");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "datetime");
     }
 }
