@@ -1236,8 +1236,11 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::process::Command;
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, Default)]
     struct FakeCommandExecutor {
@@ -1346,9 +1349,10 @@ mod tests {
 
     fn unique_temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "hermes_autonomous_{}_{}_{}",
+            "hermes_autonomous_{}_{}_{}_{}",
             label,
             std::process::id(),
+            TEMP_PATH_COUNTER.fetch_add(1, Ordering::SeqCst),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
