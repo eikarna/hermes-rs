@@ -43,6 +43,7 @@ pub mod agent;
 pub mod client;
 pub mod config;
 pub mod context;
+pub mod distillation;
 pub mod error;
 pub mod gateway;
 pub mod mcp;
@@ -63,6 +64,7 @@ pub use config::{
     ToolSettings, TuiSettings, WebToolSettings,
 };
 pub use context::{estimate_tokens, ContextConfig, ContextManager};
+pub use distillation::distill_session_to_memory;
 pub use error::{Error, Result};
 pub use gateway::{Gateway, GatewayConfig, PlatformAdapter};
 pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};

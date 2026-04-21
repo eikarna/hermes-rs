@@ -14,7 +14,9 @@ use crate::client::{
     ChatResponse, ChatStreamEvent, ChatStreamResponse, Message, OpenAIClient, ToolCall,
 };
 use crate::config::{runtime_config, BehaviorSettings};
+use crate::distillation::distill_session_to_memory;
 use crate::error::{Error, Result};
+use crate::memory::MemoryManager;
 use crate::parser::{ToolCallParser, ToolCallStreamParser};
 use crate::tools::{ToolContext, ToolRegistry, ToolResult};
 
@@ -90,6 +92,7 @@ pub struct HermesAgent {
     registry: ToolRegistry,
     conversation: Arc<RwLock<Vec<Message>>>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
+    memory_manager: Option<MemoryManager>,
 }
 
 impl HermesAgent {
@@ -101,6 +104,7 @@ impl HermesAgent {
             registry,
             conversation: Arc::new(RwLock::new(Vec::new())),
             event_tx: None,
+            memory_manager: None,
         }
     }
 
@@ -117,7 +121,14 @@ impl HermesAgent {
             registry,
             conversation: Arc::new(RwLock::new(Vec::new())),
             event_tx: Some(event_tx),
+            memory_manager: None,
         }
+    }
+
+    /// Attach a memory manager for long-term memory injection and session distillation.
+    pub fn with_memory_manager(mut self, memory_manager: MemoryManager) -> Self {
+        self.memory_manager = Some(memory_manager);
+        self
     }
 
     /// Send an event to the channel
@@ -215,6 +226,7 @@ impl HermesAgent {
                     // If no tool calls, we're done
                     if tool_calls.is_empty() {
                         let result = assistant_msg.clone();
+                        self.spawn_session_distillation(messages.clone());
                         self.emit(AgentEvent::Done {
                             message: assistant_msg,
                         })
@@ -270,25 +282,51 @@ impl HermesAgent {
     async fn build_messages(&self) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
 
-        // Add system prompt
-        if let Some(ref system) = self.config.system_prompt {
-            messages.push(Message::system(system));
+        let mut system_prompt = if let Some(ref system) = self.config.system_prompt {
+            system.clone()
         } else {
-            // Default system prompt
-            messages.push(Message::system(
-                "You are Hermes, an AI assistant that uses tools to help users. \
+            "You are Hermes, an AI assistant that uses tools to help users. \
                 When you need to use a tool, output your request in the following XML format:\n\
                 <tool_call>{\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}</tool_call>\n\
                 If you need to use multiple tools, output them sequentially, each wrapped in its own XML tags.\n\
                 After receiving tool results, continue reasoning and either call more tools or provide your final response."
-            ));
+                .to_string()
+        };
+
+        if let Some(memory_manager) = &self.memory_manager {
+            let memory_context = memory_manager.build_memory_context(2048).await;
+            let memory_context = memory_context.trim();
+            if !memory_context.is_empty() {
+                system_prompt.push_str("\n\n<long_term_memory>\n");
+                system_prompt.push_str(memory_context);
+                system_prompt.push_str("\n</long_term_memory>");
+            }
         }
+
+        // Add system prompt
+        messages.push(Message::system(system_prompt));
 
         // Add conversation history
         let conv = self.conversation.read().await;
         messages.extend(conv.clone());
 
         Ok(messages)
+    }
+
+    fn spawn_session_distillation(&self, history: Vec<Message>) {
+        let Some(memory_manager) = self.memory_manager.clone() else {
+            return;
+        };
+
+        let client = self.client.clone();
+        let model = self.config.model.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                distill_session_to_memory(client, model, memory_manager, history).await
+            {
+                warn!(error = %error, "Session distillation failed");
+            }
+        });
     }
 
     /// Process streaming response with early tool detection
@@ -857,6 +895,7 @@ pub struct HermesAgentBuilder {
     config: AgentConfig,
     client: Option<OpenAIClient>,
     registry: Option<ToolRegistry>,
+    memory_manager: Option<MemoryManager>,
 }
 
 impl HermesAgentBuilder {
@@ -865,6 +904,7 @@ impl HermesAgentBuilder {
             config: AgentConfig::default(),
             client: None,
             registry: None,
+            memory_manager: None,
         }
     }
 
@@ -916,6 +956,12 @@ impl HermesAgentBuilder {
         self
     }
 
+    /// Set the long-term memory manager.
+    pub fn memory_manager(mut self, memory_manager: MemoryManager) -> Self {
+        self.memory_manager = Some(memory_manager);
+        self
+    }
+
     /// Build the agent
     pub fn build(self) -> Result<HermesAgent> {
         let client = self.client.unwrap_or_else(|| {
@@ -927,7 +973,12 @@ impl HermesAgentBuilder {
             .registry
             .unwrap_or_else(|| ToolRegistry::new(self.config.tool_timeout));
 
-        Ok(HermesAgent::new(self.config, client, registry))
+        let mut agent = HermesAgent::new(self.config, client, registry);
+        if let Some(memory_manager) = self.memory_manager {
+            agent = agent.with_memory_manager(memory_manager);
+        }
+
+        Ok(agent)
     }
 }
 
@@ -957,6 +1008,34 @@ mod tests {
             .unwrap();
 
         // If we reach here, the agent was created successfully
+    }
+
+    #[tokio::test]
+    async fn build_messages_injects_long_term_memory() {
+        let memory_manager = MemoryManager::new();
+        memory_manager
+            .store(
+                crate::memory::MemoryBlock::new("fact1", "fact", "User prefers concise answers")
+                    .importance(80),
+            )
+            .await;
+
+        let agent = HermesAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        )
+        .with_memory_manager(memory_manager);
+
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .first()
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+
+        assert!(system.contains("<long_term_memory>"));
+        assert!(system.contains("[fact] User prefers concise answers"));
+        assert!(system.contains("</long_term_memory>"));
     }
 
     #[test]
