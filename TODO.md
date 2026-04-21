@@ -15,6 +15,3 @@
 - Persistent autonomous failure pause state across process restarts until `TODO.md` or git state changes
 
 ## Pending
-- Run end-to-end autonomous mode validation against a disposable sample repository and document the operator workflow
-- Add richer autonomous observability so repeated failures and paused states are summarized in a dedicated status report
-- Consider persisting autonomous failure state across process restarts if long-running deployments need resume behavior

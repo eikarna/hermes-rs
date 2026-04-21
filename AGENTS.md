@@ -7,6 +7,7 @@
 - Rich CLI/TUI uses `ratatui` and lives under `crates/hermes-cli/src/tui/`
 - Autonomous coding mode lives in `crates/hermes-cli/src/autonomous.rs` and is launched through `hermes autonomous` or `hermes run --autonomous`
 - Repo-root `TODO.md` is the task ledger for autonomous mode; keep `Implemented` and `Pending` accurate when autonomous behavior changes
+- Autonomous runtime writes repo-local `autonomous-status.toml` state and reloads repeated-failure pause state across restarts; keep that workflow documented when changing autonomous behavior
 - The workspace view has `Conversation`, `Reasoning`, `Activity`, and management panels for `MCP`, `Skills`, and `Behavior`
 - When config fields change, update `hermes.example.toml` in the repo root in the same change
 - When user-facing behavior changes, update `README.md`, `CHANGELOG.md`, and screenshots in `assets/` if the UI changed materially
