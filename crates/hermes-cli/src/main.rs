@@ -1,5 +1,6 @@
 //! Hermes-RS CLI
 
+mod autonomous;
 mod tui;
 
 use std::fs::OpenOptions;
@@ -91,6 +92,13 @@ enum Commands {
 
         #[arg(short, long)]
         query: Option<String>,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        autonomous: bool,
+    },
+    Autonomous {
+        #[arg(short, long)]
+        system: Option<String>,
     },
     Tools {
         #[arg(short, long)]
@@ -531,7 +539,20 @@ async fn main() -> Result<()> {
     );
 
     match &cli.command {
-        Commands::Run { system, query } => {
+        Commands::Run {
+            system,
+            query,
+            autonomous,
+        } => {
+            if *autonomous {
+                if query.is_some() {
+                    anyhow::bail!(
+                        "Do not combine 'run --autonomous' with '--query'. Autonomous mode reads TODO.md from the workspace."
+                    );
+                }
+                autonomous::run_autonomous(loaded.config.clone(), system.clone()).await?;
+                return Ok(());
+            }
             let query = query
                 .as_ref()
                 .context("No query provided. Use --query or start chat mode.")?;
@@ -561,6 +582,9 @@ async fn main() -> Result<()> {
         Commands::Tools { verbose } => {
             list_tools(&loaded.config, *verbose).await?;
         }
+        Commands::Autonomous { system } => {
+            autonomous::run_autonomous(loaded.config.clone(), system.clone()).await?;
+        }
         Commands::Test { tool_name, args } => {
             test_tool(&loaded.config, tool_name, args.as_deref()).await?;
         }
@@ -586,5 +610,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(select_log_target(&logging, true), LogTarget::File);
+    }
+
+    #[test]
+    fn autonomous_subcommand_parses() {
+        let cli = Cli::try_parse_from(["hermes", "autonomous"]).unwrap();
+        assert!(matches!(cli.command, Commands::Autonomous { .. }));
+    }
+
+    #[test]
+    fn run_autonomous_flag_parses() {
+        let cli = Cli::try_parse_from(["hermes", "run", "--autonomous"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Run {
+                autonomous: true,
+                ..
+            }
+        ));
     }
 }

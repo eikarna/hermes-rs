@@ -12,6 +12,7 @@ static RUNTIME_CONFIG: OnceLock<RwLock<AppConfig>> = OnceLock::new();
 pub struct AppConfig {
     pub client: ClientSettings,
     pub agent: BehaviorSettings,
+    pub autonomous: AutonomousSettings,
     pub logging: LoggingSettings,
     pub tui: TuiSettings,
     pub mcp: McpSettings,
@@ -66,6 +67,34 @@ impl Default for BehaviorSettings {
             context_window: 128_000,
             max_healing_attempts: 3,
             show_reasoning: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutonomousSettings {
+    pub interval_secs: u64,
+    pub todo_path: PathBuf,
+    pub test_command: String,
+    pub git_remote: String,
+    pub git_branch: String,
+    pub commit_message: String,
+    pub command_timeout_secs: u64,
+    pub max_failures_per_state: usize,
+}
+
+impl Default for AutonomousSettings {
+    fn default() -> Self {
+        Self {
+            interval_secs: 300,
+            todo_path: PathBuf::from("TODO.md"),
+            test_command: "cargo test --workspace".to_string(),
+            git_remote: "origin".to_string(),
+            git_branch: "agent-dev".to_string(),
+            commit_message: "Auto-commit by hermes-rs".to_string(),
+            command_timeout_secs: 900,
+            max_failures_per_state: 3,
         }
     }
 }
@@ -439,6 +468,35 @@ impl AppConfig {
         )?;
         apply_bool_override("HERMES_STREAM", &mut self.agent.stream)?;
         apply_string_option_override("HERMES_SYSTEM_PROMPT", &mut self.agent.system_prompt)?;
+        apply_u64_override(
+            "HERMES_AUTONOMOUS_INTERVAL",
+            &mut self.autonomous.interval_secs,
+        )?;
+        apply_path_override("HERMES_AUTONOMOUS_TODO", &mut self.autonomous.todo_path)?;
+        apply_string_value_override(
+            "HERMES_AUTONOMOUS_TEST_COMMAND",
+            &mut self.autonomous.test_command,
+        );
+        apply_string_value_override(
+            "HERMES_AUTONOMOUS_GIT_REMOTE",
+            &mut self.autonomous.git_remote,
+        );
+        apply_string_value_override(
+            "HERMES_AUTONOMOUS_GIT_BRANCH",
+            &mut self.autonomous.git_branch,
+        );
+        apply_string_value_override(
+            "HERMES_AUTONOMOUS_COMMIT_MESSAGE",
+            &mut self.autonomous.commit_message,
+        );
+        apply_u64_override(
+            "HERMES_AUTONOMOUS_COMMAND_TIMEOUT",
+            &mut self.autonomous.command_timeout_secs,
+        )?;
+        apply_usize_override(
+            "HERMES_AUTONOMOUS_MAX_FAILURES",
+            &mut self.autonomous.max_failures_per_state,
+        )?;
         apply_string_value_override("HERMES_LOG_LEVEL", &mut self.logging.level);
         apply_path_override("HERMES_SKILLS_DIR", &mut self.skills.root_dir)?;
         Ok(())
@@ -571,6 +629,7 @@ mod tests {
         let config = parse_config_str(&raw, &root).unwrap();
         assert_eq!(config.agent.model, "gpt-4");
         assert!(config.tui.rich_output);
+        assert_eq!(config.autonomous.git_branch, "agent-dev");
     }
 
     #[test]
@@ -616,6 +675,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let previous_model = set_env("HERMES_MODEL", "gpt-4.1");
         let previous_stream = set_env("HERMES_STREAM", "false");
+        let previous_interval = set_env("HERMES_AUTONOMOUS_INTERVAL", "120");
 
         let mut config = parse_config_str(
             "[agent]\nmodel = \"gpt-4o-mini\"\nstream = true\n",
@@ -626,8 +686,10 @@ mod tests {
 
         assert_eq!(config.agent.model, "gpt-4.1");
         assert!(!config.agent.stream);
+        assert_eq!(config.autonomous.interval_secs, 120);
 
         restore_env("HERMES_MODEL", previous_model);
         restore_env("HERMES_STREAM", previous_stream);
+        restore_env("HERMES_AUTONOMOUS_INTERVAL", previous_interval);
     }
 }

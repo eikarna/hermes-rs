@@ -17,6 +17,16 @@ max_healing_attempts = 3
 show_reasoning = true
 # system_prompt = "You are Hermes."
 
+[autonomous]
+interval_secs = 300
+todo_path = "TODO.md"
+test_command = "cargo test --workspace"
+git_remote = "origin"
+git_branch = "agent-dev"
+commit_message = "Auto-commit by hermes-rs"
+command_timeout_secs = 900
+max_failures_per_state = 3
+
 [logging]
 level = "info"
 format = "pretty"

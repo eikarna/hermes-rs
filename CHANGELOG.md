@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Autonomous coding mode through `hermes autonomous` and the `hermes run --autonomous` compatibility alias
+- Shared `[autonomous]` runtime configuration for autonomous polling interval, TODO path, validation command, git target, commit message, command timeout, and repeated-failure pause threshold
+- Repo-root `TODO.md` task ledger with `Implemented` and `Pending` sections for autonomous workspace planning
+
+### Changed
+
+- README, `AGENTS.md`, and `CLAUDE.md` now document the autonomous workflow and the role of `TODO.md` as the workspace task source of truth
+
+### Fixed
+
+- Autonomous command execution now runs in blocking isolation with strict exit-status checks so failed validation cannot fall through to git push
+
 ## [0.1.3] - 2026-04-20
 
 ### Added

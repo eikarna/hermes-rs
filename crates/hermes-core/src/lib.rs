@@ -57,10 +57,10 @@ pub mod trajectory;
 pub use agent::{AgentConfig, AgentEvent, HermesAgent};
 pub use client::{Message, OpenAIClient};
 pub use config::{
-    install_runtime_config, load_app_config, runtime_config, AppConfig, BehaviorSettings,
-    ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings, LoadedConfig,
-    LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TerminalSettings, ToolSettings,
-    TuiSettings, WebToolSettings,
+    install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
+    BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings,
+    LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TerminalSettings,
+    ToolSettings, TuiSettings, WebToolSettings,
 };
 pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use error::{Error, Result};

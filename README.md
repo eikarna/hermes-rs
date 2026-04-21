@@ -11,6 +11,7 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 - **Dynamic Schema Generation**: Automatically generate JSON Schema from Rust structs
 - **Shared TOML Configuration**: One runtime config model across `hermes-cli` and `hermes-core`
 - **Ratatui TUI**: Prompt-first landing view, responsive workspace panes, reasoning display, MCP/Skills/Behavior management
+- **Autonomous Coding Mode**: 24/7 workspace-driven loop that reads `TODO.md`, validates with local tests, and only pushes after success
 - **Structured Logging**: Comprehensive observability via the `tracing` crate
 
 ## Architecture
@@ -52,6 +53,9 @@ hermes chat
 
 # Run a one-shot query
 hermes run --query "What is 2 + 2?"
+
+# Start 24/7 autonomous workspace mode
+hermes autonomous
 
 # List available tools
 hermes tools
@@ -103,6 +107,14 @@ request_timeout_secs = 120
 stream = true
 show_reasoning = true
 
+[autonomous]
+interval_secs = 300
+todo_path = "TODO.md"
+test_command = "cargo test --workspace"
+git_remote = "origin"
+git_branch = "agent-dev"
+commit_message = "Auto-commit by hermes-rs"
+
 [tui]
 rich_output = true
 landing_title = "HERMES"
@@ -118,6 +130,28 @@ export HERMES_MODEL=gpt-4
 ```
 
 See [hermes.example.toml](hermes.example.toml) for the full schema, including MCP, Skills, gateway, and tool/runtime defaults.
+
+## Autonomous Mode
+
+- `hermes autonomous` runs a continuous loop against the current workspace
+- `hermes run --autonomous` is kept as a compatibility alias for the same mode
+- Autonomous mode reads repo-root `TODO.md` on every tick and skips work when `## Pending` is empty
+- The loop uses the existing Hermes agent and tools to inspect the repo, implement the next pending task, and update `TODO.md`
+- After each iteration Hermes runs the configured validation command, which defaults to `cargo test --workspace`
+- Git operations are strict:
+  - tests must pass before any push is attempted
+  - successful runs execute `git add .`, `git commit -m "Auto-commit by hermes-rs"`, then `git push origin agent-dev`
+  - repeated failures on the same workspace state pause the loop until `TODO.md` or git state changes
+
+`TODO.md` is the autonomous source of truth and should keep this structure:
+
+```md
+## Implemented
+- completed work
+
+## Pending
+- next tasks for autonomous mode
+```
 
 ## TUI Overview
 
@@ -180,6 +214,7 @@ println!("{}", response.content);
 hermes [OPTIONS] <COMMAND>
 
 Commands:
+  autonomous  Run the autonomous coding loop
   run     Run the agent with a query
   tools   List available tools
   chat    Interactive chat mode

@@ -5,6 +5,8 @@
 - Current release line: `0.1.3`
 - Runtime config is TOML-first and shared through `crates/hermes-core/src/config.rs`
 - Rich CLI/TUI uses `ratatui` and lives under `crates/hermes-cli/src/tui/`
+- Autonomous coding mode lives in `crates/hermes-cli/src/autonomous.rs` and is launched through `hermes autonomous` or `hermes run --autonomous`
+- Repo-root `TODO.md` is the task ledger for autonomous mode; keep `Implemented` and `Pending` accurate when autonomous behavior changes
 - The workspace view has `Conversation`, `Reasoning`, `Activity`, and management panels for `MCP`, `Skills`, and `Behavior`
 - When config fields change, update `hermes.example.toml` in the repo root in the same change
 - When user-facing behavior changes, update `README.md`, `CHANGELOG.md`, and screenshots in `assets/` if the UI changed materially
