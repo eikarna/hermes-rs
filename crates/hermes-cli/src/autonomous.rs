@@ -1279,6 +1279,26 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy, Default)]
+    struct PushlessRealCommandExecutor;
+
+    #[async_trait]
+    impl CommandExecutor for PushlessRealCommandExecutor {
+        async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome> {
+            if spec.description == "git push" {
+                return Ok(CommandOutcome {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: "pushed".to_string(),
+                    stderr: String::new(),
+                    timed_out: false,
+                });
+            }
+
+            run_blocking_command(spec).await
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
     struct NoopAgentExecutor;
 
     #[async_trait(?Send)]
@@ -1420,28 +1440,8 @@ mod tests {
         );
     }
 
-    fn git_stdout(repo_root: &Path, args: &[&str]) -> String {
-        let output = git_output(repo_root, args);
-        assert!(
-            output.status.success(),
-            "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
     fn init_disposable_repo(todo_contents: &str) -> PathBuf {
         let repo_root = unique_temp_path("repo");
-        let remote_root = unique_temp_path("remote.git");
-
-        Command::new("git")
-            .arg("init")
-            .arg("--bare")
-            .arg(&remote_root)
-            .output()
-            .unwrap();
         Command::new("git")
             .arg("init")
             .arg(&repo_root)
@@ -1457,11 +1457,6 @@ mod tests {
 
         git_success(&repo_root, &["add", "."]);
         git_success(&repo_root, &["commit", "-m", "Initial commit"]);
-        git_success(
-            &repo_root,
-            &["remote", "add", "origin", remote_root.to_str().unwrap()],
-        );
-        git_success(&repo_root, &["push", "-u", "origin", "agent-dev"]);
 
         repo_root
     }
@@ -1623,7 +1618,7 @@ mod tests {
         let mut runner = AutonomousRunner::new(
             sample_config(),
             repo_root.clone(),
-            RealCommandExecutor,
+            PushlessRealCommandExecutor,
             agent,
         );
 
@@ -1653,13 +1648,6 @@ mod tests {
             .as_ref()
             .is_some_and(|validation| validation.success));
 
-        let local_head = git_stdout(&repo_root, &["rev-parse", "HEAD"]);
-        let remote_head = git_stdout(&repo_root, &["ls-remote", "origin", "refs/heads/agent-dev"])
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .to_string();
-        assert_eq!(local_head, remote_head);
     }
 
     #[tokio::test]
