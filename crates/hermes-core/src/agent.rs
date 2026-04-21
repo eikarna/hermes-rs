@@ -14,6 +14,7 @@ use crate::client::{
     ChatResponse, ChatStreamEvent, ChatStreamResponse, Message, OpenAIClient, ToolCall,
 };
 use crate::config::{runtime_config, BehaviorSettings};
+use crate::context_files::{load_default_context_files, load_workspace_context};
 use crate::distillation::distill_session_to_memory;
 use crate::error::{Error, Result};
 use crate::memory::MemoryManager;
@@ -303,6 +304,13 @@ impl HermesAgent {
             }
         }
 
+        let context_files = self.load_context_file_prompt();
+        if !context_files.trim().is_empty() {
+            system_prompt.push_str("\n\n<workspace_context>\n");
+            system_prompt.push_str(context_files.trim());
+            system_prompt.push_str("\n</workspace_context>");
+        }
+
         // Add system prompt
         messages.push(Message::system(system_prompt));
 
@@ -311,6 +319,28 @@ impl HermesAgent {
         messages.extend(conv.clone());
 
         Ok(messages)
+    }
+
+    fn load_context_file_prompt(&self) -> String {
+        let mut blocks = Vec::new();
+
+        let global_context = load_default_context_files();
+        if !global_context.trim().is_empty() {
+            blocks.push(global_context);
+        }
+
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                if let Some(workspace_context) = load_workspace_context(&cwd) {
+                    blocks.push(workspace_context);
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "Could not determine current directory for context files")
+            }
+        }
+
+        blocks.join("\n\n")
     }
 
     fn spawn_session_distillation(&self, history: Vec<Message>) {

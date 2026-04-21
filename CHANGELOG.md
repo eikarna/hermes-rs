@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Disposable-repo autonomous validation coverage that exercises the full tick loop without a live model call
 - Long-term memory injection into agent system prompts via `<long_term_memory>` context built from durable `MEMORY.md` facts
 - Async state distillation that extracts durable session facts into repo-local `MEMORY.md` after completed agent runs
+- Workspace context-file auto-loading for `AGENTS.md`, `CLAUDE.md`, `.hermes.md`, `HERMES.md`, and `.cursorrules` with prompt-injection scanning and truncation
 
 ### Changed
 

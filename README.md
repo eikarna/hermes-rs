@@ -132,6 +132,12 @@ export HERMES_MODEL=gpt-4
 
 See [hermes.example.toml](hermes.example.toml) for the full schema, including MCP, Skills, gateway, and tool/runtime defaults.
 
+## Workspace Context
+
+- Hermes automatically loads the nearest workspace guidance file from `AGENTS.md`, `CLAUDE.md`, `.hermes.md`, `HERMES.md`, or `.cursorrules` and injects it into the system prompt as `<workspace_context>`
+- Global `.md` / `.txt` context files under the user Hermes context directory are also included when present
+- Oversized context files are truncated and obvious prompt-injection patterns are blocked before injection
+
 ## Autonomous Mode
 
 - `hermes autonomous` runs a continuous loop against the current workspace
