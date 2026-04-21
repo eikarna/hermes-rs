@@ -14,11 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repo-root `TODO.md` task ledger with `Implemented` and `Pending` sections for autonomous workspace planning
 - Repo-local `autonomous-status.toml` status reports that capture autonomous state, validation results, failure summaries, and last push targets
 - Disposable-repo autonomous validation coverage that exercises the full tick loop without a live model call
+- Long-term memory injection into agent system prompts via `<long_term_memory>` context built from durable `MEMORY.md` facts
+- Async state distillation that extracts durable session facts into repo-local `MEMORY.md` after completed agent runs
 
 ### Changed
 
 - README, `AGENTS.md`, and `CLAUDE.md` now document the autonomous workflow, the role of `TODO.md` as the workspace task source of truth, and the disposable operator workflow for validating autonomous mode safely
 - Repeated autonomous failure pauses now persist across process restarts until `TODO.md` or git state changes, using `autonomous-status.toml` as the durable state store
+- CLI, TUI, and autonomous sessions now reload persisted long-term memory from the current workspace before constructing agents
 
 ### Fixed
 

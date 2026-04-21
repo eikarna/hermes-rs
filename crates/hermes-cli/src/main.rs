@@ -18,6 +18,7 @@ use hermes_core::config::{
     McpServerConfig, McpTransportKind,
 };
 use hermes_core::mcp::McpManager;
+use hermes_core::memory::MemoryManager;
 use hermes_core::tools::{HermesTool, ToolContext, ToolRegistry};
 use serde::Deserialize;
 use serde_json::Value;
@@ -302,12 +303,11 @@ pub(crate) async fn create_runtime_agent(
     let client = OpenAIClient::new(client_config(config));
     let registry = build_registry(config, mcp_manager).await?;
     let agent_config = agent_config(config, behavior, system_prompt);
-    Ok(HermesAgent::with_events(
-        agent_config,
-        client,
-        registry,
-        event_tx,
-    ))
+    let memory_manager = load_repo_memory_manager().await?;
+    Ok(
+        HermesAgent::with_events(agent_config, client, registry, event_tx)
+            .with_memory_manager(memory_manager),
+    )
 }
 
 async fn create_agent_without_events(
@@ -318,7 +318,22 @@ async fn create_agent_without_events(
     let client = OpenAIClient::new(client_config(config));
     let registry = build_registry(config, mcp_manager).await?;
     let agent_config = agent_config(config, &config.agent, system_prompt);
-    Ok(HermesAgent::new(agent_config, client, registry))
+    let memory_manager = load_repo_memory_manager().await?;
+    Ok(HermesAgent::new(agent_config, client, registry).with_memory_manager(memory_manager))
+}
+
+async fn load_repo_memory_manager() -> Result<MemoryManager> {
+    let storage_dir = std::env::current_dir().context("Failed to determine current directory")?;
+    load_memory_manager(storage_dir).await
+}
+
+async fn load_memory_manager(storage_dir: PathBuf) -> Result<MemoryManager> {
+    let memory_manager = MemoryManager::with_storage_dir(storage_dir);
+    memory_manager
+        .load_from_disk()
+        .await
+        .context("Failed to load long-term memory")?;
+    Ok(memory_manager)
 }
 
 async fn run_non_tui(config: &AppConfig, system_prompt: Option<&str>, query: &str) -> Result<()> {
@@ -610,6 +625,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(select_log_target(&logging, true), LogTarget::File);
+    }
+
+    #[tokio::test]
+    async fn load_memory_manager_reads_existing_memory_file() {
+        let dir =
+            std::env::temp_dir().join(format!("hermes_cli_memory_load_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let seed = MemoryManager::with_storage_dir(dir.clone());
+        seed.store(
+            hermes_core::memory::MemoryBlock::new("cli_fact", "fact", "Loaded memory fact")
+                .importance(90),
+        )
+        .await;
+
+        let loaded = load_memory_manager(dir.clone()).await.unwrap();
+
+        assert_eq!(loaded.search("Loaded memory").await.len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

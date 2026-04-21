@@ -13,5 +13,6 @@
 - End-to-end autonomous mode validation against a disposable sample repository, with README operator workflow documentation
 - Dedicated repo-local `autonomous-status.toml` reporting for autonomous state, validation summaries, repeated failures, and paused states
 - Persistent autonomous failure pause state across process restarts until `TODO.md` or git state changes
+- State distillation with long-term memory injection and async session fact extraction into `MEMORY.md`
 
 ## Pending

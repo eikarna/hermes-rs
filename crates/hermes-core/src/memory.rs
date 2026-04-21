@@ -446,7 +446,7 @@ impl MemoryStore {
 }
 
 /// Memory manager for storing and retrieving memories
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemoryManager {
     /// Long-term memories
     long_term: Arc<RwLock<HashMap<String, MemoryBlock>>>,
