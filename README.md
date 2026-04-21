@@ -110,6 +110,7 @@ show_reasoning = true
 [autonomous]
 interval_secs = 300
 todo_path = "TODO.md"
+status_path = "autonomous-status.toml"
 test_command = "cargo test --workspace"
 git_remote = "origin"
 git_branch = "agent-dev"
@@ -137,11 +138,12 @@ See [hermes.example.toml](hermes.example.toml) for the full schema, including MC
 - `hermes run --autonomous` is kept as a compatibility alias for the same mode
 - Autonomous mode reads repo-root `TODO.md` on every tick and skips work when `## Pending` is empty
 - The loop uses the existing Hermes agent and tools to inspect the repo, implement the next pending task, and update `TODO.md`
+- Hermes writes a repo-local `autonomous-status.toml` report on each tick with the current state, failure summary, validation result, and last push target
 - After each iteration Hermes runs the configured validation command, which defaults to `cargo test --workspace`
 - Git operations are strict:
   - tests must pass before any push is attempted
-  - successful runs execute `git add .`, `git commit -m "Auto-commit by hermes-rs"`, then `git push origin agent-dev`
-  - repeated failures on the same workspace state pause the loop until `TODO.md` or git state changes
+  - successful runs stage workspace changes while excluding the status report, then execute `git commit -m "Auto-commit by hermes-rs"` and `git push origin agent-dev`
+  - repeated failures on the same workspace state pause the loop until `TODO.md` or git state changes, and that pause survives process restarts through `autonomous-status.toml`
 
 `TODO.md` is the autonomous source of truth and should keep this structure:
 
@@ -165,6 +167,53 @@ See [hermes.example.toml](hermes.example.toml) for the full schema, including MC
 - `Ctrl+L` starts a fresh session when you want to discard the current conversation history
 - After a run completes or fails, the workspace returns to prompt mode so you can send a follow-up in the same session
 - `stream = false` now uses the non-streaming response path instead of the streaming parser
+
+### Disposable Repo Workflow
+
+Use a throwaway repository first to validate your autonomous setup end to end:
+
+```bash
+mkdir hermes-autonomous-sample
+cd hermes-autonomous-sample
+git init
+git checkout -b agent-dev
+cp ../hermes-rs/hermes.example.toml ./hermes.toml
+```
+
+Create a minimal `TODO.md`:
+
+```md
+## Implemented
+- bootstrap sample repo
+
+## Pending
+- add one safe autonomous task
+```
+
+Then tune `[autonomous]` in `hermes.toml` for the sample repo:
+
+```toml
+[autonomous]
+todo_path = "TODO.md"
+status_path = "autonomous-status.toml"
+test_command = "git diff --check"
+git_remote = "origin"
+git_branch = "agent-dev"
+```
+
+Run Hermes:
+
+```bash
+hermes autonomous
+```
+
+While it runs, inspect:
+
+- `TODO.md` to confirm completed items move from `Pending` to `Implemented`
+- `autonomous-status.toml` to see `state`, timing fields, failure or pause metadata, the last validation summary, and the last push target
+- `git log --oneline` to confirm only validated work is committed
+
+If the loop pauses after repeated failures, edit `TODO.md` or otherwise change the workspace state, then start or continue `hermes autonomous` again. Hermes reloads the persisted pause state from `autonomous-status.toml` and resumes only after the workspace fingerprint changes.
 
 ## Library Usage
 

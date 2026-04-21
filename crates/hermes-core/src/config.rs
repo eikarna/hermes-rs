@@ -76,6 +76,7 @@ impl Default for BehaviorSettings {
 pub struct AutonomousSettings {
     pub interval_secs: u64,
     pub todo_path: PathBuf,
+    pub status_path: PathBuf,
     pub test_command: String,
     pub git_remote: String,
     pub git_branch: String,
@@ -89,6 +90,7 @@ impl Default for AutonomousSettings {
         Self {
             interval_secs: 300,
             todo_path: PathBuf::from("TODO.md"),
+            status_path: PathBuf::from("autonomous-status.toml"),
             test_command: "cargo test --workspace".to_string(),
             git_remote: "origin".to_string(),
             git_branch: "agent-dev".to_string(),
@@ -473,6 +475,7 @@ impl AppConfig {
             &mut self.autonomous.interval_secs,
         )?;
         apply_path_override("HERMES_AUTONOMOUS_TODO", &mut self.autonomous.todo_path)?;
+        apply_path_override("HERMES_AUTONOMOUS_STATUS", &mut self.autonomous.status_path)?;
         apply_string_value_override(
             "HERMES_AUTONOMOUS_TEST_COMMAND",
             &mut self.autonomous.test_command,
@@ -630,6 +633,10 @@ mod tests {
         assert_eq!(config.agent.model, "gpt-4");
         assert!(config.tui.rich_output);
         assert_eq!(config.autonomous.git_branch, "agent-dev");
+        assert_eq!(
+            config.autonomous.status_path,
+            PathBuf::from("autonomous-status.toml")
+        );
     }
 
     #[test]
@@ -676,6 +683,7 @@ mod tests {
         let previous_model = set_env("HERMES_MODEL", "gpt-4.1");
         let previous_stream = set_env("HERMES_STREAM", "false");
         let previous_interval = set_env("HERMES_AUTONOMOUS_INTERVAL", "120");
+        let previous_status = set_env("HERMES_AUTONOMOUS_STATUS", "runtime/autonomous-status.toml");
 
         let mut config = parse_config_str(
             "[agent]\nmodel = \"gpt-4o-mini\"\nstream = true\n",
@@ -687,9 +695,14 @@ mod tests {
         assert_eq!(config.agent.model, "gpt-4.1");
         assert!(!config.agent.stream);
         assert_eq!(config.autonomous.interval_secs, 120);
+        assert_eq!(
+            config.autonomous.status_path,
+            PathBuf::from("runtime/autonomous-status.toml")
+        );
 
         restore_env("HERMES_MODEL", previous_model);
         restore_env("HERMES_STREAM", previous_stream);
         restore_env("HERMES_AUTONOMOUS_INTERVAL", previous_interval);
+        restore_env("HERMES_AUTONOMOUS_STATUS", previous_status);
     }
 }

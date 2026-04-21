@@ -10,16 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Autonomous coding mode through `hermes autonomous` and the `hermes run --autonomous` compatibility alias
-- Shared `[autonomous]` runtime configuration for autonomous polling interval, TODO path, validation command, git target, commit message, command timeout, and repeated-failure pause threshold
+- Shared `[autonomous]` runtime configuration for autonomous polling interval, TODO path, status report path, validation command, git target, commit message, command timeout, and repeated-failure pause threshold
 - Repo-root `TODO.md` task ledger with `Implemented` and `Pending` sections for autonomous workspace planning
+- Repo-local `autonomous-status.toml` status reports that capture autonomous state, validation results, failure summaries, and last push targets
+- Disposable-repo autonomous validation coverage that exercises the full tick loop without a live model call
 
 ### Changed
 
-- README, `AGENTS.md`, and `CLAUDE.md` now document the autonomous workflow and the role of `TODO.md` as the workspace task source of truth
+- README, `AGENTS.md`, and `CLAUDE.md` now document the autonomous workflow, the role of `TODO.md` as the workspace task source of truth, and the disposable operator workflow for validating autonomous mode safely
+- Repeated autonomous failure pauses now persist across process restarts until `TODO.md` or git state changes, using `autonomous-status.toml` as the durable state store
 
 ### Fixed
 
 - Autonomous command execution now runs in blocking isolation with strict exit-status checks so failed validation cannot fall through to git push
+- Autonomous status tracking no longer dirties workspace fingerprints or staged commits with the runtime status file itself
 
 ## [0.1.3] - 2026-04-20
 

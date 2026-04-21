@@ -20,6 +20,7 @@ show_reasoning = true
 [autonomous]
 interval_secs = 300
 todo_path = "TODO.md"
+status_path = "autonomous-status.toml"
 test_command = "cargo test --workspace"
 git_remote = "origin"
 git_branch = "agent-dev"

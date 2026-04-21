@@ -10,9 +10,11 @@
 - GitHub Actions build, test, coverage, and release workflows with changelog-driven release notes
 - Autonomous coding mode entrypoints: `hermes autonomous` and `hermes run --autonomous`
 - Autonomous workspace loop that reads `TODO.md`, runs the agent, validates changes, and only pushes after passing tests
+- End-to-end autonomous mode validation against a disposable sample repository, with README operator workflow documentation
+- Dedicated repo-local `autonomous-status.toml` reporting for autonomous state, validation summaries, repeated failures, and paused states
+- Persistent autonomous failure pause state across process restarts until `TODO.md` or git state changes
 
 ## Pending
-
 - Run end-to-end autonomous mode validation against a disposable sample repository and document the operator workflow
 - Add richer autonomous observability so repeated failures and paused states are summarized in a dedicated status report
 - Consider persisting autonomous failure state across process restarts if long-running deployments need resume behavior
