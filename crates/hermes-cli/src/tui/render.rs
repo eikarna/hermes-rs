@@ -198,30 +198,8 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     frame.render_widget(status, footer_row[0]);
 }
 
-fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
-    let is_portrait_like = area.width < 56;
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if is_portrait_like {
-            [
-                Constraint::Max(4),
-                Constraint::Min(7),
-                Constraint::Max(4),
-                Constraint::Min(1),
-                Constraint::Max(2),
-            ]
-        } else {
-            [
-                Constraint::Max(4),
-                Constraint::Min(7),
-                Constraint::Max(3),
-                Constraint::Min(1),
-                Constraint::Max(2),
-            ]
-        })
-        .split(area);
-
-    let title = Paragraph::new(Text::from(vec![
+fn build_compact_title<'a>(state: &'a AppState) -> Paragraph<'a> {
+    Paragraph::new(Text::from(vec![
         Line::from(Span::styled(
             state.persistent.config.tui.landing_title.clone(),
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -232,15 +210,16 @@ fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         )),
     ]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Center);
-    frame.render_widget(title, outer[0]);
+    .alignment(Alignment::Center)
+}
 
+fn build_compact_prompt<'a>(state: &'a AppState, area_width: u16) -> Paragraph<'a> {
     let prompt_text = if state.ui.prompt_input.is_empty() {
         state.persistent.config.tui.prompt_placeholder.clone()
     } else {
         state.ui.prompt_input.clone()
     };
-    let prompt = Paragraph::new(Text::from(vec![
+    Paragraph::new(Text::from(vec![
         Line::from(Span::styled(
             prompt_text,
             Style::default()
@@ -263,15 +242,16 @@ fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             ),
             Span::raw(" · "),
             Span::styled(
-                truncate_display(&state.persistent.behavior.model, area.width as usize / 2),
+                truncate_display(&state.persistent.behavior.model, area_width as usize / 2),
                 Style::default().fg(TEXT),
             ),
         ]),
     ]))
     .block(panel_block("Prompt"))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(prompt, outer[1]);
+    .wrap(Wrap { trim: true })
+}
 
+fn build_compact_controls<'a>(is_portrait_like: bool) -> Paragraph<'a> {
     let controls = if is_portrait_like {
         vec![
             Line::from(vec![
@@ -299,21 +279,50 @@ fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             label(" panels"),
         ])]
     };
-    let help = Paragraph::new(Text::from(controls))
+    Paragraph::new(Text::from(controls))
         .style(Style::default().bg(BG))
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: true });
-    frame.render_widget(help, outer[2]);
+        .wrap(Wrap { trim: true })
+}
 
-    let status = Paragraph::new(Line::from(vec![Span::styled(
+fn build_compact_status<'a>(state: &'a AppState) -> Paragraph<'a> {
+    Paragraph::new(Line::from(vec![Span::styled(
         status_summary(state),
         Style::default()
             .fg(status_color(state))
             .add_modifier(Modifier::BOLD),
     )]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Left);
-    frame.render_widget(status, outer[4]);
+    .alignment(Alignment::Left)
+}
+
+fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let is_portrait_like = area.width < 56;
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if is_portrait_like {
+            [
+                Constraint::Max(4),
+                Constraint::Min(7),
+                Constraint::Max(4),
+                Constraint::Min(1),
+                Constraint::Max(2),
+            ]
+        } else {
+            [
+                Constraint::Max(4),
+                Constraint::Min(7),
+                Constraint::Max(3),
+                Constraint::Min(1),
+                Constraint::Max(2),
+            ]
+        })
+        .split(area);
+
+    frame.render_widget(build_compact_title(state), outer[0]);
+    frame.render_widget(build_compact_prompt(state, area.width), outer[1]);
+    frame.render_widget(build_compact_controls(is_portrait_like), outer[2]);
+    frame.render_widget(build_compact_status(state), outer[4]);
 }
 
 fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
