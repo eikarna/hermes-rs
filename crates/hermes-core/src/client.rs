@@ -73,6 +73,22 @@ impl OpenAIClient {
         }
     }
 
+    /// Create a client from an existing HTTP client handle.
+    pub(crate) fn from_shared_http_client(config: ClientConfig, http_client: Client) -> Self {
+        Self {
+            config,
+            http_client,
+        }
+    }
+
+    pub(crate) fn config_clone(&self) -> ClientConfig {
+        self.config.clone()
+    }
+
+    pub(crate) fn http_client_clone(&self) -> Client {
+        self.http_client.clone()
+    }
+
     /// Create from environment variables
     pub fn from_env() -> Result<Self> {
         let base = runtime_config();

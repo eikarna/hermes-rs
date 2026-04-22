@@ -76,5 +76,8 @@ pub use memory::{MemoryBlock, MemoryManager, Session, UserProfile};
 pub use parser::ToolCallParser;
 pub use platform::PlatformInfo;
 pub use skills::{Skill, SkillManager};
-pub use tools::{register_builtin_tools, HermesTool, ToolRegistry, ToolResult};
+pub use tools::{
+    register_builtin_tools, register_builtin_tools_with_sub_agent, HermesTool, ToolRegistry,
+    ToolResult,
+};
 pub use trajectory::{Trajectory, TrajectoryBuilder, TrajectoryExporter};

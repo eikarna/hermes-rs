@@ -243,9 +243,11 @@ fn agent_config(
 pub(crate) async fn build_registry(
     config: &AppConfig,
     mcp_manager: &mut McpManager,
+    client: &OpenAIClient,
+    model: &str,
 ) -> Result<ToolRegistry> {
     let registry = ToolRegistry::new(Duration::from_secs(config.tools.registry_timeout_secs));
-    hermes_core::tools::register_builtin_tools(&registry).await?;
+    hermes_core::tools::register_builtin_tools_with_sub_agent(&registry, client, model).await?;
     registry.register(EchoTool::new()).await?;
     registry.register(CalculatorTool::new()).await?;
 
@@ -301,7 +303,7 @@ pub(crate) async fn create_runtime_agent(
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
     let client = OpenAIClient::new(client_config(config));
-    let registry = build_registry(config, mcp_manager).await?;
+    let registry = build_registry(config, mcp_manager, &client, &behavior.model).await?;
     let agent_config = agent_config(config, behavior, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
     Ok(
@@ -316,7 +318,7 @@ async fn create_agent_without_events(
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
     let client = OpenAIClient::new(client_config(config));
-    let registry = build_registry(config, mcp_manager).await?;
+    let registry = build_registry(config, mcp_manager, &client, &config.agent.model).await?;
     let agent_config = agent_config(config, &config.agent, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
     Ok(HermesAgent::new(agent_config, client, registry).with_memory_manager(memory_manager))
@@ -378,7 +380,8 @@ async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result
 
 async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let registry = build_registry(config, &mut mcp_manager).await?;
+    let client = OpenAIClient::new(client_config(config));
+    let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let tools = registry.get_schemas().await;
 
     for tool in tools {
@@ -393,7 +396,8 @@ async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
 
 async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let registry = build_registry(config, &mut mcp_manager).await?;
+    let client = OpenAIClient::new(client_config(config));
+    let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let parsed_args: Value = if let Some(args) = args {
         serde_json::from_str(args).context("Failed to parse tool arguments as JSON")?
     } else {
