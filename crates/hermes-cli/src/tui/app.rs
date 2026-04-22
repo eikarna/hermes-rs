@@ -143,7 +143,16 @@ impl TuiApp {
         if let Some(handle) = &self.run_handle {
             if handle.is_finished() {
                 let handle = self.run_handle.take().unwrap();
-                apply_run_result(&mut self.state, handle.await);
+                let action = match handle.await {
+                    Ok(Ok(_)) => Action::ApplyRunResult(None),
+                    Ok(Err(error)) => {
+                        Action::ApplyRunResult(Some(format!("Run failed: {}", error)))
+                    }
+                    Err(error) => {
+                        Action::ApplyRunResult(Some(format!("Agent task join failed: {}", error)))
+                    }
+                };
+                self.state.reduce(action);
             }
         }
         Ok(())
@@ -443,7 +452,10 @@ impl TuiApp {
     }
 
     fn handle_runtime_error(&mut self, prefix: &str, error: anyhow::Error) {
-        apply_runtime_error(&mut self.state, prefix, error);
+        self.state.reduce(Action::RuntimeError {
+            prefix: prefix.to_string(),
+            error: error.to_string(),
+        });
     }
 
     async fn upsert_mcp_server(
@@ -754,33 +766,6 @@ fn handle_prompt_scroll_key(state: &mut AppState, key: KeyEvent) -> bool {
     true
 }
 
-fn apply_runtime_error(state: &mut AppState, prefix: &str, error: anyhow::Error) {
-    let message = format!("{}: {}", prefix, error);
-    if state.session.running {
-        state.fail_run(message);
-    } else {
-        state.record_app_event(
-            prefix,
-            message,
-            Tone::Error,
-            Some(prefix.to_ascii_lowercase()),
-        );
-    }
-}
-
-fn apply_run_result(
-    state: &mut AppState,
-    result: std::result::Result<hermes_core::Result<Message>, tokio::task::JoinError>,
-) {
-    match result {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => apply_runtime_error(state, "Run failed", anyhow::Error::new(error)),
-        Err(error) => {
-            apply_runtime_error(state, "Agent task join failed", anyhow::Error::new(error))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -902,14 +887,22 @@ mod tests {
     async fn join_errors_stay_inside_tui_state() {
         let mut state = AppState::new(AppConfig::default(), String::new(), false);
         state.begin_run("hello".to_string());
-        let run_handle = task::spawn(async move {
-            panic!("boom");
-            #[allow(unreachable_code)]
-            Ok(hermes_core::client::Message::assistant("never"))
-        });
+        let run_handle: tokio::task::JoinHandle<hermes_core::Result<Message>> =
+            task::spawn(async move {
+                panic!("boom");
+                #[allow(unreachable_code)]
+                Ok(hermes_core::client::Message::assistant("never"))
+            });
         tokio::task::yield_now().await;
 
-        apply_run_result(&mut state, run_handle.await);
+        let action = match run_handle.await {
+            Ok(Ok(_)) => Action::ApplyRunResult(None),
+            Ok(Err(error)) => Action::ApplyRunResult(Some(format!("Run failed: {}", error))),
+            Err(error) => {
+                Action::ApplyRunResult(Some(format!("Agent task join failed: {}", error)))
+            }
+        };
+        state.reduce(action);
 
         assert_eq!(state.session.status, "Run failed");
         assert!(state

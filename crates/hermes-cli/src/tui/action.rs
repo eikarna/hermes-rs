@@ -24,6 +24,8 @@ pub enum Action {
     SelectNext,
     SelectPrevious,
     Quit,
+    ApplyRunResult(Option<String>),
+    RuntimeError { prefix: String, error: String },
 }
 
 impl AppState {
@@ -124,6 +126,32 @@ impl AppState {
                 ActivePanel::Session => {}
             },
             Action::Quit => self.ui.should_quit = true,
+            Action::RuntimeError { prefix, error } => {
+                let message = format!("{}: {}", prefix, error);
+                if self.session.running {
+                    self.fail_run(message);
+                } else {
+                    self.record_app_event(
+                        prefix.clone(),
+                        message,
+                        crate::tui::state::Tone::Error,
+                        Some(prefix.to_ascii_lowercase()),
+                    );
+                }
+            }
+            Action::ApplyRunResult(Some(error)) => {
+                if self.session.running {
+                    self.fail_run(error.clone());
+                } else {
+                    self.record_app_event(
+                        "Run failed",
+                        error,
+                        crate::tui::state::Tone::Error,
+                        Some("run failed".to_string()),
+                    );
+                }
+            }
+            Action::ApplyRunResult(None) => {}
         }
     }
 }
