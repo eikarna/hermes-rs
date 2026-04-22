@@ -3,6 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::state::{
     ActivePanel, AppState, InputMode, LayoutMode, McpServerItem, SkillItem, Tone, TranscriptEntry,
@@ -18,6 +19,46 @@ const HELP: Color = Color::Rgb(188, 184, 176);
 const SUCCESS: Color = Color::Rgb(115, 185, 115);
 const ERROR: Color = Color::Rgb(220, 98, 87);
 const WARN: Color = Color::Rgb(208, 170, 82);
+const CONSTRAINED_WIDTH: u16 = 65;
+const CONSTRAINED_HEIGHT: u16 = 20;
+const DESKTOP_WIDTH: u16 = 120;
+const DESKTOP_HEIGHT: u16 = 24;
+
+#[derive(Clone, Copy)]
+struct DesktopWorkspaceLayout {
+    header: Rect,
+    conversation: Rect,
+    panel: Rect,
+    reasoning: Rect,
+    activity: Rect,
+    footer: Rect,
+}
+
+#[derive(Clone, Copy)]
+struct MediumWorkspaceLayout {
+    header: Rect,
+    conversation: Rect,
+    tabs: Rect,
+    panel: Rect,
+    reasoning: Rect,
+    footer: Rect,
+}
+
+#[derive(Clone, Copy)]
+struct CompactWorkspaceLayout {
+    header: Rect,
+    tabs: Rect,
+    content: Rect,
+    footer: Rect,
+}
+
+#[derive(Clone, Copy)]
+struct ConstrainedWorkspaceLayout {
+    header: Rect,
+    content: Rect,
+    footer: Rect,
+    popup: Rect,
+}
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
@@ -42,6 +83,11 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
 }
 
 fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    if is_constrained(area) {
+        render_landing_constrained(frame, state, area);
+        return;
+    }
+
     if area.width < 100 {
         render_landing_compact(frame, state, area);
         return;
@@ -51,10 +97,10 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(18),
-            Constraint::Length(6),
-            Constraint::Length(8),
+            Constraint::Max(6),
+            Constraint::Max(8),
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Max(2),
         ])
         .split(area);
 
@@ -105,14 +151,14 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             ),
             Span::raw(" · "),
             Span::styled(
-                state.persistent.behavior.model.clone(),
+                truncate_display(&state.persistent.behavior.model, area.width as usize / 2),
                 Style::default().fg(TEXT),
             ),
         ]),
     ]))
     .block(prompt_block)
-    .wrap(Wrap { trim: false });
-    let prompt_area = centered_rect(52, 8, area);
+    .wrap(Wrap { trim: true });
+    let prompt_area = centered_rect_percent(area, 52, 40, 100, 8);
     frame.render_widget(prompt, prompt_area);
 
     let footer_row = Layout::default()
@@ -158,19 +204,19 @@ fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         .direction(Direction::Vertical)
         .constraints(if is_portrait_like {
             [
-                Constraint::Length(4),
-                Constraint::Length(7),
-                Constraint::Length(4),
+                Constraint::Max(4),
+                Constraint::Min(7),
+                Constraint::Max(4),
                 Constraint::Min(1),
-                Constraint::Length(2),
+                Constraint::Max(2),
             ]
         } else {
             [
-                Constraint::Length(4),
-                Constraint::Length(7),
-                Constraint::Length(3),
+                Constraint::Max(4),
+                Constraint::Min(7),
+                Constraint::Max(3),
                 Constraint::Min(1),
-                Constraint::Length(2),
+                Constraint::Max(2),
             ]
         })
         .split(area);
@@ -217,13 +263,13 @@ fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             ),
             Span::raw(" · "),
             Span::styled(
-                state.persistent.behavior.model.clone(),
+                truncate_display(&state.persistent.behavior.model, area.width as usize / 2),
                 Style::default().fg(TEXT),
             ),
         ]),
     ]))
     .block(panel_block("Prompt"))
-    .wrap(Wrap { trim: false });
+    .wrap(Wrap { trim: true });
     frame.render_widget(prompt, outer[1]);
 
     let controls = if is_portrait_like {
@@ -270,8 +316,103 @@ fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     frame.render_widget(status, outer[4]);
 }
 
+fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Max(2),
+            Constraint::Min(4),
+            Constraint::Max(2),
+            Constraint::Max(1),
+        ])
+        .split(area);
+
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            truncate_display(
+                &state.persistent.config.tui.landing_title,
+                area.width as usize,
+            ),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  prompt-first", Style::default().fg(MUTED)),
+    ]))
+    .style(Style::default().bg(BG))
+    .alignment(Alignment::Left)
+    .wrap(Wrap { trim: true });
+    frame.render_widget(title, outer[0]);
+
+    let prompt_text = if state.ui.prompt_input.is_empty() {
+        state.persistent.config.tui.prompt_placeholder.clone()
+    } else {
+        state.ui.prompt_input.clone()
+    };
+    let prompt = Paragraph::new(Text::from(vec![
+        Line::from(Span::styled(
+            prompt_text,
+            Style::default()
+                .fg(if state.ui.prompt_input.is_empty() {
+                    MUTED
+                } else {
+                    TEXT
+                })
+                .add_modifier(if matches!(state.ui.input_mode, InputMode::Prompt) {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "Plan",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate_display(
+                    &state.persistent.behavior.model,
+                    area.width.saturating_sub(7) as usize,
+                ),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+    ]))
+    .block(panel_block("Prompt"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(prompt, outer[1]);
+
+    let help = Paragraph::new(Text::from(vec![Line::from(vec![
+        keycap("q"),
+        label(" quit  "),
+        keycap("i"),
+        label(" prompt  "),
+        keycap("Enter"),
+        label(" run  "),
+        keycap("Tab"),
+        label(" panels"),
+    ])]))
+    .style(Style::default().bg(BG))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(help, outer[2]);
+
+    let status = Paragraph::new(Line::from(Span::styled(
+        status_summary(state),
+        Style::default()
+            .fg(status_color(state))
+            .add_modifier(Modifier::BOLD),
+    )))
+    .style(Style::default().bg(BG))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(status, outer[3]);
+}
+
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
-    match state.ui.layout {
+    if is_constrained(area) {
+        render_workspace_constrained(frame, state, area);
+        return;
+    }
+
+    match responsive_workspace_mode(state.ui.layout, area) {
         LayoutMode::Wide => render_workspace_wide(frame, state, area),
         LayoutMode::Medium => render_workspace_medium(frame, state, area),
         LayoutMode::Compact => render_workspace_compact(frame, state, area),
@@ -279,12 +420,71 @@ fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
 }
 
 fn render_workspace_wide(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let layout = build_desktop_layout(area);
+    frame.render_widget(header_widget(state), layout.header);
+    render_conversation_widget(frame, state, layout.conversation);
+    frame.render_widget(panel_widget(state), layout.panel);
+    frame.render_widget(reasoning_widget(state), layout.reasoning);
+    frame.render_widget(activity_widget(state), layout.activity);
+    frame.render_widget(footer_widget(state), layout.footer);
+}
+
+fn render_workspace_medium(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let layout = build_medium_layout(area);
+    frame.render_widget(header_widget(state), layout.header);
+    render_conversation_widget(frame, state, layout.conversation);
+    frame.render_widget(panel_tabs(state), layout.tabs);
+    frame.render_widget(panel_widget(state), layout.panel);
+    frame.render_widget(reasoning_widget(state), layout.reasoning);
+    frame.render_widget(footer_widget(state), layout.footer);
+}
+
+fn render_workspace_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let layout = build_compact_layout(area);
+    frame.render_widget(header_widget(state), layout.header);
+    frame.render_widget(panel_tabs(state), layout.tabs);
+    if state.ui.active_panel == ActivePanel::Session {
+        render_session_compact_widget(frame, state, layout.content);
+    } else {
+        frame.render_widget(panel_widget(state), layout.content);
+    }
+    frame.render_widget(footer_widget(state), layout.footer);
+}
+
+fn render_workspace_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let layout = build_constrained_layout(area);
+    frame.render_widget(constrained_header_widget(state, area.width), layout.header);
+    render_conversation_widget(frame, state, layout.content);
+
+    if state.ui.active_panel != ActivePanel::Session {
+        frame.render_widget(Clear, layout.popup);
+        frame.render_widget(panel_widget(state), layout.popup);
+    }
+
+    frame.render_widget(constrained_footer_widget(state, area.width), layout.footer);
+}
+
+fn is_constrained(area: Rect) -> bool {
+    area.width < CONSTRAINED_WIDTH || area.height < CONSTRAINED_HEIGHT
+}
+
+fn responsive_workspace_mode(mode: LayoutMode, area: Rect) -> LayoutMode {
+    if area.height < DESKTOP_HEIGHT {
+        return LayoutMode::Compact;
+    }
+    if mode == LayoutMode::Wide && area.width < DESKTOP_WIDTH {
+        return LayoutMode::Medium;
+    }
+    mode
+}
+
+fn build_desktop_layout(area: Rect) -> DesktopWorkspaceLayout {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(12),
-            Constraint::Length(5),
+            Constraint::Length(4),
+            Constraint::Min(8),
+            Constraint::Length(4),
         ])
         .split(area);
     let body = Layout::default()
@@ -300,56 +500,70 @@ fn render_workspace_wide(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         ])
         .split(body[1]);
 
-    frame.render_widget(header_widget(state), outer[0]);
-    render_conversation_widget(frame, state, body[0]);
-    frame.render_widget(panel_widget(state), right[0]);
-    frame.render_widget(reasoning_widget(state), right[1]);
-    frame.render_widget(activity_widget(state), right[2]);
-    frame.render_widget(footer_widget(state), outer[2]);
+    DesktopWorkspaceLayout {
+        header: outer[0],
+        conversation: body[0],
+        panel: right[0],
+        reasoning: right[1],
+        activity: right[2],
+        footer: outer[2],
+    }
 }
 
-fn render_workspace_medium(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+fn build_medium_layout(area: Rect) -> MediumWorkspaceLayout {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(4),
+            Constraint::Ratio(1, 2),
             Constraint::Length(3),
-            Constraint::Percentage(48),
-            Constraint::Length(3),
-            Constraint::Percentage(27),
-            Constraint::Percentage(12),
-            Constraint::Length(5),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 6),
+            Constraint::Length(4),
         ])
         .split(area);
 
-    frame.render_widget(header_widget(state), outer[0]);
-    render_conversation_widget(frame, state, outer[1]);
-    frame.render_widget(panel_tabs(state), outer[2]);
-    frame.render_widget(panel_widget(state), outer[3]);
-    frame.render_widget(reasoning_widget(state), outer[4]);
-    frame.render_widget(footer_widget(state), outer[5]);
+    MediumWorkspaceLayout {
+        header: outer[0],
+        conversation: outer[1],
+        tabs: outer[2],
+        panel: outer[3],
+        reasoning: outer[4],
+        footer: outer[5],
+    }
 }
 
-fn render_workspace_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+fn build_compact_layout(area: Rect) -> CompactWorkspaceLayout {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(4),
             Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(12),
-            Constraint::Length(5),
+            Constraint::Min(6),
+            Constraint::Length(4),
         ])
         .split(area);
 
-    frame.render_widget(header_widget(state), outer[0]);
-    frame.render_widget(panel_tabs(state), outer[1]);
-    frame.render_widget(
-        match state.ui.active_panel {
-            ActivePanel::Session => session_compact_widget(state),
-            _ => panel_widget(state),
-        },
-        outer[2],
-    );
-    frame.render_widget(footer_widget(state), outer[3]);
+    CompactWorkspaceLayout {
+        header: outer[0],
+        tabs: outer[1],
+        content: outer[2],
+        footer: outer[3],
+    }
+}
+
+fn build_constrained_layout(area: Rect) -> ConstrainedWorkspaceLayout {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Max(1), Constraint::Min(3), Constraint::Max(2)])
+        .split(area);
+
+    ConstrainedWorkspaceLayout {
+        header: outer[0],
+        content: outer[1],
+        footer: outer[2],
+        popup: centered_rect_percent(outer[1], 92, 88, 80, 16),
+    }
 }
 
 fn header_widget(state: &AppState) -> Paragraph<'_> {
@@ -364,7 +578,7 @@ fn header_widget(state: &AppState) -> Paragraph<'_> {
             ),
             Span::raw(" "),
             Span::styled(
-                state.persistent.behavior.model.clone(),
+                truncate_display(&state.persistent.behavior.model, 42),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
@@ -383,6 +597,28 @@ fn header_widget(state: &AppState) -> Paragraph<'_> {
     )
 }
 
+fn constrained_header_widget(state: &AppState, width: u16) -> Paragraph<'_> {
+    let model_width = width.saturating_sub(18) as usize;
+    Paragraph::new(Line::from(vec![
+        Span::styled(
+            " hermes ",
+            Style::default()
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            truncate_display(&state.persistent.behavior.model, model_width),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(state.ui.active_panel.title(), Style::default().fg(ACCENT)),
+    ]))
+    .style(Style::default().bg(PANEL_ALT))
+    .wrap(Wrap { trim: true })
+}
+
 fn render_conversation_widget(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let lines = conversation_lines(state);
     let block = panel_block("Conversation");
@@ -397,7 +633,7 @@ fn render_conversation_widget(frame: &mut Frame<'_>, state: &AppState, area: Rec
     let widget = Paragraph::new(Text::from(lines))
         .block(block)
         .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }
 
@@ -457,7 +693,7 @@ fn reasoning_widget(state: &AppState) -> Paragraph<'_> {
 
     Paragraph::new(body.to_string())
         .block(panel_block("Reasoning"))
-        .wrap(Wrap { trim: false })
+        .wrap(Wrap { trim: true })
 }
 
 fn activity_widget(state: &AppState) -> Paragraph<'_> {
@@ -538,7 +774,7 @@ fn footer_widget(state: &AppState) -> Paragraph<'_> {
             ),
             Span::raw(" "),
             Span::styled(
-                prompt,
+                truncate_display(&prompt, 180),
                 Style::default().fg(if state.ui.prompt_input.is_empty() {
                     MUTED
                 } else {
@@ -549,6 +785,44 @@ fn footer_widget(state: &AppState) -> Paragraph<'_> {
         Line::from(footer_line),
     ]))
     .block(panel_block("Input"))
+    .wrap(Wrap { trim: true })
+}
+
+fn constrained_footer_widget(state: &AppState, width: u16) -> Paragraph<'_> {
+    let prompt = if state.ui.prompt_input.is_empty() {
+        state.persistent.config.tui.prompt_placeholder.clone()
+    } else {
+        state.ui.prompt_input.clone()
+    };
+    let status = status_summary(state);
+    let prompt_width = width.saturating_sub(status.len() as u16 + 12) as usize;
+
+    Paragraph::new(Text::from(vec![Line::from(vec![
+        Span::styled(
+            if matches!(state.ui.input_mode, InputMode::Prompt) {
+                "PROMPT "
+            } else {
+                "CMD "
+            },
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            truncate_display(&prompt, prompt_width),
+            Style::default().fg(if state.ui.prompt_input.is_empty() {
+                MUTED
+            } else {
+                TEXT
+            }),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            status,
+            Style::default()
+                .fg(status_color(state))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])]))
+    .style(Style::default().bg(PANEL_ALT))
     .wrap(Wrap { trim: true })
 }
 
@@ -624,7 +898,7 @@ fn session_summary_widget(state: &AppState) -> Paragraph<'_> {
         Line::from(vec![
             Span::styled("query ", Style::default().fg(MUTED)),
             Span::styled(
-                state.session.active_query.clone(),
+                truncate_display(&state.session.active_query, 120),
                 Style::default().fg(TEXT),
             ),
         ]),
@@ -657,9 +931,10 @@ fn session_summary_widget(state: &AppState) -> Paragraph<'_> {
         ]),
     ]))
     .block(panel_block("Session"))
+    .wrap(Wrap { trim: true })
 }
 
-fn session_compact_widget(state: &AppState) -> Paragraph<'_> {
+fn render_session_compact_widget(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         "Conversation",
@@ -683,17 +958,20 @@ fn session_compact_widget(state: &AppState) -> Paragraph<'_> {
         300,
     )));
 
-    let max_scroll = max_wrapped_scroll(&lines, 78, 12);
+    let block = panel_block("Session");
+    let inner = block.inner(area);
+    let max_scroll = max_wrapped_scroll(&lines, inner.width, inner.height);
     let scroll = if state.follow_conversation_tail() {
         max_scroll
     } else {
         state.conversation_scroll().min(max_scroll)
     };
 
-    Paragraph::new(Text::from(lines))
-        .block(panel_block("Session"))
+    let widget = Paragraph::new(Text::from(lines))
+        .block(block)
         .scroll((scroll, 0))
-        .wrap(Wrap { trim: false })
+        .wrap(Wrap { trim: true });
+    frame.render_widget(widget, area);
 }
 
 fn max_wrapped_scroll(lines: &[Line<'_>], width: u16, height: u16) -> u16 {
@@ -709,7 +987,9 @@ fn max_wrapped_scroll(lines: &[Line<'_>], width: u16, height: u16) -> u16 {
             width.max(1).div_ceil(available_width)
         })
         .sum::<usize>();
-    total_rows.saturating_sub(usize::from(height)) as u16
+    total_rows
+        .saturating_sub(usize::from(height))
+        .min(usize::from(u16::MAX)) as u16
 }
 
 fn mcp_widget(servers: &[McpServerItem], selected: usize) -> Paragraph<'_> {
@@ -740,7 +1020,10 @@ fn mcp_widget(servers: &[McpServerItem], selected: usize) -> Paragraph<'_> {
             if index == selected {
                 lines.push(Line::from(vec![
                     Span::styled("    endpoint ", Style::default().fg(MUTED)),
-                    Span::styled(server.endpoint.clone(), Style::default().fg(TEXT)),
+                    Span::styled(
+                        truncate_display(&server.endpoint, 96),
+                        Style::default().fg(TEXT),
+                    ),
                     Span::raw("  "),
                     Span::styled(
                         if server.enabled {
@@ -757,7 +1040,7 @@ fn mcp_widget(servers: &[McpServerItem], selected: usize) -> Paragraph<'_> {
 
     Paragraph::new(Text::from(lines))
         .block(panel_block("MCP Servers"))
-        .wrap(Wrap { trim: false })
+        .wrap(Wrap { trim: true })
 }
 
 fn skills_widget(skills: &[SkillItem], selected: usize, skills_root: String) -> Paragraph<'_> {
@@ -781,7 +1064,10 @@ fn skills_widget(skills: &[SkillItem], selected: usize, skills_root: String) -> 
         ]),
         Line::from(vec![
             Span::styled("root ", Style::default().fg(MUTED)),
-            Span::styled(skills_root, Style::default().fg(TEXT)),
+            Span::styled(
+                truncate_display(&skills_root, 96),
+                Style::default().fg(TEXT),
+            ),
         ]),
         Line::from(""),
     ];
@@ -797,7 +1083,10 @@ fn skills_widget(skills: &[SkillItem], selected: usize, skills_root: String) -> 
             if index == selected {
                 lines.push(Line::from(vec![
                     Span::styled("    ", Style::default().fg(MUTED)),
-                    Span::styled(skill.description.clone(), Style::default().fg(MUTED)),
+                    Span::styled(
+                        truncate_display(&skill.description, 140),
+                        Style::default().fg(MUTED),
+                    ),
                 ]));
             }
         }
@@ -805,7 +1094,7 @@ fn skills_widget(skills: &[SkillItem], selected: usize, skills_root: String) -> 
 
     Paragraph::new(Text::from(lines))
         .block(panel_block("Skills"))
-        .wrap(Wrap { trim: false })
+        .wrap(Wrap { trim: true })
 }
 
 fn behavior_widget(state: &AppState) -> Paragraph<'_> {
@@ -842,13 +1131,13 @@ fn behavior_widget(state: &AppState) -> Paragraph<'_> {
                         Modifier::empty()
                     }),
             ),
-            Span::styled(value.clone(), Style::default().fg(TEXT)),
+            Span::styled(truncate_display(value, 120), Style::default().fg(TEXT)),
         ]));
     }
 
     Paragraph::new(Text::from(lines))
         .block(panel_block("Behavior"))
-        .wrap(Wrap { trim: false })
+        .wrap(Wrap { trim: true })
 }
 
 fn render_modal(
@@ -859,7 +1148,7 @@ fn render_modal(
     fields: &[crate::tui::forms::FormField],
     selected: usize,
 ) {
-    let modal_area = centered_rect(68, 14, area);
+    let modal_area = centered_rect_percent(area, 88, 82, 92, 16);
     frame.render_widget(Clear, modal_area);
 
     let mut lines = vec![
@@ -890,14 +1179,14 @@ fn render_modal(
         .block(
             Block::default()
                 .title(Span::styled(
-                    title,
+                    truncate_display(title, 48),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ACCENT))
                 .style(Style::default().bg(PANEL)),
         )
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: true });
 
     frame.render_widget(modal, modal_area);
 }
@@ -1287,34 +1576,64 @@ fn render_table_row(line: &str, header: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(height),
-            Constraint::Min(1),
-        ])
-        .split(area);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width_percent) / 2),
-            Constraint::Percentage(width_percent),
-            Constraint::Percentage((100 - width_percent) / 2),
-        ])
-        .split(vertical[1]);
-    horizontal[1]
+fn centered_rect_percent(
+    area: Rect,
+    width_percent: u16,
+    height_percent: u16,
+    max_width: u16,
+    max_height: u16,
+) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+
+    let width = area
+        .width
+        .saturating_mul(width_percent.min(100))
+        .saturating_div(100)
+        .min(max_width)
+        .max(1)
+        .min(area.width.max(1));
+    let height = area
+        .height
+        .saturating_mul(height_percent.min(100))
+        .saturating_div(100)
+        .min(max_height)
+        .max(1)
+        .min(area.height.max(1));
+
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 fn truncate_text(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        let mut value = text.chars().take(max.saturating_sub(3)).collect::<String>();
-        value.push_str("...");
-        value
+    truncate_display(text, max)
+}
+
+fn truncate_display(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
     }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let mut width = 0;
+    let mut value = String::new();
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width - 3 {
+            break;
+        }
+        width += ch_width;
+        value.push(ch);
+    }
+    value.push_str("...");
+    value
 }
 
 #[cfg(test)]
@@ -1430,11 +1749,25 @@ mod tests {
     }
 
     #[test]
-    fn medium_workspace_renders_tabs() {
+    fn desktop_workspace_uses_split_layout_at_120_by_30() {
         let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
         state.ui.view = ViewMode::Workspace;
         state.set_layout_for_width(120);
-        let text = buffer_text(&state, 120, 36);
+
+        let text = buffer_text(&state, 120, 30);
+
+        assert!(text.contains("Conversation"));
+        assert!(text.contains("Reasoning"));
+        assert!(text.contains("Activity"));
+        assert!(!text.contains("Panels"));
+    }
+
+    #[test]
+    fn medium_workspace_renders_tabs() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(110);
+        let text = buffer_text(&state, 110, 36);
         assert!(text.contains("Panels"));
         assert!(text.contains("Session"));
     }
@@ -1449,6 +1782,47 @@ mod tests {
         assert!(text.contains("Input"));
         assert!(text.contains("idle"));
         assert!(!text.contains("iter 0/"));
+    }
+
+    #[test]
+    fn constrained_workspace_prioritizes_conversation_at_40_by_15() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(40);
+
+        let text = buffer_text(&state, 40, 15);
+
+        assert!(text.contains("Conversation"));
+        assert!(text.contains("PROMPT"));
+        assert!(text.contains("idle"));
+        assert!(!text.contains("Panels"));
+        assert!(!text.contains("Reasoning"));
+        assert!(!text.contains("Activity"));
+    }
+
+    #[test]
+    fn constrained_workspace_shows_secondary_panel_as_popup() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.ui.active_panel = ActivePanel::Mcp;
+        state.set_layout_for_width(40);
+
+        let text = buffer_text(&state, 40, 15);
+
+        assert!(text.contains("MCP"));
+        assert!(text.contains("No MCP servers configured."));
+        assert!(!text.contains("Panels"));
+    }
+
+    #[test]
+    fn renderer_handles_extreme_small_viewports() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+
+        for (width, height) in [(1, 1), (20, 8), (40, 15), (64, 19)] {
+            state.set_layout_for_width(width);
+            let _ = buffer_text(&state, width, height);
+        }
     }
 
     #[test]

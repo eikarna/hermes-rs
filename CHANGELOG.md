@@ -24,11 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, `AGENTS.md`, and `CLAUDE.md` now document the autonomous workflow, the role of `TODO.md` as the workspace task source of truth, and the disposable operator workflow for validating autonomous mode safely
 - Repeated autonomous failure pauses now persist across process restarts until `TODO.md` or git state changes, using `autonomous-status.toml` as the durable state store
 - CLI, TUI, and autonomous sessions now reload persisted long-term memory from the current workspace before constructing agents
+- The TUI workspace now uses the desktop split at 120 columns and gracefully collapses secondary panels into popups below 65 columns or 20 rows
 
 ### Fixed
 
 - Autonomous command execution now runs in blocking isolation with strict exit-status checks so failed validation cannot fall through to git push
 - Autonomous status tracking no longer dirties workspace fingerprints or staged commits with the runtime status file itself
+- TUI layout rows now preserve the primary conversation area in cramped terminals instead of letting fixed chrome starve the workspace body
 
 ## [0.1.3] - 2026-04-20
 
