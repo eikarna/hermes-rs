@@ -13,16 +13,17 @@ pub mod file_tools;
 pub mod http_tool;
 pub mod memory_tools;
 pub mod patch_tool;
+pub mod sub_agent_tool;
 pub mod terminal_tool;
 pub mod todo_tool;
 pub mod web_tools;
 
 // Re-export commonly used types
 pub use builtin::{
-    builtin_tool_names, register_builtin_tools, ClarifyTool, CodeExecutionTool, DateTimeTool,
-    FileListTool, FileReadTool, FileSearchTool, FileWriteTool, HttpRequestTool, MemoryRecallTool,
-    MemorySearchTool, MemoryStoreTool, PatchTool, TerminalTool, TimestampTool, TodoTool,
-    WebFetchTool, WebSearchTool,
+    builtin_tool_names, register_builtin_tools, register_builtin_tools_with_sub_agent, ClarifyTool,
+    CodeExecutionTool, DateTimeTool, FileListTool, FileReadTool, FileSearchTool, FileWriteTool,
+    HttpRequestTool, MemoryRecallTool, MemorySearchTool, MemoryStoreTool, PatchTool, SubAgentTool,
+    TerminalTool, TimestampTool, TodoTool, WebFetchTool, WebSearchTool,
 };
 
 use std::collections::HashMap;

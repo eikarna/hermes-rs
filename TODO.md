@@ -15,5 +15,6 @@
 - Persistent autonomous failure pause state across process restarts until `TODO.md` or git state changes
 - State distillation with long-term memory injection and async session fact extraction into `MEMORY.md`
 - Workspace context-file auto-loading with prompt-injection scanning for agent guidance files
+- Sub-agent delegation as an opt-in built-in tool through `delegate_to_sub_agent`
 
 ## Pending

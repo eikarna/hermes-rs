@@ -322,6 +322,8 @@ impl HermesTool for WeatherTool {
 }
 ```
 
+Hermes can also register `delegate_to_sub_agent`, an opt-in built-in tool that lets the parent ReAct agent delegate focused deep-analysis tasks to an isolated child `HermesAgent` with a fresh conversation.
+
 ## Error Handling
 
 The library provides structured error types with self-healing capabilities:
