@@ -152,7 +152,7 @@ impl Default for TuiSettings {
             prompt_placeholder: "Ask anything... \"Fix a TODO in the codebase\"".to_string(),
             refresh_rate_ms: 80,
             compact_width: 96,
-            medium_width: 140,
+            medium_width: 120,
         }
     }
 }
