@@ -10,7 +10,7 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 - **Self-Healing**: Automatically re-prompt LLM with error context on failures
 - **Dynamic Schema Generation**: Automatically generate JSON Schema from Rust structs
 - **Shared TOML Configuration**: One runtime config model across `hermes-cli` and `hermes-core`
-- **Ratatui TUI**: Prompt-first landing view, responsive workspace panes, constrained-terminal fallback, reasoning display, MCP/Skills/Behavior management
+- **Ratatui TUI**: Prompt-first landing view, responsive workspace panes, constrained-terminal fallback, blockquote-style reasoning, block-style tool activity, MCP/Skills/Behavior management
 - **Autonomous Coding Mode**: 24/7 workspace-driven loop that reads `TODO.md`, validates with local tests, and only pushes after success
 - **Structured Logging**: Comprehensive observability via the `tracing` crate
 
@@ -172,6 +172,7 @@ See [hermes.example.toml](hermes.example.toml) for the full schema, including MC
 - `PageUp`, `PageDown`, `Home`, and `End` scroll the conversation even while prompt mode is active
 - `Ctrl+L` starts a fresh session when you want to discard the current conversation history
 - The workspace uses a split desktop layout at 120 columns and above, stacks panels below that, and collapses secondary panels into popups below 65 columns or 20 rows
+- The Reasoning pane renders model thinking with quote rails, while tool calls in Activity render as compact blocks for easier scanning
 - After a run completes or fails, the workspace returns to prompt mode so you can send a follow-up in the same session
 - `stream = false` now uses the non-streaming response path instead of the streaming parser
 

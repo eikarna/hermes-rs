@@ -690,42 +690,43 @@ fn conversation_lines(state: &AppState) -> Vec<Line<'static>> {
 }
 
 fn reasoning_widget(state: &AppState) -> Paragraph<'_> {
-    let body = if state.session.reasoning.trim().is_empty() {
+    let lines = if state.session.reasoning.trim().is_empty() {
         if state.persistent.behavior.show_reasoning {
-            "Reasoning pane waiting for structured thinking."
+            vec![Line::from(Span::styled(
+                "Reasoning pane waiting for structured thinking.",
+                Style::default().fg(MUTED),
+            ))]
         } else {
-            "Reasoning display disabled."
+            vec![Line::from(Span::styled(
+                "Reasoning display disabled.",
+                Style::default().fg(MUTED),
+            ))]
         }
     } else {
-        &state.session.reasoning
+        render_reasoning_body(&state.session.reasoning)
     };
 
-    Paragraph::new(body.to_string())
+    Paragraph::new(Text::from(lines))
         .block(panel_block("Reasoning"))
         .wrap(Wrap { trim: true })
 }
 
 fn activity_widget(state: &AppState) -> Paragraph<'_> {
-    let mut lines = state
+    let mut lines = Vec::new();
+    for (index, entry) in state
         .session
         .activity
         .iter()
         .rev()
         .take(6)
         .rev()
-        .map(|entry| {
-            let color = tone_color(entry.tone);
-            Line::from(vec![
-                Span::styled("• ", Style::default().fg(color)),
-                Span::styled(
-                    entry.label.clone(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(": ", Style::default().fg(MUTED)),
-                Span::styled(truncate_text(&entry.body, 72), Style::default().fg(TEXT)),
-            ])
-        })
-        .collect::<Vec<_>>();
+        .enumerate()
+    {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.extend(render_activity_entry(entry));
+    }
 
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -737,6 +738,54 @@ fn activity_widget(state: &AppState) -> Paragraph<'_> {
     Paragraph::new(Text::from(lines))
         .block(panel_block("Activity"))
         .wrap(Wrap { trim: true })
+}
+
+fn render_activity_entry(entry: &crate::tui::state::ActivityItem) -> Vec<Line<'static>> {
+    let color = tone_color(entry.tone);
+
+    if is_tool_activity(&entry.label) {
+        let title = truncate_text(&entry.label, 36);
+        let body = truncate_text(&entry.body, 96);
+        return vec![
+            Line::from(vec![
+                Span::styled("╭─ ", Style::default().fg(color)),
+                Span::styled(
+                    title,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("│ ", Style::default().fg(color)),
+                Span::styled(body, Style::default().fg(TEXT)),
+            ]),
+            Line::from(Span::styled("╰─", Style::default().fg(color))),
+        ];
+    }
+
+    if entry.label == "Thinking" {
+        return vec![Line::from(vec![
+            Span::styled("▎ ", Style::default().fg(MUTED)),
+            Span::styled(
+                "Thinking: ",
+                Style::default().fg(HELP).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(truncate_text(&entry.body, 88), Style::default().fg(HELP)),
+        ])];
+    }
+
+    vec![Line::from(vec![
+        Span::styled("• ", Style::default().fg(color)),
+        Span::styled(
+            entry.label.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": ", Style::default().fg(MUTED)),
+        Span::styled(truncate_text(&entry.body, 72), Style::default().fg(TEXT)),
+    ])]
+}
+
+fn is_tool_activity(label: &str) -> bool {
+    label.starts_with("Tool ") || label == "Tool complete"
 }
 
 fn footer_widget(state: &AppState) -> Paragraph<'_> {
@@ -1352,6 +1401,21 @@ fn render_message_body(text: &str) -> Vec<Line<'static>> {
     rendered
 }
 
+fn render_reasoning_body(text: &str) -> Vec<Line<'static>> {
+    text.split('\n')
+        .map(|raw_line| {
+            let line = raw_line.trim_end_matches('\r');
+            if line.trim().is_empty() {
+                return Line::from(Span::styled("▎", Style::default().fg(MUTED)));
+            }
+
+            let mut spans = vec![Span::styled("▎ ", Style::default().fg(MUTED))];
+            spans.extend(parse_inline_markdown(line, InlineStyle::Quote));
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn render_markdown_line(line: &str) -> Line<'static> {
     if line.trim().is_empty() {
         return Line::from("");
@@ -1902,5 +1966,35 @@ mod tests {
         assert!(text.contains("echo │ test"));
         assert!(text.contains("☑ done"));
         assert!(!text.contains("| --- | --- |"));
+    }
+
+    #[test]
+    fn reasoning_renders_as_blockquote() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.reasoning = "I should inspect files.\nThen patch the renderer.".to_string();
+
+        let text = buffer_text(&state, 160, 40);
+
+        assert!(text.contains("▎ I should inspect files."));
+        assert!(text.contains("▎ Then patch the renderer."));
+    }
+
+    #[test]
+    fn activity_renders_tool_calls_as_blocks() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.activity.clear();
+        state.push_activity("Thinking", "Choosing a tool.", Tone::Info);
+        state.push_activity("Tool file_read", r#"{"path":"README.md"}"#, Tone::Warning);
+
+        let text = buffer_text(&state, 160, 40);
+
+        assert!(text.contains("▎ Thinking: Choosing a tool."));
+        assert!(text.contains("╭─ Tool file_read"));
+        assert!(text.contains("│ {\"path\":\"README.md\"}"));
+        assert!(text.contains("╰─"));
     }
 }

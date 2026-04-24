@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repeated autonomous failure pauses now persist across process restarts until `TODO.md` or git state changes, using `autonomous-status.toml` as the durable state store
 - CLI, TUI, and autonomous sessions now reload persisted long-term memory from the current workspace before constructing agents
 - The TUI workspace now uses the desktop split at 120 columns and gracefully collapses secondary panels into popups below 65 columns or 20 rows
+- TUI agent reasoning now renders with quote rails, and tool activity now renders as compact blocks for clearer tool-call scanning
 
 ### Fixed
 
