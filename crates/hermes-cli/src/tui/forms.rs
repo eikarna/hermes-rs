@@ -72,7 +72,9 @@ impl FormState {
 pub enum Modal {
     AddMcp(FormState),
     CreateSkill(FormState),
+
     EditBehavior(FormState),
+    Settings(FormState),
 }
 
 impl Modal {
@@ -114,15 +116,32 @@ impl Modal {
         ))
     }
 
+    pub fn settings(theme: &str, simple_mode: bool) -> Self {
+        Self::Settings(FormState::new(
+            "Settings",
+            "Configure TUI. Theme options: opencode, high-contrast. Simple Mode merges panels on small screens (true/false).",
+            vec![
+                FormField::new("theme", theme),
+                FormField::new("simple_mode", if simple_mode { "true" } else { "false" }),
+            ],
+        ))
+    }
+
     pub fn form(&self) -> &FormState {
         match self {
-            Self::AddMcp(form) | Self::CreateSkill(form) | Self::EditBehavior(form) => form,
+            Self::AddMcp(form)
+            | Self::CreateSkill(form)
+            | Self::EditBehavior(form)
+            | Self::Settings(form) => form,
         }
     }
 
     pub fn form_mut(&mut self) -> &mut FormState {
         match self {
-            Self::AddMcp(form) | Self::CreateSkill(form) | Self::EditBehavior(form) => form,
+            Self::AddMcp(form)
+            | Self::CreateSkill(form)
+            | Self::EditBehavior(form)
+            | Self::Settings(form) => form,
         }
     }
 

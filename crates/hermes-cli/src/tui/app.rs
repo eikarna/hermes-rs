@@ -77,7 +77,7 @@ impl TuiApp {
             skill_manager: SkillManager::new(config.skills.root_dir.clone()),
         };
         if let Err(error) = app.refresh_skills() {
-            app.record_operational_event(
+            app.record_app_event(
                 "Skill load failed",
                 format!("Skill load failed: {}", error),
                 Tone::Error,
@@ -85,7 +85,7 @@ impl TuiApp {
             );
         }
         if let Err(error) = app.refresh_mcp().await {
-            app.record_operational_event(
+            app.record_app_event(
                 "MCP refresh failed",
                 format!("MCP refresh failed: {}", error),
                 Tone::Error,
@@ -241,6 +241,11 @@ impl TuiApp {
             KeyCode::Char('b') => self
                 .state
                 .reduce(Action::SetActivePanel(ActivePanel::Behavior)),
+            KeyCode::Char('o') => self.state.reduce(Action::OpenModal(Modal::settings(
+                &self.state.persistent.config.tui.theme,
+                self.state.persistent.config.tui.rich_output, // we'll use this as a boolean toggle
+            ))),
+
             KeyCode::Up => self.state.reduce(Action::SelectPrevious),
             KeyCode::Down => self.state.reduce(Action::SelectNext),
             KeyCode::Char('a') if self.state.ui.active_panel == ActivePanel::Mcp => {
@@ -251,7 +256,7 @@ impl TuiApp {
             }
             KeyCode::Char('r') if self.state.ui.active_panel == ActivePanel::Skills => {
                 match self.refresh_skills() {
-                    Ok(()) => self.record_operational_event(
+                    Ok(()) => self.record_app_event(
                         "Skills reloaded",
                         "Skills reloaded from disk.",
                         Tone::Success,
@@ -334,13 +339,27 @@ impl TuiApp {
                     let content = default_skill_content(name, description);
                     self.skill_manager.create(name, &content)?;
                     self.refresh_skills()?;
-                    self.record_operational_event(
+                    self.record_app_event(
                         "Skill created",
                         format!("Created skill '{}'.", name),
                         Tone::Success,
                         "skill created",
                     );
                 }
+            }
+
+            Modal::Settings(form) => {
+                let theme = form.fields[0].value.trim();
+                let simple_mode = form.fields[1].value.trim().to_lowercase() == "true";
+                self.state.persistent.config.tui.theme = theme.to_string();
+                self.state.persistent.config.tui.rich_output = simple_mode;
+
+                self.state.record_app_event(
+                    "Settings applied",
+                    "Updated TUI settings.",
+                    Tone::Success,
+                    Some("settings applied".to_string()),
+                );
             }
             Modal::EditBehavior(form) => {
                 let field = form.fields[0].value.trim().to_string();
@@ -504,7 +523,7 @@ impl TuiApp {
         }
         self.state.persistent.needs_rebuild = true;
         self.refresh_mcp().await?;
-        self.record_operational_event(
+        self.record_app_event(
             "MCP server saved",
             "MCP server saved. Press ctrl+l for a fresh session with updated tools.",
             Tone::Success,
@@ -530,7 +549,7 @@ impl TuiApp {
                 .retain(|item| item.name != server.name);
             self.state.persistent.needs_rebuild = true;
             self.refresh_mcp().await?;
-            self.record_operational_event(
+            self.record_app_event(
                 "MCP server removed",
                 format!("Removed MCP server '{}'.", server.name),
                 Tone::Warning,
@@ -550,7 +569,7 @@ impl TuiApp {
         {
             self.skill_manager.delete(&skill.name)?;
             self.refresh_skills()?;
-            self.record_operational_event(
+            self.record_app_event(
                 "Skill deleted",
                 format!("Deleted skill '{}'.", skill.name),
                 Tone::Warning,
@@ -605,7 +624,7 @@ impl TuiApp {
         self.state.persistent.config.agent = behavior.clone();
         self.state.session.max_iterations = behavior.max_iterations;
         self.state.persistent.needs_rebuild = true;
-        self.record_operational_event(
+        self.record_app_event(
             "Behavior updated",
             format!(
                 "Updated {}. Press ctrl+l to start a fresh session with new behavior.",
@@ -617,13 +636,7 @@ impl TuiApp {
         Ok(())
     }
 
-    fn record_operational_event(
-        &mut self,
-        label: &str,
-        body: impl Into<String>,
-        tone: Tone,
-        notice: &str,
-    ) {
+    fn record_app_event(&mut self, label: &str, body: impl Into<String>, tone: Tone, notice: &str) {
         self.state
             .record_app_event(label, body, tone, Some(notice.to_string()));
     }
