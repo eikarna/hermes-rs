@@ -63,20 +63,14 @@ impl ToolSchema {
 
         // For now, we do basic structural validation
         // A full JSON Schema validator would be more robust
-        let params_obj = self.parameters.get("properties");
-        if let Some(props) = params_obj.and_then(|p| p.as_object()) {
-            for (key, _schema) in props {
-                // Check required fields
-                if let Some(required) = self.parameters.get("required") {
-                    if let Some(reqs) = required.as_array() {
-                        let required_keys: Vec<&str> =
-                            reqs.iter().filter_map(|v| v.as_str()).collect();
-                        if required_keys.contains(&key.as_str()) && args.get(key).is_none() {
-                            return Err(Error::InvalidToolArgs {
-                                name: self.name.clone(),
-                                details: format!("Missing required field: {}", key),
-                            });
-                        }
+        if let Some(required) = self.parameters.get("required").and_then(|r| r.as_array()) {
+            for req_field in required {
+                if let Some(key) = req_field.as_str() {
+                    if args.get(key).is_none() {
+                        return Err(Error::InvalidToolArgs {
+                            name: self.name.clone(),
+                            details: format!("Missing required field: {}", key),
+                        });
                     }
                 }
             }

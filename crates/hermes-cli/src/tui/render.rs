@@ -198,30 +198,8 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     frame.render_widget(status, footer_row[0]);
 }
 
-fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
-    let is_portrait_like = area.width < 56;
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if is_portrait_like {
-            [
-                Constraint::Max(4),
-                Constraint::Min(7),
-                Constraint::Max(4),
-                Constraint::Min(1),
-                Constraint::Max(2),
-            ]
-        } else {
-            [
-                Constraint::Max(4),
-                Constraint::Min(7),
-                Constraint::Max(3),
-                Constraint::Min(1),
-                Constraint::Max(2),
-            ]
-        })
-        .split(area);
-
-    let title = Paragraph::new(Text::from(vec![
+fn build_compact_title<'a>(state: &'a AppState) -> Paragraph<'a> {
+    Paragraph::new(Text::from(vec![
         Line::from(Span::styled(
             state.persistent.config.tui.landing_title.clone(),
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -232,15 +210,16 @@ fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         )),
     ]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Center);
-    frame.render_widget(title, outer[0]);
+    .alignment(Alignment::Center)
+}
 
+fn build_compact_prompt<'a>(state: &'a AppState, area_width: u16) -> Paragraph<'a> {
     let prompt_text = if state.ui.prompt_input.is_empty() {
         state.persistent.config.tui.prompt_placeholder.clone()
     } else {
         state.ui.prompt_input.clone()
     };
-    let prompt = Paragraph::new(Text::from(vec![
+    Paragraph::new(Text::from(vec![
         Line::from(Span::styled(
             prompt_text,
             Style::default()
@@ -263,15 +242,16 @@ fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             ),
             Span::raw(" · "),
             Span::styled(
-                truncate_display(&state.persistent.behavior.model, area.width as usize / 2),
+                truncate_display(&state.persistent.behavior.model, area_width as usize / 2),
                 Style::default().fg(TEXT),
             ),
         ]),
     ]))
     .block(panel_block("Prompt"))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(prompt, outer[1]);
+    .wrap(Wrap { trim: true })
+}
 
+fn build_compact_controls<'a>(is_portrait_like: bool) -> Paragraph<'a> {
     let controls = if is_portrait_like {
         vec![
             Line::from(vec![
@@ -299,21 +279,50 @@ fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             label(" panels"),
         ])]
     };
-    let help = Paragraph::new(Text::from(controls))
+    Paragraph::new(Text::from(controls))
         .style(Style::default().bg(BG))
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: true });
-    frame.render_widget(help, outer[2]);
+        .wrap(Wrap { trim: true })
+}
 
-    let status = Paragraph::new(Line::from(vec![Span::styled(
+fn build_compact_status<'a>(state: &'a AppState) -> Paragraph<'a> {
+    Paragraph::new(Line::from(vec![Span::styled(
         status_summary(state),
         Style::default()
             .fg(status_color(state))
             .add_modifier(Modifier::BOLD),
     )]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Left);
-    frame.render_widget(status, outer[4]);
+    .alignment(Alignment::Left)
+}
+
+fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let is_portrait_like = area.width < 56;
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if is_portrait_like {
+            [
+                Constraint::Max(4),
+                Constraint::Min(7),
+                Constraint::Max(4),
+                Constraint::Min(1),
+                Constraint::Max(2),
+            ]
+        } else {
+            [
+                Constraint::Max(4),
+                Constraint::Min(7),
+                Constraint::Max(3),
+                Constraint::Min(1),
+                Constraint::Max(2),
+            ]
+        })
+        .split(area);
+
+    frame.render_widget(build_compact_title(state), outer[0]);
+    frame.render_widget(build_compact_prompt(state, area.width), outer[1]);
+    frame.render_widget(build_compact_controls(is_portrait_like), outer[2]);
+    frame.render_widget(build_compact_status(state), outer[4]);
 }
 
 fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
@@ -681,42 +690,43 @@ fn conversation_lines(state: &AppState) -> Vec<Line<'static>> {
 }
 
 fn reasoning_widget(state: &AppState) -> Paragraph<'_> {
-    let body = if state.session.reasoning.trim().is_empty() {
+    let lines = if state.session.reasoning.trim().is_empty() {
         if state.persistent.behavior.show_reasoning {
-            "Reasoning pane waiting for structured thinking."
+            vec![Line::from(Span::styled(
+                "Reasoning pane waiting for structured thinking.",
+                Style::default().fg(MUTED),
+            ))]
         } else {
-            "Reasoning display disabled."
+            vec![Line::from(Span::styled(
+                "Reasoning display disabled.",
+                Style::default().fg(MUTED),
+            ))]
         }
     } else {
-        &state.session.reasoning
+        render_reasoning_body(&state.session.reasoning)
     };
 
-    Paragraph::new(body.to_string())
+    Paragraph::new(Text::from(lines))
         .block(panel_block("Reasoning"))
         .wrap(Wrap { trim: true })
 }
 
 fn activity_widget(state: &AppState) -> Paragraph<'_> {
-    let mut lines = state
+    let mut lines = Vec::new();
+    for (index, entry) in state
         .session
         .activity
         .iter()
         .rev()
         .take(6)
         .rev()
-        .map(|entry| {
-            let color = tone_color(entry.tone);
-            Line::from(vec![
-                Span::styled("• ", Style::default().fg(color)),
-                Span::styled(
-                    entry.label.clone(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(": ", Style::default().fg(MUTED)),
-                Span::styled(truncate_text(&entry.body, 72), Style::default().fg(TEXT)),
-            ])
-        })
-        .collect::<Vec<_>>();
+        .enumerate()
+    {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.extend(render_activity_entry(entry));
+    }
 
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -728,6 +738,54 @@ fn activity_widget(state: &AppState) -> Paragraph<'_> {
     Paragraph::new(Text::from(lines))
         .block(panel_block("Activity"))
         .wrap(Wrap { trim: true })
+}
+
+fn render_activity_entry(entry: &crate::tui::state::ActivityItem) -> Vec<Line<'static>> {
+    let color = tone_color(entry.tone);
+
+    if is_tool_activity(&entry.label) {
+        let title = truncate_text(&entry.label, 36);
+        let body = truncate_text(&entry.body, 96);
+        return vec![
+            Line::from(vec![
+                Span::styled("╭─ ", Style::default().fg(color)),
+                Span::styled(
+                    title,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("│ ", Style::default().fg(color)),
+                Span::styled(body, Style::default().fg(TEXT)),
+            ]),
+            Line::from(Span::styled("╰─", Style::default().fg(color))),
+        ];
+    }
+
+    if entry.label == "Thinking" {
+        return vec![Line::from(vec![
+            Span::styled("▎ ", Style::default().fg(MUTED)),
+            Span::styled(
+                "Thinking: ",
+                Style::default().fg(HELP).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(truncate_text(&entry.body, 88), Style::default().fg(HELP)),
+        ])];
+    }
+
+    vec![Line::from(vec![
+        Span::styled("• ", Style::default().fg(color)),
+        Span::styled(
+            entry.label.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": ", Style::default().fg(MUTED)),
+        Span::styled(truncate_text(&entry.body, 72), Style::default().fg(TEXT)),
+    ])]
+}
+
+fn is_tool_activity(label: &str) -> bool {
+    label.starts_with("Tool ") || label == "Tool complete"
 }
 
 fn footer_widget(state: &AppState) -> Paragraph<'_> {
@@ -1343,6 +1401,21 @@ fn render_message_body(text: &str) -> Vec<Line<'static>> {
     rendered
 }
 
+fn render_reasoning_body(text: &str) -> Vec<Line<'static>> {
+    text.split('\n')
+        .map(|raw_line| {
+            let line = raw_line.trim_end_matches('\r');
+            if line.trim().is_empty() {
+                return Line::from(Span::styled("▎", Style::default().fg(MUTED)));
+            }
+
+            let mut spans = vec![Span::styled("▎ ", Style::default().fg(MUTED))];
+            spans.extend(parse_inline_markdown(line, InlineStyle::Quote));
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn render_markdown_line(line: &str) -> Line<'static> {
     if line.trim().is_empty() {
         return Line::from("");
@@ -1893,5 +1966,35 @@ mod tests {
         assert!(text.contains("echo │ test"));
         assert!(text.contains("☑ done"));
         assert!(!text.contains("| --- | --- |"));
+    }
+
+    #[test]
+    fn reasoning_renders_as_blockquote() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.reasoning = "I should inspect files.\nThen patch the renderer.".to_string();
+
+        let text = buffer_text(&state, 160, 40);
+
+        assert!(text.contains("▎ I should inspect files."));
+        assert!(text.contains("▎ Then patch the renderer."));
+    }
+
+    #[test]
+    fn activity_renders_tool_calls_as_blocks() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.activity.clear();
+        state.push_activity("Thinking", "Choosing a tool.", Tone::Info);
+        state.push_activity("Tool file_read", r#"{"path":"README.md"}"#, Tone::Warning);
+
+        let text = buffer_text(&state, 160, 40);
+
+        assert!(text.contains("▎ Thinking: Choosing a tool."));
+        assert!(text.contains("╭─ Tool file_read"));
+        assert!(text.contains("│ {\"path\":\"README.md\"}"));
+        assert!(text.contains("╰─"));
     }
 }
