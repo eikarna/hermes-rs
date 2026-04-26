@@ -183,10 +183,16 @@ impl HermesTool for FileSearchTool {
         };
 
         let path = PathBuf::from(&args.path);
-        let pattern = if args.case_sensitive.unwrap_or(true) {
-            args.pattern.clone()
-        } else {
-            args.pattern.to_lowercase()
+        let case_sensitive = args.case_sensitive.unwrap_or(true);
+        let escaped_pattern = regex::escape(&args.pattern);
+        let re = match regex::RegexBuilder::new(&escaped_pattern)
+            .case_insensitive(!case_sensitive)
+            .build()
+        {
+            Ok(re) => re,
+            Err(e) => {
+                return ToolResult::error("file_search", format!("Invalid regex pattern: {}", e))
+            }
         };
 
         let mut results = Vec::new();
@@ -194,8 +200,7 @@ impl HermesTool for FileSearchTool {
 
         fn search_recursive(
             dir: &PathBuf,
-            pattern: &str,
-            case_sensitive: bool,
+            re: &regex::Regex,
             results: &mut Vec<serde_json::Value>,
             max_results: usize,
         ) {
@@ -223,25 +228,13 @@ impl HermesTool for FileSearchTool {
                             && name != "target"
                             && name != "__pycache__"
                         {
-                            search_recursive(&path, pattern, case_sensitive, results, max_results);
+                            search_recursive(&path, re, results, max_results);
                         }
                     }
                 } else if path.is_file() {
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        let search_pattern = if case_sensitive {
-                            pattern.to_string()
-                        } else {
-                            pattern.to_lowercase()
-                        };
-
                         for (line_num, line) in content.lines().enumerate() {
-                            let search_line = if case_sensitive {
-                                line.to_string()
-                            } else {
-                                line.to_lowercase()
-                            };
-
-                            if search_line.contains(&search_pattern) {
+                            if re.is_match(line) {
                                 results.push(serde_json::json!({
                                     "file": path.to_string_lossy(),
                                     "line": line_num + 1,
@@ -259,29 +252,11 @@ impl HermesTool for FileSearchTool {
         }
 
         if path.is_dir() {
-            search_recursive(
-                &path,
-                &pattern,
-                args.case_sensitive.unwrap_or(true),
-                &mut results,
-                max_results,
-            );
+            search_recursive(&path, &re, &mut results, max_results);
         } else if path.is_file() {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                let search_pattern = if args.case_sensitive.unwrap_or(true) {
-                    pattern.clone()
-                } else {
-                    pattern.to_lowercase()
-                };
-
                 for (line_num, line) in content.lines().enumerate() {
-                    let search_line = if args.case_sensitive.unwrap_or(true) {
-                        line.to_string()
-                    } else {
-                        line.to_lowercase()
-                    };
-
-                    if search_line.contains(&search_pattern) {
+                    if re.is_match(line) {
                         results.push(serde_json::json!({
                             "file": path.to_string_lossy(),
                             "line": line_num + 1,

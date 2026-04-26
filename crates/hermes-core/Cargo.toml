@@ -45,3 +45,9 @@ tokio-test = "0.4"
 mockito = "1.4"
 tracing-subscriber = { workspace = true }
 serial_test = "3.2"
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3.27.0"
+
+[[bench]]
+name = "file_search_bench"
+harness = false
