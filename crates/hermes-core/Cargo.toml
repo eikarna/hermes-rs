@@ -45,10 +45,3 @@ tokio-test = "0.4"
 mockito = "1.4"
 tracing-subscriber = { workspace = true }
 serial_test = "3.2"
-
-
-criterion = "0.4"
-
-[[bench]]
-name = "parser_bench"
-harness = false
