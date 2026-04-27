@@ -276,7 +276,7 @@ impl McpClient {
             .read()
             .await
             .iter()
-            .map(|t| t.definition.clone())
+            .map(|t| (*t.definition).clone())
             .collect())
     }
 
@@ -557,7 +557,7 @@ impl McpStdioClient {
             .read()
             .await
             .iter()
-            .map(|t| t.definition.clone())
+            .map(|t| (*t.definition).clone())
             .collect())
     }
 
@@ -718,7 +718,7 @@ impl McpTransport {
 #[derive(Debug, Clone)]
 pub struct McpTool {
     transport: McpTransport,
-    definition: McpToolDefinition,
+    definition: Arc<McpToolDefinition>,
 }
 
 impl McpTool {
@@ -726,7 +726,7 @@ impl McpTool {
     pub fn new(client: McpClient, definition: McpToolDefinition) -> Self {
         Self {
             transport: McpTransport::Http(client),
-            definition,
+            definition: Arc::new(definition),
         }
     }
 
@@ -734,7 +734,7 @@ impl McpTool {
     pub fn new_stdio(client: McpStdioClient, definition: McpToolDefinition) -> Self {
         Self {
             transport: McpTransport::Stdio(client),
-            definition,
+            definition: Arc::new(definition),
         }
     }
 
