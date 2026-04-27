@@ -118,8 +118,7 @@ impl ToolCallParser {
         if data.is_empty() {
             // Flush any remaining text
             if !self.buffer.is_empty() {
-                let text = self.buffer.clone();
-                self.buffer.clear();
+                let text = std::mem::take(&mut self.buffer);
                 events.push(ParserEvent::Text(text));
             }
             events.push(ParserEvent::End);
@@ -159,8 +158,7 @@ impl ToolCallParser {
                     } else {
                         // Not a tool_call tag, emit buffered text and go back
                         if !self.buffer.is_empty() {
-                            events.push(ParserEvent::Text(self.buffer.clone()));
-                            self.buffer.clear();
+                            events.push(ParserEvent::Text(std::mem::take(&mut self.buffer)));
                         }
                         self.state = ParserState::Outside;
                     }
