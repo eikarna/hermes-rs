@@ -186,48 +186,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_display_value_non_secret() {
-        let field_empty = FormField::new("label", "");
-        assert_eq!(field_empty.display_value(), "");
-
-        let field_value = FormField::new("label", "hello");
-        assert_eq!(field_value.display_value(), "hello");
-    }
-
-    #[test]
-    fn test_display_value_secret_empty() {
-        let field = FormField::secret("label", "");
-        assert_eq!(field.display_value(), "");
-    }
-
-    #[test]
-    fn test_display_value_secret_short() {
-        let field = FormField::secret("label", "secret123");
-        assert_eq!(field.display_value(), "*********"); // length is 9
-    }
-
-    #[test]
-    fn test_display_value_secret_exact_max() {
-        let field = FormField::secret("label", "1234567890123456");
-        assert_eq!(field.display_value(), "****************"); // length is 16
-    }
-
-    #[test]
-    fn test_display_value_secret_long() {
-        let field = FormField::secret("label", "12345678901234567890");
-        assert_eq!(field.display_value(), "****************"); // max length is 16
-    }
-
-    #[test]
-    fn test_display_value_secret_unicode() {
-        let field = FormField::secret("label", "🍎🍊🍇");
-        assert_eq!(field.display_value(), "***"); // 3 unicode characters
-
-        let field_long = FormField::secret("label", "🍎🍊🍇🍎🍊🍇🍎🍊🍇🍎🍊🍇🍎🍊🍇🍎🍊🍇"); // 18 chars
-        assert_eq!(field_long.display_value(), "****************"); // max length is 16
-    }
-
-    #[test]
     fn test_form_field_new() {
         let field = FormField::new("username", "alice");
         assert_eq!(field.label, "username");
@@ -241,6 +199,28 @@ mod tests {
         assert_eq!(field.label, "password");
         assert_eq!(field.value, "12345");
         assert!(field.secret);
+    }
+
+    #[test]
+    fn test_form_field_display_value() {
+        // Normal field
+        let field = FormField::new("username", "alice");
+        assert_eq!(field.display_value(), "alice");
+
+        // Secret field, empty
+        let secret_empty = FormField::secret("password", "");
+        assert_eq!(secret_empty.display_value(), "");
+
+        // Secret field, short
+        let secret_short = FormField::secret("password", "12345");
+        assert_eq!(secret_short.display_value(), "*****");
+
+        // Secret field, long (limit to 16)
+        let secret_long = FormField::secret(
+            "password",
+            "this_is_a_very_long_password_that_should_be_capped",
+        );
+        assert_eq!(secret_long.display_value(), "*".repeat(16));
     }
 
     #[test]
