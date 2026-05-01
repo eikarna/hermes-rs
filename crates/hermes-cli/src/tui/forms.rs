@@ -180,3 +180,50 @@ pub struct SubmittedMcpForm {
     pub args: Vec<String>,
     pub env: std::collections::HashMap<String, String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display_value_non_secret() {
+        let field_empty = FormField::new("label", "");
+        assert_eq!(field_empty.display_value(), "");
+
+        let field_value = FormField::new("label", "hello");
+        assert_eq!(field_value.display_value(), "hello");
+    }
+
+    #[test]
+    fn test_display_value_secret_empty() {
+        let field = FormField::secret("label", "");
+        assert_eq!(field.display_value(), "");
+    }
+
+    #[test]
+    fn test_display_value_secret_short() {
+        let field = FormField::secret("label", "secret123");
+        assert_eq!(field.display_value(), "*********"); // length is 9
+    }
+
+    #[test]
+    fn test_display_value_secret_exact_max() {
+        let field = FormField::secret("label", "1234567890123456");
+        assert_eq!(field.display_value(), "****************"); // length is 16
+    }
+
+    #[test]
+    fn test_display_value_secret_long() {
+        let field = FormField::secret("label", "12345678901234567890");
+        assert_eq!(field.display_value(), "****************"); // max length is 16
+    }
+
+    #[test]
+    fn test_display_value_secret_unicode() {
+        let field = FormField::secret("label", "🍎🍊🍇");
+        assert_eq!(field.display_value(), "***"); // 3 unicode characters
+
+        let field_long = FormField::secret("label", "🍎🍊🍇🍎🍊🍇🍎🍊🍇🍎🍊🍇🍎🍊🍇🍎🍊🍇"); // 18 chars
+        assert_eq!(field_long.display_value(), "****************"); // max length is 16
+    }
+}
