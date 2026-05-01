@@ -180,3 +180,85 @@ pub struct SubmittedMcpForm {
     pub args: Vec<String>,
     pub env: std::collections::HashMap<String, String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_form_field_new() {
+        let field = FormField::new("username", "alice");
+        assert_eq!(field.label, "username");
+        assert_eq!(field.value, "alice");
+        assert!(!field.secret);
+    }
+
+    #[test]
+    fn test_form_field_secret() {
+        let field = FormField::secret("password", "12345");
+        assert_eq!(field.label, "password");
+        assert_eq!(field.value, "12345");
+        assert!(field.secret);
+    }
+
+    #[test]
+    fn test_form_field_display_value() {
+        // Normal field
+        let field = FormField::new("username", "alice");
+        assert_eq!(field.display_value(), "alice");
+
+        // Secret field, empty
+        let secret_empty = FormField::secret("password", "");
+        assert_eq!(secret_empty.display_value(), "");
+
+        // Secret field, short
+        let secret_short = FormField::secret("password", "12345");
+        assert_eq!(secret_short.display_value(), "*****");
+
+        // Secret field, long (limit to 16)
+        let secret_long = FormField::secret(
+            "password",
+            "this_is_a_very_long_password_that_should_be_capped",
+        );
+        assert_eq!(secret_long.display_value(), "*".repeat(16));
+    }
+
+    #[test]
+    fn test_form_state_navigation() {
+        let fields = vec![
+            FormField::new("field1", "val1"),
+            FormField::new("field2", "val2"),
+            FormField::new("field3", "val3"),
+        ];
+        let mut state = FormState::new("Title", "Help", fields);
+
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.active_mut().label, "field1");
+
+        state.next();
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.active_mut().label, "field2");
+
+        state.next();
+        assert_eq!(state.selected, 2);
+        assert_eq!(state.active_mut().label, "field3");
+
+        state.next();
+        assert_eq!(state.selected, 0); // Wrap around
+
+        state.previous();
+        assert_eq!(state.selected, 2); // Wrap around back
+
+        state.previous();
+        assert_eq!(state.selected, 1);
+    }
+
+    #[test]
+    fn test_form_state_active_mut() {
+        let fields = vec![FormField::new("field1", "val1")];
+        let mut state = FormState::new("Title", "Help", fields);
+
+        state.active_mut().value = "new_val".to_string();
+        assert_eq!(state.fields[0].value, "new_val");
+    }
+}
