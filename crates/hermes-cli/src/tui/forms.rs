@@ -216,7 +216,10 @@ mod tests {
         assert_eq!(secret_short.display_value(), "*****");
 
         // Secret field, long (limit to 16)
-        let secret_long = FormField::secret("password", "this_is_a_very_long_password_that_should_be_capped");
+        let secret_long = FormField::secret(
+            "password",
+            "this_is_a_very_long_password_that_should_be_capped",
+        );
         assert_eq!(secret_long.display_value(), "*".repeat(16));
     }
 
@@ -252,9 +255,7 @@ mod tests {
 
     #[test]
     fn test_form_state_active_mut() {
-        let fields = vec![
-            FormField::new("field1", "val1"),
-        ];
+        let fields = vec![FormField::new("field1", "val1")];
         let mut state = FormState::new("Title", "Help", fields);
 
         state.active_mut().value = "new_val".to_string();
