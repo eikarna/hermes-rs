@@ -36,6 +36,17 @@ const THREAT_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
+lazy_static::lazy_static! {
+    static ref THREAT_REGEXES: Vec<(regex::Regex, &'static str)> = THREAT_PATTERNS
+        .iter()
+        .map(|&(pattern, id)| {
+            let re = regex::Regex::new(&format!("(?i){}", pattern))
+                .expect("Invalid context scan pattern");
+            (re, id)
+        })
+        .collect();
+}
+
 const INVISIBLE_CHARS: &[char] = &[
     '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}', '\u{202a}', '\u{202b}', '\u{202c}',
     '\u{202d}', '\u{202e}',
@@ -51,11 +62,9 @@ pub fn scan_context_content(content: &str, filename: &str) -> String {
         }
     }
 
-    for &(pattern, id) in THREAT_PATTERNS {
-        match regex::Regex::new(&format!("(?i){}", pattern)) {
-            Ok(re) if re.is_match(content) => findings.push(id.to_string()),
-            Ok(_) => {}
-            Err(error) => debug!(pattern, error = %error, "Invalid context scan pattern"),
+    for (re, id) in THREAT_REGEXES.iter() {
+        if re.is_match(content) {
+            findings.push(id.to_string());
         }
     }
 
