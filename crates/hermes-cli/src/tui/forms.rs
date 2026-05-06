@@ -261,4 +261,20 @@ mod tests {
         state.active_mut().value = "new_val".to_string();
         assert_eq!(state.fields[0].value, "new_val");
     }
+
+    #[test]
+    fn test_modal_push_char() {
+        let mut modal = Modal::create_skill();
+        assert_eq!(modal.form_mut().active_mut().label, "name");
+        assert_eq!(modal.form_mut().active_mut().value, "");
+
+        modal.push_char('a');
+        assert_eq!(modal.form_mut().active_mut().value, "a");
+
+        modal.push_char('b');
+        assert_eq!(modal.form_mut().active_mut().value, "ab");
+
+        modal.push_char('c');
+        assert_eq!(modal.form_mut().active_mut().value, "abc");
+    }
 }
