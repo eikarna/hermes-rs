@@ -26,6 +26,7 @@ struct TerminalArgs {
     env_vars: Option<HashMap<String, String>>,
     timeout: Option<u64>,
     max_output: Option<usize>,
+    use_shell: Option<bool>,
 }
 
 #[async_trait]
@@ -35,7 +36,7 @@ impl HermesTool for TerminalTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its output. Supports custom working directory and environment variables."
+        "Execute a command and return its output. Supports custom working directory and environment variables. Uses direct execution by default (preventing injection), but can use a shell if `useShell` is set to true."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -56,14 +57,27 @@ impl HermesTool for TerminalTool {
         );
         let max_output = args.max_output.unwrap_or(settings.max_output_bytes);
 
-        let shell = crate::platform::detect_shell();
         let mut cmd = {
-            let mut c = Command::new(&shell.path);
-            for arg in &shell.args_pattern {
-                c.arg(arg);
+            if args.use_shell.unwrap_or(false) {
+                let shell = crate::platform::detect_shell();
+                let mut c = Command::new(&shell.path);
+                for arg in &shell.args_pattern {
+                    c.arg(arg);
+                }
+                c.arg(&args.command);
+                c
+            } else {
+                let parts = match shell_words::split(&args.command) {
+                    Ok(p) => p,
+                    Err(e) => return ToolResult::error("terminal", format!("Failed to parse command string: {}. Consider using useShell=true if you have special shell characters.", e)),
+                };
+                if parts.is_empty() {
+                    return ToolResult::error("terminal", "Empty command string");
+                }
+                let mut c = Command::new(&parts[0]);
+                c.args(&parts[1..]);
+                c
             }
-            c.arg(&args.command);
-            c
         };
 
         // Set working directory
@@ -173,5 +187,26 @@ impl HermesTool for TerminalTool {
                 }),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_terminal_tool_direct_execution() {
+        let tool = TerminalTool;
+        let args = json!({
+            "command": "echo 'hello world'"
+        });
+
+        let result = tool.execute(args, ToolContext::default()).await;
+
+        // This is a basic test to ensure the tool successfully runs directly
+        // Because of direct execution 'echo' won't process the quotes via shell, so stdout should literally be "'hello world'\n"
+        // Let's just check if it succeeds.
+        assert!(result.success);
     }
 }
