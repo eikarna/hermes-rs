@@ -467,14 +467,18 @@ impl PlatformAdapter for DiscordAdapter {
             return Ok(());
         }
 
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::MissingConfig {
+                key: "discord_token".to_string(),
+            })?;
+
         // Verify the token
         let client = reqwest::Client::new();
         let response = client
             .get(format!("{}/users/@me", self.api_url()))
-            .header(
-                "Authorization",
-                format!("Bot {}", self.token.as_ref().unwrap()),
-            )
+            .header("Authorization", format!("Bot {}", token))
             .send()
             .await?;
 
@@ -494,6 +498,13 @@ impl PlatformAdapter for DiscordAdapter {
     }
 
     async fn send_message(&self, message: OutgoingMessage) -> Result<()> {
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::MissingConfig {
+                key: "discord_token".to_string(),
+            })?;
+
         let client = reqwest::Client::new();
 
         let body = serde_json::json!({
@@ -508,10 +519,7 @@ impl PlatformAdapter for DiscordAdapter {
 
         client
             .post(&url)
-            .header(
-                "Authorization",
-                format!("Bot {}", self.token.as_ref().unwrap()),
-            )
+            .header("Authorization", format!("Bot {}", token))
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -620,6 +628,13 @@ impl PlatformAdapter for SlackAdapter {
     }
 
     async fn send_message(&self, message: OutgoingMessage) -> Result<()> {
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::MissingConfig {
+                key: "slack_token".to_string(),
+            })?;
+
         let client = reqwest::Client::new();
 
         let body = serde_json::json!({
@@ -635,10 +650,7 @@ impl PlatformAdapter for SlackAdapter {
                     .slack_api_base
                     .trim_end_matches('/')
             ))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.token.as_ref().unwrap()),
-            )
+            .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
