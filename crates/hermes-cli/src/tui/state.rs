@@ -745,4 +745,36 @@ mod tests {
 
         assert_eq!(state.ui.prompt_history, vec!["repeat".to_string()]);
     }
+
+    #[test]
+    fn truncate_handles_short_strings() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("  hello  ", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_handles_exact_length_strings() {
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("  hello  ", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_adds_ellipsis_when_too_long() {
+        assert_eq!(truncate("hello world", 8), "hello...");
+        assert_eq!(truncate("  hello world  ", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_handles_very_short_max_chars() {
+        assert_eq!(truncate("hello", 2), "...");
+        assert_eq!(truncate("hello", 0), "...");
+    }
+
+    #[test]
+    fn truncate_handles_multibyte_chars_correctly() {
+        assert_eq!(truncate("👋🌍", 2), "👋🌍");
+        assert_eq!(truncate("👋🌍👋🌍", 3), "...");
+        assert_eq!(truncate("👋🌍👋🌍", 4), "👋🌍👋🌍");
+        assert_eq!(truncate("👋🌍👋🌍👋🌍", 4), "👋...");
+    }
 }
