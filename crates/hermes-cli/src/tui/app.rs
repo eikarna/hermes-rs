@@ -140,9 +140,9 @@ impl TuiApp {
     }
 
     async fn finish_run_if_ready(&mut self) -> Result<()> {
-        if let Some(handle) = &self.run_handle {
-            if handle.is_finished() {
-                let handle = self.run_handle.take().unwrap();
+        let is_finished = self.run_handle.as_ref().is_some_and(|h| h.is_finished());
+        if is_finished {
+            if let Some(handle) = self.run_handle.take() {
                 let action = match handle.await {
                     Ok(Ok(_)) => Action::ApplyRunResult(None),
                     Ok(Err(error)) => {
