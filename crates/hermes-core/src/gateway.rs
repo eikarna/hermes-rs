@@ -471,10 +471,15 @@ impl PlatformAdapter for DiscordAdapter {
         let client = reqwest::Client::new();
         let response = client
             .get(format!("{}/users/@me", self.api_url()))
-            .header(
-                "Authorization",
-                format!("Bot {}", self.token.as_ref().unwrap()),
-            )
+            .header("Authorization", {
+                let mut auth_val = reqwest::header::HeaderValue::from_str(&format!(
+                    "Bot {}",
+                    self.token.as_ref().unwrap()
+                ))
+                .map_err(|e| crate::error::Error::Agent(format!("Invalid auth header: {}", e)))?;
+                auth_val.set_sensitive(true);
+                auth_val
+            })
             .send()
             .await?;
 
@@ -508,10 +513,15 @@ impl PlatformAdapter for DiscordAdapter {
 
         client
             .post(&url)
-            .header(
-                "Authorization",
-                format!("Bot {}", self.token.as_ref().unwrap()),
-            )
+            .header("Authorization", {
+                let mut auth_val = reqwest::header::HeaderValue::from_str(&format!(
+                    "Bot {}",
+                    self.token.as_ref().unwrap()
+                ))
+                .map_err(|e| crate::error::Error::Agent(format!("Invalid auth header: {}", e)))?;
+                auth_val.set_sensitive(true);
+                auth_val
+            })
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -635,10 +645,15 @@ impl PlatformAdapter for SlackAdapter {
                     .slack_api_base
                     .trim_end_matches('/')
             ))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.token.as_ref().unwrap()),
-            )
+            .header("Authorization", {
+                let mut auth_val = reqwest::header::HeaderValue::from_str(&format!(
+                    "Bearer {}",
+                    self.token.as_ref().unwrap()
+                ))
+                .map_err(|e| crate::error::Error::Agent(format!("Invalid auth header: {}", e)))?;
+                auth_val.set_sensitive(true);
+                auth_val
+            })
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
