@@ -745,4 +745,125 @@ mod tests {
 
         assert_eq!(state.ui.prompt_history, vec!["repeat".to_string()]);
     }
+
+    #[test]
+    fn apply_agent_event_thinking() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.begin_run("test".to_string());
+        state.apply_agent_event(AgentEvent::Thinking {
+            content: "Pondering...".to_string(),
+        });
+
+        assert_eq!(state.session.status, "Pondering...");
+        let last_activity = state.session.activity.last().unwrap();
+        assert_eq!(last_activity.label, "Thinking");
+        assert_eq!(last_activity.body, "Pondering...");
+        assert_eq!(last_activity.tone, Tone::Info);
+    }
+
+    #[test]
+    fn apply_agent_event_reasoning() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.begin_run("test".to_string());
+        state.apply_agent_event(AgentEvent::Reasoning {
+            text: "Step 1...".to_string(),
+        });
+        state.apply_agent_event(AgentEvent::Reasoning {
+            text: " Step 2...".to_string(),
+        });
+
+        assert_eq!(state.session.reasoning, "Step 1... Step 2...");
+        assert_eq!(state.session.status, "Streaming reasoning");
+    }
+
+    #[test]
+    fn apply_agent_event_tool_start() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.begin_run("test".to_string());
+        state.apply_agent_event(AgentEvent::ToolStart {
+            name: "calculator".to_string(),
+            arguments: "1+1".to_string(),
+        });
+
+        assert_eq!(state.session.status, "Running calculator");
+        let last_activity = state.session.activity.last().unwrap();
+        assert_eq!(last_activity.label, "Tool calculator");
+        assert_eq!(last_activity.body, "1+1");
+        assert_eq!(last_activity.tone, Tone::Warning);
+    }
+
+    #[test]
+    fn apply_agent_event_tool_complete() {
+        use hermes_core::tools::ToolResult;
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.begin_run("test".to_string());
+
+        // Success case
+        state.apply_agent_event(AgentEvent::ToolComplete {
+            result: ToolResult {
+                tool_call_id: "1".to_string(),
+                success: true,
+                content: "2".to_string(),
+                error: None,
+            },
+        });
+        assert_eq!(state.session.status, "Tool completed");
+        let last_activity = state.session.activity.last().unwrap();
+        assert_eq!(last_activity.label, "Tool complete");
+        assert_eq!(last_activity.body, "2");
+        assert_eq!(last_activity.tone, Tone::Success);
+
+        // Failure case
+        state.apply_agent_event(AgentEvent::ToolComplete {
+            result: ToolResult {
+                tool_call_id: "2".to_string(),
+                success: false,
+                content: "syntax error".to_string(),
+                error: Some("error".to_string()),
+            },
+        });
+        assert_eq!(state.session.status, "Tool completed");
+        let last_activity = state.session.activity.last().unwrap();
+        assert_eq!(last_activity.label, "Tool complete");
+        assert_eq!(last_activity.body, "syntax error");
+        assert_eq!(last_activity.tone, Tone::Error);
+    }
+
+    #[test]
+    fn apply_agent_event_tool_error() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.begin_run("test".to_string());
+        state.apply_agent_event(AgentEvent::ToolError {
+            name: "calculator".to_string(),
+            error: "timeout".to_string(),
+        });
+
+        assert_eq!(state.session.status, "calculator failed");
+        let last_activity = state.session.activity.last().unwrap();
+        assert_eq!(last_activity.label, "Tool calculator");
+        assert_eq!(last_activity.body, "timeout");
+        assert_eq!(last_activity.tone, Tone::Error);
+    }
+
+    #[test]
+    fn apply_agent_event_content_and_iteration() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.begin_run("test".to_string());
+
+        state.apply_agent_event(AgentEvent::Content {
+            text: "Hello".to_string(),
+        });
+        state.apply_agent_event(AgentEvent::Content {
+            text: " World".to_string(),
+        });
+        assert_eq!(state.session.streaming_response, "Hello World");
+        assert_eq!(state.session.status, "Streaming response");
+
+        state.apply_agent_event(AgentEvent::IterationComplete { iteration: 5 });
+        assert_eq!(state.session.current_iteration, 5);
+        let last_activity = state.session.activity.last().unwrap();
+        assert_eq!(last_activity.label, "Iteration 5");
+        assert_eq!(last_activity.body, "Agent loop step finished.");
+        assert_eq!(last_activity.tone, Tone::Info);
+    }
 }
