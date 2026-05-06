@@ -9,6 +9,63 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::schema::ToolSchema;
+
+/// Ensure a path is safe and within the current workspace (CWD)
+pub(crate) fn ensure_safe_path(path_str: &str) -> Result<PathBuf, String> {
+    let base = std::env::current_dir()
+        .and_then(|p| p.canonicalize())
+        .map_err(|e| format!("Failed to get workspace root: {}", e))?;
+
+    let path = PathBuf::from(path_str);
+    let joined = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+
+    // If it exists, canonicalize it to resolve symlinks and ..
+    if joined.exists() {
+        let canonical = joined
+            .canonicalize()
+            .map_err(|e| format!("Invalid path: {}", e))?;
+        if !canonical.starts_with(&base) {
+            return Err(format!(
+                "Access denied: path {} resolves outside workspace",
+                path_str
+            ));
+        }
+        Ok(canonical)
+    } else {
+        // For new files or paths that don't exist yet, we normalize the path lexically
+        let mut normalized = PathBuf::new();
+        for component in joined.components() {
+            match component {
+                std::path::Component::Prefix(p) => normalized.push(p.as_os_str()),
+                std::path::Component::RootDir => {
+                    normalized.push(std::path::MAIN_SEPARATOR.to_string())
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !normalized.pop() {
+                        return Err(format!(
+                            "Access denied: path {} attempts to escape root",
+                            path_str
+                        ));
+                    }
+                }
+                std::path::Component::Normal(c) => normalized.push(c),
+            }
+        }
+
+        if !normalized.starts_with(&base) {
+            return Err(format!(
+                "Access denied: path {} is outside workspace",
+                path_str
+            ));
+        }
+        Ok(normalized)
+    }
+}
 use crate::tools::{HermesTool, ToolContext, ToolResult};
 
 /// Tool for reading file contents
@@ -42,7 +99,10 @@ impl HermesTool for FileReadTool {
             Err(e) => return ToolResult::error("file_read", format!("Invalid arguments: {}", e)),
         };
 
-        let path = PathBuf::from(&args.path);
+        let path = match ensure_safe_path(&args.path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error("file_read", e),
+        };
 
         if !path.exists() {
             return ToolResult::error("file_read", format!("File not found: {}", args.path));
@@ -106,7 +166,10 @@ impl HermesTool for FileWriteTool {
             Err(e) => return ToolResult::error("file_write", format!("Invalid arguments: {}", e)),
         };
 
-        let path = PathBuf::from(&args.path);
+        let path = match ensure_safe_path(&args.path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error("file_write", e),
+        };
 
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
@@ -182,7 +245,10 @@ impl HermesTool for FileSearchTool {
             Err(e) => return ToolResult::error("file_search", format!("Invalid arguments: {}", e)),
         };
 
-        let path = PathBuf::from(&args.path);
+        let path = match ensure_safe_path(&args.path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error("file_search", e),
+        };
         let case_sensitive = args.case_sensitive.unwrap_or(true);
         let escaped_pattern = regex::escape(&args.pattern);
         let re = match regex::RegexBuilder::new(&escaped_pattern)
@@ -316,7 +382,10 @@ impl HermesTool for FileListTool {
             Err(e) => return ToolResult::error("file_list", format!("Invalid arguments: {}", e)),
         };
 
-        let path = PathBuf::from(&args.path);
+        let path = match ensure_safe_path(&args.path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error("file_list", e),
+        };
 
         if !path.exists() {
             return ToolResult::error("file_list", format!("Path does not exist: {}", args.path));
@@ -401,5 +470,58 @@ impl HermesTool for FileListTool {
                 "count": entries.len()
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolContext;
+
+    #[tokio::test]
+    async fn test_ensure_safe_path() {
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+
+        // Safe paths
+        assert!(ensure_safe_path("Cargo.toml").is_ok());
+        assert!(ensure_safe_path("./Cargo.toml").is_ok());
+
+        // Unsafe paths
+        let result = ensure_safe_path("/etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Access denied"));
+
+        let result = ensure_safe_path("../../../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_file_read_traversal() {
+        let tool = FileReadTool;
+        let ctx = ToolContext::default();
+
+        let args = serde_json::json!({
+            "path": "/etc/passwd"
+        });
+
+        let result = tool.execute(args, ctx).await;
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_file_write_traversal() {
+        let tool = FileWriteTool;
+        let ctx = ToolContext::default();
+
+        let args = serde_json::json!({
+            "path": "/tmp/evil.sh",
+            "content": "echo 'evil'"
+        });
+
+        let result = tool.execute(args, ctx).await;
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Access denied"));
     }
 }
