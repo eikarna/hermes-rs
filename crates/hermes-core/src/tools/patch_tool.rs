@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::PathBuf;
 
 use crate::schema::ToolSchema;
+use crate::tools::file_tools::ensure_safe_path;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
 
 /// Arguments for the patch tool
@@ -141,7 +141,10 @@ impl HermesTool for PatchTool {
             Err(e) => return ToolResult::error("patch", format!("Invalid arguments: {}", e)),
         };
 
-        let path = PathBuf::from(&args.path);
+        let path = match ensure_safe_path(&args.path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error("patch", e),
+        };
 
         if !path.exists() {
             return ToolResult::error("patch", format!("File not found: {}", args.path));
@@ -363,5 +366,21 @@ mod tests {
         let (replaced, count) = result.unwrap();
         assert_eq!(count, 1);
         assert!(replaced.contains("baz"));
+    }
+
+    #[tokio::test]
+    async fn test_patch_traversal() {
+        let tool = PatchTool;
+        let ctx = ToolContext::default();
+
+        let args = serde_json::json!({
+            "path": "/etc/passwd",
+            "find": "root",
+            "replace": "evil"
+        });
+
+        let result = tool.execute(args, ctx).await;
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Access denied"));
     }
 }
