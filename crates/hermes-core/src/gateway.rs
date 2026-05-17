@@ -477,7 +477,9 @@ impl PlatformAdapter for DiscordAdapter {
                     "Bot {}",
                     self.token
                         .as_ref()
-                        .ok_or(crate::error::Error::MissingApiKey)?
+                        .ok_or_else(|| crate::error::Error::MissingConfig {
+                            key: "discord_token".to_string()
+                        })?
                 ),
             )
             .send()
@@ -519,7 +521,9 @@ impl PlatformAdapter for DiscordAdapter {
                     "Bot {}",
                     self.token
                         .as_ref()
-                        .ok_or(crate::error::Error::MissingApiKey)?
+                        .ok_or_else(|| crate::error::Error::MissingConfig {
+                            key: "discord_token".to_string()
+                        })?
                 ),
             )
             .header("Content-Type", "application/json")
@@ -651,7 +655,9 @@ impl PlatformAdapter for SlackAdapter {
                     "Bearer {}",
                     self.token
                         .as_ref()
-                        .ok_or(crate::error::Error::MissingApiKey)?
+                        .ok_or_else(|| crate::error::Error::MissingConfig {
+                            key: "slack_token".to_string()
+                        })?
                 ),
             )
             .header("Content-Type", "application/json")
@@ -759,8 +765,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discord_send_message_returns_missing_config_without_token() {
+        let adapter = DiscordAdapter::new(None);
+        let result = adapter
+            .send_message(OutgoingMessage::new("channel", "hello"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::MissingConfig { key }) if key == "discord_token"
+        ));
+    }
+
+    #[tokio::test]
     async fn test_slack_adapter_disabled() {
         let adapter = SlackAdapter::new(None, None);
         assert!(!adapter.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn slack_send_message_returns_missing_config_without_token() {
+        let adapter = SlackAdapter::new(None, None);
+        let result = adapter
+            .send_message(OutgoingMessage::new("channel", "hello"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::MissingConfig { key }) if key == "slack_token"
+        ));
     }
 }
