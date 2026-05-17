@@ -756,8 +756,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discord_send_message_returns_missing_config_without_token() {
+        let adapter = DiscordAdapter::new(None);
+        let result = adapter
+            .send_message(OutgoingMessage::new("channel", "hello"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::MissingConfig { key }) if key == "discord_token"
+        ));
+    }
+
+    #[tokio::test]
     async fn test_slack_adapter_disabled() {
         let adapter = SlackAdapter::new(None, None);
         assert!(!adapter.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn slack_send_message_returns_missing_config_without_token() {
+        let adapter = SlackAdapter::new(None, None);
+        let result = adapter
+            .send_message(OutgoingMessage::new("channel", "hello"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::MissingConfig { key }) if key == "slack_token"
+        ));
     }
 }
