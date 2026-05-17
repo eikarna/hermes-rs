@@ -31,7 +31,7 @@ pub struct McpClient {
     /// HTTP client
     client: reqwest::Client,
     /// Connected tools from this server
-    tools: Arc<RwLock<Vec<McpTool>>>,
+    tools: Arc<RwLock<Arc<Vec<McpTool>>>>,
     /// Server capabilities
     capabilities: Arc<RwLock<McpCapabilities>>,
     /// Whether connected
@@ -183,7 +183,7 @@ impl McpClient {
             url: url.into(),
             auth_token,
             client: reqwest::Client::new(),
-            tools: Arc::new(RwLock::new(Vec::new())),
+            tools: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             capabilities: Arc::new(RwLock::new(McpCapabilities::default())),
             connected: Arc::new(RwLock::new(false)),
         }
@@ -245,7 +245,7 @@ impl McpClient {
     /// Disconnect from the MCP server
     pub async fn disconnect(&self) -> Result<()> {
         *self.connected.write().await = false;
-        self.tools.write().await.clear();
+        *self.tools.write().await = Arc::new(Vec::new());
         info!(url = %self.url, "Disconnected from MCP server");
         Ok(())
     }
@@ -268,7 +268,7 @@ impl McpClient {
             .map(|def| McpTool::new(self.clone(), def))
             .collect();
 
-        *self.tools.write().await = tools;
+        *self.tools.write().await = Arc::new(tools);
 
         debug!(count = self.tools.read().await.len(), "Listed MCP tools");
         Ok(self
@@ -292,7 +292,7 @@ impl McpClient {
     }
 
     /// Get all tools
-    pub async fn get_tools(&self) -> Vec<McpTool> {
+    pub async fn get_tools(&self) -> Arc<Vec<McpTool>> {
         self.tools.read().await.clone()
     }
 
@@ -394,7 +394,7 @@ pub struct McpStdioClient {
     /// Stdin/stdout IO pair (locked together for request-response atomicity)
     io: Arc<tokio::sync::Mutex<Option<StdioIo>>>,
     /// Connected tools from this server
-    tools: Arc<RwLock<Vec<McpTool>>>,
+    tools: Arc<RwLock<Arc<Vec<McpTool>>>>,
     /// Server capabilities
     capabilities: Arc<RwLock<McpCapabilities>>,
     /// Whether connected
@@ -416,7 +416,7 @@ impl McpStdioClient {
             env,
             child: Arc::new(RwLock::new(None)),
             io: Arc::new(tokio::sync::Mutex::new(None)),
-            tools: Arc::new(RwLock::new(Vec::new())),
+            tools: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             capabilities: Arc::new(RwLock::new(McpCapabilities::default())),
             connected: Arc::new(RwLock::new(false)),
             request_id: Arc::new(AtomicU64::new(1)),
@@ -510,7 +510,7 @@ impl McpStdioClient {
     /// Disconnect from the MCP server by killing the child process
     pub async fn disconnect(&self) -> Result<()> {
         *self.connected.write().await = false;
-        self.tools.write().await.clear();
+        *self.tools.write().await = Arc::new(Vec::new());
 
         // Drop IO handles to close stdin (signals EOF to child)
         *self.io.lock().await = None;
@@ -546,7 +546,7 @@ impl McpStdioClient {
             .map(|def| McpTool::new_stdio(self.clone(), def))
             .collect();
 
-        *self.tools.write().await = tools;
+        *self.tools.write().await = Arc::new(tools);
 
         debug!(
             count = self.tools.read().await.len(),
@@ -573,7 +573,7 @@ impl McpStdioClient {
     }
 
     /// Get all tools
-    pub async fn get_tools(&self) -> Vec<McpTool> {
+    pub async fn get_tools(&self) -> Arc<Vec<McpTool>> {
         self.tools.read().await.clone()
     }
 
@@ -690,7 +690,7 @@ impl McpTransport {
     }
 
     /// Get all tools from this transport
-    pub async fn get_tools(&self) -> Vec<McpTool> {
+    pub async fn get_tools(&self) -> Arc<Vec<McpTool>> {
         match self {
             McpTransport::Http(c) => c.get_tools().await,
             McpTransport::Stdio(c) => c.get_tools().await,
@@ -841,7 +841,7 @@ impl McpManager {
         let mut tools = Vec::new();
         for transport in self.servers.values() {
             if transport.is_connected().await {
-                tools.extend(transport.get_tools().await);
+                tools.extend(transport.get_tools().await.iter().cloned());
             }
         }
         tools
