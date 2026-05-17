@@ -288,7 +288,9 @@ impl TuiApp {
     }
 
     async fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
-        let mut modal = self.state.ui.modal.clone().unwrap();
+        let Some(mut modal) = self.state.ui.modal.clone() else {
+            return Ok(());
+        };
         match key.code {
             KeyCode::Esc => {
                 self.state.reduce(Action::CloseModal);

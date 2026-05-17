@@ -66,6 +66,14 @@ impl FormState {
             self.selected -= 1;
         }
     }
+
+    pub fn push_char(&mut self, ch: char) {
+        self.active_mut().value.push(ch);
+    }
+
+    pub fn backspace(&mut self) {
+        self.active_mut().value.pop();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,11 +154,11 @@ impl Modal {
     }
 
     pub fn push_char(&mut self, ch: char) {
-        self.form_mut().active_mut().value.push(ch);
+        self.form_mut().push_char(ch);
     }
 
     pub fn backspace(&mut self) {
-        self.form_mut().active_mut().value.pop();
+        self.form_mut().backspace();
     }
 
     pub fn next_field(&mut self) {
@@ -263,18 +271,45 @@ mod tests {
     }
 
     #[test]
-    fn test_modal_push_char() {
+    fn test_form_state_editing() {
+        let fields = vec![FormField::new("field1", "val1")];
+        let mut state = FormState::new("Title", "Help", fields);
+
+        // push_char
+        state.push_char('x');
+        assert_eq!(state.fields[0].value, "val1x");
+
+        // backspace
+        state.backspace();
+        assert_eq!(state.fields[0].value, "val1");
+
+        // backspace empty
+        state.fields[0].value.clear();
+        state.backspace();
+        assert_eq!(state.fields[0].value, "");
+
+        // Multi-byte
+        state.push_char('🦀');
+        assert_eq!(state.fields[0].value, "🦀");
+        state.backspace();
+        assert_eq!(state.fields[0].value, "");
+    }
+
+    #[test]
+    fn test_modal_editing() {
         let mut modal = Modal::create_skill();
-        assert_eq!(modal.form_mut().active_mut().label, "name");
-        assert_eq!(modal.form_mut().active_mut().value, "");
 
+        // Modal::push_char
         modal.push_char('a');
-        assert_eq!(modal.form_mut().active_mut().value, "a");
+        assert_eq!(modal.form().fields[0].value, "a");
 
+        // Modal::backspace
+        modal.backspace();
+        assert_eq!(modal.form().fields[0].value, "");
+
+        // Next field editing
+        modal.next_field();
         modal.push_char('b');
-        assert_eq!(modal.form_mut().active_mut().value, "ab");
-
-        modal.push_char('c');
-        assert_eq!(modal.form_mut().active_mut().value, "abc");
+        assert_eq!(modal.form().fields[1].value, "b");
     }
 }
