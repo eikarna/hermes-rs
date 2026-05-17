@@ -4,6 +4,7 @@
 //! Telegram, Discord, Slack, WhatsApp, and more.
 
 use async_trait::async_trait;
+use reqwest::header::HeaderValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -452,6 +453,13 @@ impl DiscordAdapter {
     }
 }
 
+fn sensitive_authorization_header(scheme: &str, token: &str) -> Result<HeaderValue> {
+    let mut value = HeaderValue::from_str(&format!("{} {}", scheme, token))
+        .map_err(|e| crate::error::Error::Agent(format!("Invalid auth header: {}", e)))?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 #[async_trait]
 impl PlatformAdapter for DiscordAdapter {
     fn name(&self) -> &str {
@@ -469,17 +477,18 @@ impl PlatformAdapter for DiscordAdapter {
 
         // Verify the token
         let client = reqwest::Client::new();
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::MissingConfig {
+                key: "discord_token".to_string(),
+            })?;
         let response = client
             .get(format!("{}/users/@me", self.api_url()))
-            .header("Authorization", {
-                let mut auth_val = reqwest::header::HeaderValue::from_str(&format!(
-                    "Bot {}",
-                    self.token.as_ref().unwrap()
-                ))
-                .map_err(|e| crate::error::Error::Agent(format!("Invalid auth header: {}", e)))?;
-                auth_val.set_sensitive(true);
-                auth_val
-            })
+            .header(
+                "Authorization",
+                sensitive_authorization_header("Bot", token)?,
+            )
             .send()
             .await?;
 
@@ -500,6 +509,12 @@ impl PlatformAdapter for DiscordAdapter {
 
     async fn send_message(&self, message: OutgoingMessage) -> Result<()> {
         let client = reqwest::Client::new();
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::MissingConfig {
+                key: "discord_token".to_string(),
+            })?;
 
         let body = serde_json::json!({
             "content": message.content,
@@ -513,15 +528,10 @@ impl PlatformAdapter for DiscordAdapter {
 
         client
             .post(&url)
-            .header("Authorization", {
-                let mut auth_val = reqwest::header::HeaderValue::from_str(&format!(
-                    "Bot {}",
-                    self.token.as_ref().unwrap()
-                ))
-                .map_err(|e| crate::error::Error::Agent(format!("Invalid auth header: {}", e)))?;
-                auth_val.set_sensitive(true);
-                auth_val
-            })
+            .header(
+                "Authorization",
+                sensitive_authorization_header("Bot", token)?,
+            )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -631,6 +641,12 @@ impl PlatformAdapter for SlackAdapter {
 
     async fn send_message(&self, message: OutgoingMessage) -> Result<()> {
         let client = reqwest::Client::new();
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::MissingConfig {
+                key: "slack_token".to_string(),
+            })?;
 
         let body = serde_json::json!({
             "channel": message.channel_id,
@@ -645,15 +661,10 @@ impl PlatformAdapter for SlackAdapter {
                     .slack_api_base
                     .trim_end_matches('/')
             ))
-            .header("Authorization", {
-                let mut auth_val = reqwest::header::HeaderValue::from_str(&format!(
-                    "Bearer {}",
-                    self.token.as_ref().unwrap()
-                ))
-                .map_err(|e| crate::error::Error::Agent(format!("Invalid auth header: {}", e)))?;
-                auth_val.set_sensitive(true);
-                auth_val
-            })
+            .header(
+                "Authorization",
+                sensitive_authorization_header("Bearer", token)?,
+            )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -744,6 +755,21 @@ mod tests {
         let config = GatewayConfig::default();
         assert!(!config.telegram_enabled);
         assert!(!config.discord_enabled);
+    }
+
+    #[test]
+    fn sensitive_authorization_header_marks_token_sensitive() {
+        let header = sensitive_authorization_header("Bot", "secret-token").unwrap();
+
+        assert_eq!(header.to_str().unwrap(), "Bot secret-token");
+        assert!(header.is_sensitive());
+    }
+
+    #[test]
+    fn sensitive_authorization_header_rejects_invalid_value() {
+        let result = sensitive_authorization_header("Bearer", "bad\n token");
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]
