@@ -473,7 +473,14 @@ impl PlatformAdapter for DiscordAdapter {
             .get(format!("{}/users/@me", self.api_url()))
             .header(
                 "Authorization",
-                format!("Bot {}", self.token.as_ref().unwrap()),
+                format!(
+                    "Bot {}",
+                    self.token
+                        .as_ref()
+                        .ok_or_else(|| crate::error::Error::MissingConfig {
+                            key: "discord_token".to_string()
+                        })?
+                ),
             )
             .send()
             .await?;
@@ -510,7 +517,14 @@ impl PlatformAdapter for DiscordAdapter {
             .post(&url)
             .header(
                 "Authorization",
-                format!("Bot {}", self.token.as_ref().unwrap()),
+                format!(
+                    "Bot {}",
+                    self.token
+                        .as_ref()
+                        .ok_or_else(|| crate::error::Error::MissingConfig {
+                            key: "discord_token".to_string()
+                        })?
+                ),
             )
             .header("Content-Type", "application/json")
             .json(&body)
@@ -637,7 +651,14 @@ impl PlatformAdapter for SlackAdapter {
             ))
             .header(
                 "Authorization",
-                format!("Bearer {}", self.token.as_ref().unwrap()),
+                format!(
+                    "Bearer {}",
+                    self.token
+                        .as_ref()
+                        .ok_or_else(|| crate::error::Error::MissingConfig {
+                            key: "slack_token".to_string()
+                        })?
+                ),
             )
             .header("Content-Type", "application/json")
             .json(&body)
