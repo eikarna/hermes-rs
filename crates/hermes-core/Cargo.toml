@@ -46,7 +46,14 @@ tokio-test = "0.4"
 mockito = "1.4"
 tracing-subscriber = { workspace = true }
 serial_test = "3.2"
-criterion = "0.5"
+
+[dev-dependencies.criterion]
+version = "0.5.1"
+features = ["async_tokio"]
+
+[[bench]]
+name = "patch_tool"
+harness = false
 
 [[bench]]
 name = "file_read"
