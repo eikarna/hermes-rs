@@ -110,8 +110,9 @@ impl HermesTool for FileWriteTool {
 
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+            let parent_exists = tokio::fs::try_exists(parent).await.unwrap_or(false);
+            if !parent_exists {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
                     return ToolResult::error(
                         "file_write",
                         format!("Failed to create directory: {}", e),
@@ -121,21 +122,26 @@ impl HermesTool for FileWriteTool {
         }
 
         let result = if args.append.unwrap_or(false) {
-            std::fs::OpenOptions::new()
+            let file_result = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(args.content.as_bytes())
-                })
+                .await;
+
+            match file_result {
+                Ok(mut f) => {
+                    use tokio::io::AsyncWriteExt;
+                    f.write_all(args.content.as_bytes()).await
+                }
+                Err(e) => Err(e),
+            }
         } else {
-            std::fs::write(&path, &args.content)
+            tokio::fs::write(&path, &args.content).await
         };
 
         match result {
             Ok(_) => {
-                let metadata = std::fs::metadata(&path).ok();
+                let metadata = tokio::fs::metadata(&path).await.ok();
                 ToolResult::success(
                     "file_write",
                     serde_json::json!({
