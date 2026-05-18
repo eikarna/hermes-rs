@@ -104,7 +104,27 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         ])
         .split(area);
 
-    let title = Paragraph::new(Text::from(vec![
+    let title = build_landing_title(state);
+    frame.render_widget(title, vertical[1]);
+
+    let prompt = build_landing_prompt(state, area.width);
+    let prompt_area = centered_rect_percent(area, 52, 40, 100, 8);
+    frame.render_widget(prompt, prompt_area);
+
+    let footer_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(vertical[4]);
+
+    let footer = build_landing_footer();
+    frame.render_widget(footer, footer_row[1]);
+
+    let status = build_landing_status(state);
+    frame.render_widget(status, footer_row[0]);
+}
+
+fn build_landing_title<'a>(state: &'a AppState) -> Paragraph<'a> {
+    Paragraph::new(Text::from(vec![
         Line::from(Span::styled(
             state.persistent.config.tui.landing_title.clone(),
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -115,9 +135,10 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         )),
     ]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Center);
-    frame.render_widget(title, vertical[1]);
+    .alignment(Alignment::Center)
+}
 
+fn build_landing_prompt<'a>(state: &'a AppState, area_width: u16) -> Paragraph<'a> {
     let prompt_block = Block::default()
         .borders(Borders::LEFT | Borders::BOTTOM)
         .border_style(Style::default().fg(ACCENT))
@@ -128,7 +149,7 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     } else {
         state.ui.prompt_input.clone()
     };
-    let prompt = Paragraph::new(Text::from(vec![
+    Paragraph::new(Text::from(vec![
         Line::from(Span::styled(
             prompt_text,
             Style::default()
@@ -151,22 +172,17 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             ),
             Span::raw(" · "),
             Span::styled(
-                truncate_display(&state.persistent.behavior.model, area.width as usize / 2),
+                truncate_display(&state.persistent.behavior.model, area_width as usize / 2),
                 Style::default().fg(TEXT),
             ),
         ]),
     ]))
     .block(prompt_block)
-    .wrap(Wrap { trim: true });
-    let prompt_area = centered_rect_percent(area, 52, 40, 100, 8);
-    frame.render_widget(prompt, prompt_area);
+    .wrap(Wrap { trim: true })
+}
 
-    let footer_row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(vertical[4]);
-
-    let footer = Paragraph::new(Text::from(vec![Line::from(vec![
+fn build_landing_footer<'a>() -> Paragraph<'a> {
+    Paragraph::new(Text::from(vec![Line::from(vec![
         Span::styled(
             "tab",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -184,18 +200,18 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         Span::styled(" run", Style::default().fg(HELP)),
     ])]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Right);
-    frame.render_widget(footer, footer_row[1]);
+    .alignment(Alignment::Right)
+}
 
-    let status = Paragraph::new(Line::from(vec![Span::styled(
+fn build_landing_status<'a>(state: &'a AppState) -> Paragraph<'a> {
+    Paragraph::new(Line::from(vec![Span::styled(
         status_summary(state),
         Style::default()
             .fg(status_color(state))
             .add_modifier(Modifier::BOLD),
     )]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Left);
-    frame.render_widget(status, footer_row[0]);
+    .alignment(Alignment::Left)
 }
 
 fn build_compact_title<'a>(state: &'a AppState) -> Paragraph<'a> {
