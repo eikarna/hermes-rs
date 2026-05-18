@@ -54,3 +54,7 @@ features = ["async_tokio"]
 [[bench]]
 name = "patch_tool"
 harness = false
+
+[[bench]]
+name = "file_read"
+harness = false
