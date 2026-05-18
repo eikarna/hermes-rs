@@ -195,83 +195,88 @@ impl HermesTool for FileSearchTool {
             }
         };
 
-        let mut results = Vec::new();
         let max_results = args.max_results.unwrap_or(100);
 
-        fn search_recursive(
-            dir: &PathBuf,
-            re: &regex::Regex,
-            results: &mut Vec<serde_json::Value>,
-            max_results: usize,
-        ) {
-            if results.len() >= max_results {
-                return;
-            }
+        let results = tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            if path.is_dir() {
+                let mut stack = vec![path.clone()];
 
-            let entries = match std::fs::read_dir(dir) {
-                Ok(e) => e,
-                Err(_) => return,
-            };
-
-            for entry in entries.flatten() {
-                if results.len() >= max_results {
-                    break;
-                }
-
-                let path = entry.path();
-
-                if path.is_dir() {
-                    // Skip hidden directories and common non-relevant dirs
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if !name.starts_with('.')
-                            && name != "node_modules"
-                            && name != "target"
-                            && name != "__pycache__"
-                        {
-                            search_recursive(&path, re, results, max_results);
-                        }
+                while let Some(current_dir) = stack.pop() {
+                    if results.len() >= max_results {
+                        break;
                     }
-                } else if path.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        for (line_num, line) in content.lines().enumerate() {
-                            if re.is_match(line) {
-                                results.push(serde_json::json!({
-                                    "file": path.to_string_lossy(),
-                                    "line": line_num + 1,
-                                    "content": line
-                                }));
 
-                                if results.len() >= max_results {
-                                    break;
+                    let entries = match std::fs::read_dir(&current_dir) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    for entry in entries.flatten() {
+                        if results.len() >= max_results {
+                            break;
+                        }
+
+                        let path = entry.path();
+
+                        if path.is_dir() {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if !name.starts_with('.')
+                                    && name != "node_modules"
+                                    && name != "target"
+                                    && name != "__pycache__"
+                                {
+                                    stack.push(path);
+                                }
+                            }
+                        } else if path.is_file() {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                for (line_num, line) in content.lines().enumerate() {
+                                    if re.is_match(line) {
+                                        results.push(serde_json::json!({
+                                            "file": path.to_string_lossy(),
+                                            "line": line_num + 1,
+                                            "content": line
+                                        }));
+
+                                        if results.len() >= max_results {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        }
+            } else if path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    for (line_num, line) in content.lines().enumerate() {
+                        if re.is_match(line) {
+                            results.push(serde_json::json!({
+                                "file": path.to_string_lossy(),
+                                "line": line_num + 1,
+                                "content": line
+                            }));
 
-        if path.is_dir() {
-            search_recursive(&path, &re, &mut results, max_results);
-        } else if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                for (line_num, line) in content.lines().enumerate() {
-                    if re.is_match(line) {
-                        results.push(serde_json::json!({
-                            "file": path.to_string_lossy(),
-                            "line": line_num + 1,
-                            "content": line
-                        }));
-
-                        if results.len() >= max_results {
-                            break;
+                            if results.len() >= max_results {
+                                break;
+                            }
                         }
                     }
                 }
+            } else {
+                // Return an error wrapped in a Result from the blocking task
+                return Err(format!("Path does not exist: {}", path.display()));
             }
-        } else {
-            return ToolResult::error("file_search", format!("Path does not exist: {}", args.path));
-        }
+            Ok(results)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("Task failed: {}", e)));
+
+        let results = match results {
+            Ok(res) => res,
+            Err(e) => return ToolResult::error("file_search", e),
+        };
 
         ToolResult::success(
             "file_search",
@@ -329,54 +334,54 @@ impl HermesTool for FileListTool {
             );
         }
 
-        let mut entries = Vec::new();
+        let recursive = args.recursive.unwrap_or(false);
+        let include_hidden = args.include_hidden.unwrap_or(false);
+        let path_clone = path.clone();
 
-        fn list_recursive(
-            dir: &PathBuf,
-            entries: &mut Vec<serde_json::Value>,
-            recursive: bool,
-            include_hidden: bool,
-        ) {
-            let read_dir = match std::fs::read_dir(dir) {
-                Ok(rd) => rd,
-                Err(_) => return,
-            };
+        let mut entries = tokio::task::spawn_blocking(move || {
+            let mut entries = Vec::new();
+            let mut stack = vec![path_clone];
 
-            for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
+            while let Some(current_dir) = stack.pop() {
+                let read_dir = match std::fs::read_dir(&current_dir) {
+                    Ok(rd) => rd,
+                    Err(_) => continue,
+                };
 
-                // Skip hidden files/dirs unless requested
-                if !include_hidden && name.starts_with('.') {
-                    continue;
-                }
+                for entry in read_dir.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
 
-                let path = entry.path();
-                let metadata = entry.metadata().ok();
+                    // Skip hidden files/dirs unless requested
+                    if !include_hidden && name.starts_with('.') {
+                        continue;
+                    }
 
-                let entry_json = serde_json::json!({
-                    "name": name,
-                    "path": path.to_string_lossy(),
-                    "is_dir": path.is_dir(),
-                    "size": metadata.as_ref().map(|m| m.len()).unwrap_or(0),
-                    "modified": metadata.as_ref()
-                        .and_then(|m| m.modified().ok())
-                        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
-                });
+                    let path = entry.path();
+                    let metadata = entry.metadata().ok();
 
-                entries.push(entry_json);
+                    let is_dir = path.is_dir();
 
-                if recursive && path.is_dir() {
-                    list_recursive(&path, entries, recursive, include_hidden);
+                    let entry_json = serde_json::json!({
+                        "name": name,
+                        "path": path.to_string_lossy(),
+                        "is_dir": is_dir,
+                        "size": metadata.as_ref().map(|m| m.len()).unwrap_or(0),
+                        "modified": metadata.as_ref()
+                            .and_then(|m| m.modified().ok())
+                            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                    });
+
+                    entries.push(entry_json);
+
+                    if recursive && is_dir {
+                        stack.push(path);
+                    }
                 }
             }
-        }
-
-        list_recursive(
-            &path,
-            &mut entries,
-            args.recursive.unwrap_or(false),
-            args.include_hidden.unwrap_or(false),
-        );
+            entries
+        })
+        .await
+        .unwrap_or_default();
 
         // Sort: directories first, then by name
         entries.sort_by(|a, b| {
