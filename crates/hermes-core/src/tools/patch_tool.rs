@@ -151,7 +151,7 @@ impl HermesTool for PatchTool {
             return ToolResult::error("patch", format!("Path is not a file: {}", args.path));
         }
 
-        let content = match std::fs::read_to_string(&path) {
+        let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => return ToolResult::error("patch", format!("Failed to read file: {}", e)),
         };
@@ -179,7 +179,7 @@ impl HermesTool for PatchTool {
         };
 
         // Write the patched content back
-        match std::fs::write(&path, &new_content) {
+        match tokio::fs::write(&path, &new_content).await {
             Ok(_) => {}
             Err(e) => {
                 return ToolResult::error("patch", format!("Failed to write file: {}", e));
