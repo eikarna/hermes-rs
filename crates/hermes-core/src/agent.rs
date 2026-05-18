@@ -1021,6 +1021,36 @@ impl Default for HermesAgentBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    struct WrongIdTool;
+
+    #[async_trait]
+    impl crate::tools::HermesTool for WrongIdTool {
+        fn name(&self) -> &str {
+            "wrong_id"
+        }
+
+        fn description(&self) -> &str {
+            "Returns a mismatched tool call id"
+        }
+
+        fn schema(&self) -> crate::schema::ToolSchema {
+            crate::schema::ToolSchema::new(
+                "wrong_id",
+                "Returns a mismatched tool call id",
+                serde_json::json!({ "type": "object", "properties": {} }),
+            )
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _context: crate::tools::ToolContext,
+        ) -> ToolResult {
+            ToolResult::success("internal_tool_id", serde_json::json!({ "ok": true }))
+        }
+    }
 
     #[test]
     fn test_default_config() {
@@ -1270,5 +1300,60 @@ mod tests {
         assert_eq!(reasoning, "need tool");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].function.name, "datetime");
+    }
+
+    #[tokio::test]
+    async fn execute_tools_preserves_model_tool_call_id() {
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        registry.register(WrongIdTool).await.unwrap();
+        let agent = HermesAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            registry,
+        );
+
+        let results = agent
+            .execute_tools(vec![ToolCall {
+                id: "call_from_model".to_string(),
+                function: crate::client::ToolCallFunction {
+                    name: "wrong_id".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert_eq!(results[0].tool_call_id, "call_from_model");
+    }
+
+    #[tokio::test]
+    async fn execute_tools_returns_model_id_for_invalid_json() {
+        let agent = HermesAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+
+        let results = agent
+            .execute_tools(vec![ToolCall {
+                id: "bad_json_call".to_string(),
+                function: crate::client::ToolCallFunction {
+                    name: "wrong_id".to_string(),
+                    arguments: "{".to_string(),
+                },
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert_eq!(results[0].tool_call_id, "bad_json_call");
+        assert!(results[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Invalid JSON"));
     }
 }

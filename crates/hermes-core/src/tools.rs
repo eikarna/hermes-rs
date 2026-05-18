@@ -283,10 +283,11 @@ impl ToolRegistry {
                 let name = tool_name.to_string();
                 let id = tool_call_id.to_string();
                 debug!(tool = %name, args = ?args, "Executing tool");
-                let result = self
+                let mut result = self
                     .executor
-                    .execute_with_timeout(tool, name, id, args, context)
+                    .execute_with_timeout(tool, name, id.clone(), args, context)
                     .await;
+                result.tool_call_id = id;
                 Ok(result)
             }
             None => {
@@ -434,7 +435,46 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
+        assert_eq!(result.tool_call_id, "call_1");
         assert!(result.content.contains("Processed:"));
+    }
+
+    #[tokio::test]
+    async fn tool_execution_uses_requested_tool_call_id() {
+        let registry = ToolRegistry::new(Duration::from_secs(5));
+        registry.register(TestTool).await.unwrap();
+
+        let result = registry
+            .execute(
+                "test_tool",
+                "model_call_123",
+                serde_json::json!({ "query": "test query" }),
+                ToolContext::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.tool_call_id, "model_call_123");
+    }
+
+    #[tokio::test]
+    async fn failed_tool_execution_uses_requested_tool_call_id() {
+        let registry = ToolRegistry::new(Duration::from_secs(5));
+        registry.register(TestTool).await.unwrap();
+
+        let result = registry
+            .execute(
+                "test_tool",
+                "model_call_error",
+                serde_json::json!({}),
+                ToolContext::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.tool_call_id, "model_call_error");
     }
 
     #[tokio::test]
