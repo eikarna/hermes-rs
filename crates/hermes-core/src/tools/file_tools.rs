@@ -201,48 +201,46 @@ impl HermesTool for FileSearchTool {
             }
         };
 
-        let mut results = Vec::new();
         let max_results = args.max_results.unwrap_or(100);
 
-        fn search_recursive(
-            dir: &PathBuf,
-            re: &regex::Regex,
-            results: &mut Vec<serde_json::Value>,
-            max_results: usize,
-        ) {
-            if results.len() >= max_results {
-                return;
-            }
+        if !path.exists() {
+            return ToolResult::error("file_search", format!("Path does not exist: {}", args.path));
+        }
 
-            let entries = match std::fs::read_dir(dir) {
-                Ok(e) => e,
-                Err(_) => return,
-            };
+        let results = tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            let mut stack = vec![path];
 
-            for entry in entries.flatten() {
+            while let Some(current_path) = stack.pop() {
                 if results.len() >= max_results {
                     break;
                 }
 
-                let path = entry.path();
-
-                if path.is_dir() {
-                    // Skip hidden directories and common non-relevant dirs
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if !name.starts_with('.')
-                            && name != "node_modules"
-                            && name != "target"
-                            && name != "__pycache__"
-                        {
-                            search_recursive(&path, re, results, max_results);
+                if current_path.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&current_path) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                    if !name.starts_with('.')
+                                        && name != "node_modules"
+                                        && name != "target"
+                                        && name != "__pycache__"
+                                    {
+                                        stack.push(path);
+                                    }
+                                }
+                            } else if path.is_file() {
+                                stack.push(path);
+                            }
                         }
                     }
-                } else if path.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
+                } else if current_path.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(&current_path) {
                         for (line_num, line) in content.lines().enumerate() {
                             if re.is_match(line) {
                                 results.push(serde_json::json!({
-                                    "file": path.to_string_lossy(),
+                                    "file": current_path.to_string_lossy(),
                                     "line": line_num + 1,
                                     "content": line
                                 }));
@@ -255,29 +253,10 @@ impl HermesTool for FileSearchTool {
                     }
                 }
             }
-        }
-
-        if path.is_dir() {
-            search_recursive(&path, &re, &mut results, max_results);
-        } else if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                for (line_num, line) in content.lines().enumerate() {
-                    if re.is_match(line) {
-                        results.push(serde_json::json!({
-                            "file": path.to_string_lossy(),
-                            "line": line_num + 1,
-                            "content": line
-                        }));
-
-                        if results.len() >= max_results {
-                            break;
-                        }
-                    }
-                }
-            }
-        } else {
-            return ToolResult::error("file_search", format!("Path does not exist: {}", args.path));
-        }
+            results
+        })
+        .await
+        .unwrap_or_default();
 
         ToolResult::success(
             "file_search",
