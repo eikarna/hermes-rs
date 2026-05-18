@@ -5,60 +5,15 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::tui::layout::{
+    build_compact_layout, build_constrained_layout, build_desktop_layout,
+    build_landing_compact_layout, build_landing_constrained_layout, build_medium_layout,
+    centered_rect_percent, is_constrained, DESKTOP_HEIGHT, DESKTOP_WIDTH,
+};
 use crate::tui::state::{
     ActivePanel, AppState, InputMode, LayoutMode, McpServerItem, SkillItem, Tone, TranscriptEntry,
 };
-
-const BG: Color = Color::Black;
-const PANEL: Color = Color::Rgb(26, 24, 22);
-const PANEL_ALT: Color = Color::Rgb(18, 17, 15);
-const ACCENT: Color = Color::Rgb(232, 165, 54);
-const TEXT: Color = Color::Rgb(230, 228, 222);
-const MUTED: Color = Color::Rgb(134, 132, 126);
-const HELP: Color = Color::Rgb(188, 184, 176);
-const SUCCESS: Color = Color::Rgb(115, 185, 115);
-const ERROR: Color = Color::Rgb(220, 98, 87);
-const WARN: Color = Color::Rgb(208, 170, 82);
-const CONSTRAINED_WIDTH: u16 = 65;
-const CONSTRAINED_HEIGHT: u16 = 20;
-const DESKTOP_WIDTH: u16 = 120;
-const DESKTOP_HEIGHT: u16 = 24;
-
-#[derive(Clone, Copy)]
-struct DesktopWorkspaceLayout {
-    header: Rect,
-    conversation: Rect,
-    panel: Rect,
-    reasoning: Rect,
-    activity: Rect,
-    footer: Rect,
-}
-
-#[derive(Clone, Copy)]
-struct MediumWorkspaceLayout {
-    header: Rect,
-    conversation: Rect,
-    tabs: Rect,
-    panel: Rect,
-    reasoning: Rect,
-    footer: Rect,
-}
-
-#[derive(Clone, Copy)]
-struct CompactWorkspaceLayout {
-    header: Rect,
-    tabs: Rect,
-    content: Rect,
-    footer: Rect,
-}
-
-#[derive(Clone, Copy)]
-struct ConstrainedWorkspaceLayout {
-    header: Rect,
-    content: Rect,
-    footer: Rect,
-    popup: Rect,
-}
+use crate::tui::theme::{ACCENT, BG, ERROR, HELP, MUTED, PANEL, PANEL_ALT, SUCCESS, TEXT, WARN};
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
@@ -314,43 +269,16 @@ fn build_compact_status<'a>(state: &'a AppState) -> Paragraph<'a> {
 
 fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let is_portrait_like = area.width < 56;
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if is_portrait_like {
-            [
-                Constraint::Max(4),
-                Constraint::Min(7),
-                Constraint::Max(4),
-                Constraint::Min(1),
-                Constraint::Max(2),
-            ]
-        } else {
-            [
-                Constraint::Max(4),
-                Constraint::Min(7),
-                Constraint::Max(3),
-                Constraint::Min(1),
-                Constraint::Max(2),
-            ]
-        })
-        .split(area);
+    let layout = build_landing_compact_layout(area, is_portrait_like);
 
-    frame.render_widget(build_compact_title(state), outer[0]);
-    frame.render_widget(build_compact_prompt(state, area.width), outer[1]);
-    frame.render_widget(build_compact_controls(is_portrait_like), outer[2]);
-    frame.render_widget(build_compact_status(state), outer[4]);
+    frame.render_widget(build_compact_title(state), layout.title);
+    frame.render_widget(build_compact_prompt(state, area.width), layout.prompt);
+    frame.render_widget(build_compact_controls(is_portrait_like), layout.controls);
+    frame.render_widget(build_compact_status(state), layout.status);
 }
 
 fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Max(2),
-            Constraint::Min(4),
-            Constraint::Max(2),
-            Constraint::Max(1),
-        ])
-        .split(area);
+    let layout = build_landing_constrained_layout(area);
 
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -365,7 +293,7 @@ fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rec
     .style(Style::default().bg(BG))
     .alignment(Alignment::Left)
     .wrap(Wrap { trim: true });
-    frame.render_widget(title, outer[0]);
+    frame.render_widget(title, layout.title);
 
     let prompt_text = if state.ui.prompt_input.is_empty() {
         state.persistent.config.tui.prompt_placeholder.clone()
@@ -404,7 +332,7 @@ fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rec
     ]))
     .block(panel_block("Prompt"))
     .wrap(Wrap { trim: true });
-    frame.render_widget(prompt, outer[1]);
+    frame.render_widget(prompt, layout.prompt);
 
     let help = Paragraph::new(Text::from(vec![Line::from(vec![
         keycap("q"),
@@ -418,7 +346,7 @@ fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rec
     ])]))
     .style(Style::default().bg(BG))
     .wrap(Wrap { trim: true });
-    frame.render_widget(help, outer[2]);
+    frame.render_widget(help, layout.help);
 
     let status = Paragraph::new(Line::from(Span::styled(
         status_summary(state),
@@ -428,7 +356,7 @@ fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rec
     )))
     .style(Style::default().bg(BG))
     .wrap(Wrap { trim: true });
-    frame.render_widget(status, outer[3]);
+    frame.render_widget(status, layout.status);
 }
 
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
@@ -489,10 +417,6 @@ fn render_workspace_constrained(frame: &mut Frame<'_>, state: &AppState, area: R
     frame.render_widget(constrained_footer_widget(state, area.width), layout.footer);
 }
 
-fn is_constrained(area: Rect) -> bool {
-    area.width < CONSTRAINED_WIDTH || area.height < CONSTRAINED_HEIGHT
-}
-
 fn responsive_workspace_mode(mode: LayoutMode, area: Rect) -> LayoutMode {
     if area.height < DESKTOP_HEIGHT {
         return LayoutMode::Compact;
@@ -501,94 +425,6 @@ fn responsive_workspace_mode(mode: LayoutMode, area: Rect) -> LayoutMode {
         return LayoutMode::Medium;
     }
     mode
-}
-
-fn build_desktop_layout(area: Rect) -> DesktopWorkspaceLayout {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(8),
-            Constraint::Length(4),
-        ])
-        .split(area);
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(outer[1]);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(42),
-            Constraint::Percentage(33),
-            Constraint::Percentage(25),
-        ])
-        .split(body[1]);
-
-    DesktopWorkspaceLayout {
-        header: outer[0],
-        conversation: body[0],
-        panel: right[0],
-        reasoning: right[1],
-        activity: right[2],
-        footer: outer[2],
-    }
-}
-
-fn build_medium_layout(area: Rect) -> MediumWorkspaceLayout {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Ratio(1, 2),
-            Constraint::Length(3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 6),
-            Constraint::Length(4),
-        ])
-        .split(area);
-
-    MediumWorkspaceLayout {
-        header: outer[0],
-        conversation: outer[1],
-        tabs: outer[2],
-        panel: outer[3],
-        reasoning: outer[4],
-        footer: outer[5],
-    }
-}
-
-fn build_compact_layout(area: Rect) -> CompactWorkspaceLayout {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Length(3),
-            Constraint::Min(6),
-            Constraint::Length(4),
-        ])
-        .split(area);
-
-    CompactWorkspaceLayout {
-        header: outer[0],
-        tabs: outer[1],
-        content: outer[2],
-        footer: outer[3],
-    }
-}
-
-fn build_constrained_layout(area: Rect) -> ConstrainedWorkspaceLayout {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Max(1), Constraint::Min(3), Constraint::Max(2)])
-        .split(area);
-
-    ConstrainedWorkspaceLayout {
-        header: outer[0],
-        content: outer[1],
-        footer: outer[2],
-        popup: centered_rect_percent(outer[1], 92, 88, 80, 16),
-    }
 }
 
 fn header_widget(state: &AppState) -> Paragraph<'_> {
@@ -1663,40 +1499,6 @@ fn render_table_row(line: &str, header: bool) -> Line<'static> {
     }
 
     Line::from(spans)
-}
-
-fn centered_rect_percent(
-    area: Rect,
-    width_percent: u16,
-    height_percent: u16,
-    max_width: u16,
-    max_height: u16,
-) -> Rect {
-    if area.width == 0 || area.height == 0 {
-        return area;
-    }
-
-    let width = area
-        .width
-        .saturating_mul(width_percent.min(100))
-        .saturating_div(100)
-        .min(max_width)
-        .max(1)
-        .min(area.width.max(1));
-    let height = area
-        .height
-        .saturating_mul(height_percent.min(100))
-        .saturating_div(100)
-        .min(max_height)
-        .max(1)
-        .min(area.height.max(1));
-
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    }
 }
 
 fn truncate_text(text: &str, max: usize) -> String {
