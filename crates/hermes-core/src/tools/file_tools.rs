@@ -52,7 +52,7 @@ impl HermesTool for FileReadTool {
             return ToolResult::error("file_read", format!("Path is not a file: {}", args.path));
         }
 
-        match std::fs::read_to_string(&path) {
+        match tokio::fs::read_to_string(&path).await {
             Ok(content) => {
                 let offset = args.offset.unwrap_or(0);
                 let limit = args.limit.unwrap_or(usize::MAX);
