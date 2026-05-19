@@ -26,6 +26,7 @@ pub struct AppConfig {
 pub struct ClientSettings {
     pub base_url: String,
     pub api_key: Option<String>,
+    pub auth_ref: Option<String>,
     pub timeout_secs: u64,
     pub max_context_length: usize,
 }
@@ -35,6 +36,7 @@ impl Default for ClientSettings {
         Self {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: None,
+            auth_ref: None,
             timeout_secs: 60,
             max_context_length: 128_000,
         }
@@ -456,6 +458,7 @@ impl AppConfig {
     pub fn apply_env_overrides(&mut self) -> Result<()> {
         apply_string_option_override("OPENAI_API_KEY", &mut self.client.api_key)?;
         apply_string_value_override("OPENAI_BASE_URL", &mut self.client.base_url);
+        apply_string_option_override("HERMES_AUTH_REF", &mut self.client.auth_ref)?;
         apply_string_value_override("HERMES_MODEL", &mut self.agent.model);
         apply_usize_override("HERMES_MAX_ITERATIONS", &mut self.agent.max_iterations)?;
         apply_u64_override("HERMES_TOOL_TIMEOUT", &mut self.agent.tool_timeout_secs)?;

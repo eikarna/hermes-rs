@@ -40,6 +40,7 @@
 //! ```
 
 pub mod agent;
+pub mod auth;
 pub mod client;
 pub mod config;
 pub mod context;
@@ -57,6 +58,7 @@ pub mod tools;
 pub mod trajectory;
 
 pub use agent::{AgentConfig, AgentEvent, HermesAgent};
+pub use auth::{default_auth_store_path, AuthMethod, AuthProfile, AuthStore};
 pub use client::{Message, OpenAIClient};
 pub use config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,

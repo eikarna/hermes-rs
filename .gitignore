@@ -25,3 +25,8 @@ hermes-agent
 
 # kilo code user data
 .kilo
+
+# Hermes runtime/local memory files
+autonomous-status.toml
+MEMORY.md
+USER.md

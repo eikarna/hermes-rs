@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use hermes_core::agent::{AgentConfig, AgentEvent, HermesAgent};
+use hermes_core::auth::{default_auth_store_path, AuthStore};
 use hermes_core::client::{ClientConfig, OpenAIClient};
 use hermes_core::config::{
     install_runtime_config, load_app_config, AppConfig, BehaviorSettings, LoggingSettings,
@@ -115,6 +116,32 @@ enum Commands {
 
         #[arg(short, long)]
         args: Option<String>,
+    },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommands {
+    SetApiKey {
+        #[arg()]
+        provider: String,
+
+        #[arg(long)]
+        name: Option<String>,
+
+        #[arg(long = "env")]
+        env_var: Option<String>,
+
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    List,
+    Logout {
+        #[arg()]
+        name: String,
     },
 }
 
@@ -223,8 +250,44 @@ fn apply_cli_overrides(cli: &Cli, config: &mut AppConfig) {
     }
 }
 
-fn client_config(config: &AppConfig) -> ClientConfig {
-    ClientConfig::from(&config.client)
+fn client_config(config: &AppConfig) -> Result<ClientConfig> {
+    let client = ClientConfig::from(&config.client);
+    if let Some(auth_ref) = config.client.auth_ref.as_deref() {
+        let store = AuthStore::load_default()?;
+        return apply_auth_profile_to_client(client, &store, auth_ref);
+    }
+    Ok(client)
+}
+
+fn apply_auth_profile_to_client(
+    mut client: ClientConfig,
+    store: &AuthStore,
+    auth_ref: &str,
+) -> Result<ClientConfig> {
+    let profile = store.profiles.get(auth_ref).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Missing required configuration: auth profile '{}'",
+            auth_ref
+        )
+    })?;
+    if client.api_key.is_none() {
+        client.api_key = Some(store.resolve_api_key(auth_ref)?);
+    }
+    let trusted_base_url = profile
+        .base_url
+        .clone()
+        .unwrap_or_else(|| hermes_core::config::ClientSettings::default().base_url);
+    let default_base_url = hermes_core::config::ClientSettings::default().base_url;
+    if client.base_url != default_base_url && client.base_url != trusted_base_url {
+        anyhow::bail!(
+            "Auth profile '{}' is bound to '{}'; refusing to send credentials to '{}'",
+            auth_ref,
+            trusted_base_url,
+            client.base_url
+        );
+    }
+    client.base_url = trusted_base_url;
+    Ok(client)
 }
 
 fn agent_config(
@@ -302,7 +365,7 @@ pub(crate) async fn create_runtime_agent(
     event_tx: mpsc::Sender<AgentEvent>,
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
-    let client = OpenAIClient::new(client_config(config));
+    let client = OpenAIClient::new(client_config(config)?);
     let registry = build_registry(config, mcp_manager, &client, &behavior.model).await?;
     let agent_config = agent_config(config, behavior, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
@@ -317,7 +380,7 @@ async fn create_agent_without_events(
     system_prompt: Option<&str>,
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
-    let client = OpenAIClient::new(client_config(config));
+    let client = OpenAIClient::new(client_config(config)?);
     let registry = build_registry(config, mcp_manager, &client, &config.agent.model).await?;
     let agent_config = agent_config(config, &config.agent, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
@@ -380,7 +443,7 @@ async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result
 
 async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let client = OpenAIClient::new(client_config(config));
+    let client = OpenAIClient::new(client_config(config)?);
     let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let tools = registry.get_schemas().await;
 
@@ -396,7 +459,7 @@ async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
 
 async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let client = OpenAIClient::new(client_config(config));
+    let client = OpenAIClient::new(client_config(config)?);
     let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let parsed_args: Value = if let Some(args) = args {
         serde_json::from_str(args).context("Failed to parse tool arguments as JSON")?
@@ -420,6 +483,88 @@ async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> R
     }
 
     Ok(())
+}
+
+fn handle_auth_command(command: &AuthCommands) -> Result<()> {
+    match command {
+        AuthCommands::SetApiKey {
+            provider,
+            name,
+            env_var,
+            base_url,
+        } => {
+            let profile_name = name
+                .clone()
+                .unwrap_or_else(|| format!("{}-default", provider));
+            let env_var = env_var
+                .clone()
+                .unwrap_or_else(|| default_api_key_env_var(provider));
+            let mut store = AuthStore::load_default()?;
+            store.upsert_api_key_env_profile(
+                profile_name.clone(),
+                provider.clone(),
+                env_var.clone(),
+                base_url.clone(),
+            )?;
+            store.save_default()?;
+            println!(
+                "Saved auth profile '{}' for provider '{}' using env:{}",
+                profile_name, provider, env_var
+            );
+            println!("Auth metadata: {}", default_auth_store_path().display());
+        }
+        AuthCommands::List => {
+            let store = AuthStore::load_default()?;
+            if store.profiles.is_empty() {
+                println!("No auth profiles configured.");
+                return Ok(());
+            }
+            for (name, profile) in store.profiles {
+                let secret_ref = profile
+                    .resolved_env_var()
+                    .map(|env_var| display_auth_field(&format!("env:{}", env_var)))
+                    .unwrap_or_else(|| "unsupported".to_string());
+                let base_url = profile
+                    .base_url
+                    .as_deref()
+                    .map(display_auth_field)
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{}\tprovider={}\tmethod={:?}\tsecret={}\tbase_url={}",
+                    display_auth_field(&name),
+                    display_auth_field(&profile.provider),
+                    profile.method,
+                    secret_ref,
+                    base_url
+                );
+            }
+        }
+        AuthCommands::Logout { name } => {
+            let mut store = AuthStore::load_default()?;
+            if !store.remove_profile(name) {
+                anyhow::bail!("Auth profile '{}' was not found", name);
+            }
+            store.save_default()?;
+            println!("Removed auth profile '{}'", name);
+        }
+    }
+
+    Ok(())
+}
+
+fn default_api_key_env_var(provider: &str) -> String {
+    match provider.to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => "ANTHROPIC_API_KEY".to_string(),
+        "google" | "gemini" | "google-gemini" => "GOOGLE_API_KEY".to_string(),
+        _ => "OPENAI_API_KEY".to_string(),
+    }
+}
+
+fn display_auth_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect()
 }
 
 struct EchoTool;
@@ -607,6 +752,9 @@ async fn main() -> Result<()> {
         Commands::Test { tool_name, args } => {
             test_tool(&loaded.config, tool_name, args.as_deref()).await?;
         }
+        Commands::Auth { command } => {
+            handle_auth_command(command)?;
+        }
     }
 
     Ok(())
@@ -668,5 +816,93 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn auth_set_api_key_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "hermes",
+            "auth",
+            "set-api-key",
+            "openai",
+            "--name",
+            "openai-default",
+            "--env",
+            "OPENAI_API_KEY",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                command: AuthCommands::SetApiKey { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn default_api_key_env_var_prefers_known_providers() {
+        assert_eq!(default_api_key_env_var("openai"), "OPENAI_API_KEY");
+        assert_eq!(default_api_key_env_var("claude"), "ANTHROPIC_API_KEY");
+        assert_eq!(default_api_key_env_var("gemini"), "GOOGLE_API_KEY");
+    }
+
+    #[test]
+    fn configured_api_key_takes_precedence_over_auth_profile() {
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile("openai-default", "openai", "MISSING_ENV_VAR", None)
+            .unwrap();
+        let client = ClientConfig {
+            api_key: Some("configured-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let resolved = apply_auth_profile_to_client(client, &store, "openai-default").unwrap();
+
+        assert_eq!(resolved.api_key.as_deref(), Some("configured-key"));
+    }
+
+    #[test]
+    fn auth_profile_base_url_applies_when_default_base_url_is_unset() {
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile(
+                "local-default",
+                "local",
+                "MISSING_ENV_VAR",
+                Some("http://127.0.0.1:11434/v1".to_string()),
+            )
+            .unwrap();
+        let client = ClientConfig {
+            api_key: Some("configured-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let resolved = apply_auth_profile_to_client(client, &store, "local-default").unwrap();
+
+        assert_eq!(resolved.base_url, "http://127.0.0.1:11434/v1");
+    }
+
+    #[test]
+    fn auth_profile_rejects_untrusted_base_url_override() {
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile("openai-default", "openai", "OPENAI_API_KEY", None)
+            .unwrap();
+        let client = ClientConfig {
+            base_url: "https://attacker.example/v1".to_string(),
+            api_key: Some("configured-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let result = apply_auth_profile_to_client(client, &store, "openai-default");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn auth_list_fields_escape_control_characters() {
+        assert_eq!(display_auth_field("good\nspoof"), "good?spoof");
     }
 }

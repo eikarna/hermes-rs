@@ -4,6 +4,7 @@
 //! Supports Server-Sent Events for streaming responses.
 //! Supports reasoning_content for extended-thinking models.
 
+use std::env;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, instrument};
 
+use crate::auth::AuthStore;
 use crate::config::{runtime_config, ClientSettings};
 use crate::error::{Error, Result};
 use crate::schema::ToolSchema;
@@ -92,18 +94,45 @@ impl OpenAIClient {
     /// Create from environment variables
     pub fn from_env() -> Result<Self> {
         let base = runtime_config();
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty());
+        let api_key = env_var_non_empty("OPENAI_API_KEY");
 
-        let base_url = std::env::var("OPENAI_BASE_URL").unwrap_or(base.client.base_url);
+        let base_url = env_var_non_empty("OPENAI_BASE_URL").unwrap_or(base.client.base_url);
 
-        Ok(Self::new(ClientConfig {
+        let mut config = ClientConfig {
             base_url,
             api_key: api_key.or(base.client.api_key),
             timeout: Duration::from_secs(base.client.timeout_secs),
             max_context_length: base.client.max_context_length,
-        }))
+        };
+
+        let auth_ref = env_var_non_empty("HERMES_AUTH_REF").or(base.client.auth_ref);
+
+        if let Some(auth_ref) = auth_ref.as_deref() {
+            let store = AuthStore::load_default()?;
+            let profile = store
+                .profiles
+                .get(auth_ref)
+                .ok_or_else(|| Error::MissingConfig {
+                    key: format!("auth profile '{}'", auth_ref),
+                })?;
+            if config.api_key.is_none() {
+                config.api_key = Some(store.resolve_api_key(auth_ref)?);
+            }
+            let trusted_base_url = profile
+                .base_url
+                .clone()
+                .unwrap_or_else(|| ClientSettings::default().base_url);
+            let default_base_url = ClientSettings::default().base_url;
+            if config.base_url != default_base_url && config.base_url != trusted_base_url {
+                return Err(Error::Config(format!(
+                    "Auth profile '{}' is bound to '{}'; refusing to send credentials to '{}'",
+                    auth_ref, trusted_base_url, config.base_url
+                )));
+            }
+            config.base_url = trusted_base_url;
+        }
+
+        Ok(Self::new(config))
     }
 
     /// Build authorization headers
@@ -540,6 +569,13 @@ impl Stream for ChatStreamResponse {
     }
 }
 
+fn env_var_non_empty(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn try_parse_next_sse_event(buffer: &mut String, allow_partial: bool) -> Option<ChatStreamEvent> {
     normalize_sse_buffer(buffer);
 
@@ -634,6 +670,8 @@ impl MessageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthStore;
+    use serial_test::serial;
 
     #[test]
     fn test_message_to_value() {
@@ -690,9 +728,100 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_client_from_env() {
         // This will succeed even without env vars (uses defaults)
         let client = OpenAIClient::from_env();
         assert!(client.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_resolves_auth_ref_profile() {
+        let home =
+            std::env::temp_dir().join(format!("hermes_client_auth_ref_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let old_home = std::env::var("HERMES_HOME").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_api_key = std::env::var("HERMES_TEST_CLIENT_API_KEY").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let old_base_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        std::env::set_var("HERMES_HOME", &home);
+        std::env::set_var("HERMES_AUTH_REF", "test-default");
+        std::env::set_var("HERMES_TEST_CLIENT_API_KEY", "profile-key");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_BASE_URL");
+
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile(
+                "test-default",
+                "openai",
+                "HERMES_TEST_CLIENT_API_KEY",
+                Some("http://127.0.0.1:11434/v1".to_string()),
+            )
+            .unwrap();
+        store.save_default().unwrap();
+
+        let client = OpenAIClient::from_env().unwrap();
+        let config = client.config_clone();
+        assert_eq!(config.api_key.as_deref(), Some("profile-key"));
+        assert_eq!(config.base_url, "http://127.0.0.1:11434/v1");
+
+        restore_env("HERMES_HOME", old_home);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("HERMES_TEST_CLIENT_API_KEY", old_api_key);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        restore_env("OPENAI_BASE_URL", old_base_url);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_rejects_untrusted_auth_profile_base_url_override() {
+        let home =
+            std::env::temp_dir().join(format!("hermes_client_auth_exfil_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let old_home = std::env::var("HERMES_HOME").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_api_key = std::env::var("HERMES_TEST_CLIENT_API_KEY").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let old_base_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        std::env::set_var("HERMES_HOME", &home);
+        std::env::set_var("HERMES_AUTH_REF", "test-default");
+        std::env::set_var("HERMES_TEST_CLIENT_API_KEY", "profile-key");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_BASE_URL", "https://attacker.example/v1");
+
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile(
+                "test-default",
+                "openai",
+                "HERMES_TEST_CLIENT_API_KEY",
+                None,
+            )
+            .unwrap();
+        store.save_default().unwrap();
+
+        let result = OpenAIClient::from_env();
+        assert!(result.is_err());
+
+        restore_env("HERMES_HOME", old_home);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("HERMES_TEST_CLIENT_API_KEY", old_api_key);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        restore_env("OPENAI_BASE_URL", old_base_url);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn restore_env(key: &str, value: Option<String>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
     }
 }

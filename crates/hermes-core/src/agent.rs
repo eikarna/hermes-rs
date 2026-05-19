@@ -994,10 +994,10 @@ impl HermesAgentBuilder {
 
     /// Build the agent
     pub fn build(self) -> Result<HermesAgent> {
-        let client = self.client.unwrap_or_else(|| {
-            OpenAIClient::from_env()
-                .unwrap_or_else(|_| OpenAIClient::new(crate::client::ClientConfig::default()))
-        });
+        let client = match self.client {
+            Some(client) => client,
+            None => OpenAIClient::from_env()?,
+        };
 
         let registry = self
             .registry
@@ -1022,6 +1022,7 @@ impl Default for HermesAgentBuilder {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use serial_test::serial;
 
     struct WrongIdTool;
 
@@ -1060,6 +1061,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_agent_builder() {
         let _agent = HermesAgentBuilder::new()
             .model("gpt-3.5-turbo")
@@ -1068,6 +1070,38 @@ mod tests {
             .unwrap();
 
         // If we reach here, the agent was created successfully
+    }
+
+    #[test]
+    #[serial]
+    fn agent_builder_propagates_auth_profile_errors() {
+        let home =
+            std::env::temp_dir().join(format!("hermes_agent_auth_error_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let old_home = std::env::var("HERMES_HOME").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_api_key = std::env::var("OPENAI_API_KEY").ok();
+
+        std::env::set_var("HERMES_HOME", &home);
+        std::env::set_var("HERMES_AUTH_REF", "missing-profile");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let result = HermesAgentBuilder::new().build();
+
+        assert!(result.is_err());
+
+        restore_env("HERMES_HOME", old_home);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("OPENAI_API_KEY", old_api_key);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn restore_env(key: &str, value: Option<String>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
     }
 
     #[tokio::test]

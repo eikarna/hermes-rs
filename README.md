@@ -62,6 +62,9 @@ hermes tools
 
 # Test a specific tool
 hermes test echo --args '{"message": "Hello, World!"}'
+
+# Create a local auth profile that references an environment variable
+hermes auth set-api-key openai --env OPENAI_API_KEY
 ```
 
 ## Screenshots
@@ -98,6 +101,7 @@ Configuration is TOML, not YAML. Example:
 base_url = "https://api.openai.com/v1"
 timeout_secs = 60
 # api_key = "set me or use OPENAI_API_KEY"
+# auth_ref = "openai-default"
 
 [agent]
 model = "gpt-4"
@@ -131,6 +135,21 @@ export HERMES_MODEL=gpt-4
 ```
 
 See [hermes.example.toml](hermes.example.toml) for the full schema, including MCP, Skills, gateway, and tool/runtime defaults.
+
+## Authentication profiles
+
+Hermes supports local auth metadata profiles without storing API keys in the project config. Create one with:
+
+```bash
+hermes auth set-api-key openai --env OPENAI_API_KEY
+hermes auth list
+```
+
+Then point `[client].auth_ref` at the profile name, for example `openai-default`. The profile stores only metadata and an environment-variable reference such as `env:OPENAI_API_KEY`; the actual secret remains in your environment or external secret manager.
+
+When `auth_ref` is active, Hermes binds the credential to the profile endpoint. Use `hermes auth set-api-key <provider> --base-url <url>` for non-default OpenAI-compatible endpoints instead of setting a repo-local `[client].base_url` that could redirect credentials.
+
+OAuth browser login is intentionally not enabled until provider-specific secure token storage and documented OAuth flows are implemented. See [OAUTH_DESIGN.md](OAUTH_DESIGN.md) for the phased plan.
 
 ## Workspace Context
 
