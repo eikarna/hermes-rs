@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use hermes_core::agent::{AgentConfig, AgentEvent, HermesAgent};
-use hermes_core::auth::{default_auth_store_path, AuthMethod, AuthProfile, AuthStore};
+use hermes_core::auth::{default_auth_store_path, AuthMethod, AuthStore};
 use hermes_core::client::{ClientConfig, OpenAIClient};
 use hermes_core::config::{
     install_runtime_config, load_app_config, AppConfig, BehaviorSettings, LoggingSettings,
@@ -821,6 +821,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hermes_core::auth::AuthProfile;
 
     #[test]
     fn rich_tui_without_log_file_uses_sink() {

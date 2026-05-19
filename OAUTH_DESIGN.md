@@ -154,6 +154,15 @@ Implemented Phase 2a:
 - Add no-browser flow only for providers with a documented device-code or external-tool path.
 - Tests: state validation, callback parsing, token exchange mock server, cleanup of local listener.
 
+Implemented Phase 3a:
+
+- Added provider-neutral PKCE/state helpers.
+- Authorization URLs require `http://127.0.0.1:<port>/...` loopback redirects.
+- Callback parsing accepts only authorization codes with matching `state` and rejects access tokens in query strings or fragments.
+- Added a loopback callback receiver that binds only to `127.0.0.1` on a random local port and accepts one GET callback.
+- Added provider-neutral authorization-code token exchange helper for PKCE flows. Token endpoints must use HTTPS; tests use loopback HTTP only through private test plumbing.
+- Hermes still does not launch browsers or refresh/store OAuth tokens itself.
+
 ### Phase 4: provider-specific clients
 
 - Add provider client abstraction only when the first non-OpenAI-compatible provider needs it.

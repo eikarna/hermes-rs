@@ -36,6 +36,8 @@ tracing = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
 regex = "1.10"
 lazy_static = "1.4"
 dirs = { workspace = true }

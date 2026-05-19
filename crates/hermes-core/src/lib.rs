@@ -58,7 +58,11 @@ pub mod tools;
 pub mod trajectory;
 
 pub use agent::{AgentConfig, AgentEvent, HermesAgent};
-pub use auth::{default_auth_store_path, AuthMethod, AuthProfile, AuthStore};
+pub use auth::{
+    build_oauth_authorization_url, default_auth_store_path, exchange_oauth_authorization_code,
+    generate_oauth_state, generate_pkce_challenge, parse_loopback_authorization_code, AuthMethod,
+    AuthProfile, AuthStore, LoopbackOAuthReceiver, OAuthTokenResponse, PkceChallenge,
+};
 pub use client::{Message, OpenAIClient};
 pub use config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
