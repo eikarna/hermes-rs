@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -52,10 +55,22 @@ impl TuiApp {
     ) -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+            rollback_terminal_setup();
+            return Err(error.into());
+        }
         let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-        terminal.clear()?;
+        let mut terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                rollback_terminal_setup();
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = terminal.clear() {
+            rollback_terminal_setup();
+            return Err(error.into());
+        }
         let (event_tx, event_rx) = mpsc::channel(config.tools.event_channel_size);
         let prompt = match &launch {
             LaunchMode::Landing => String::new(),
@@ -99,6 +114,21 @@ impl TuiApp {
     }
 
     pub async fn run(mut self) -> Result<()> {
+        let run_result = self.run_loop().await;
+        let exit_result = self.exit();
+
+        match (run_result, exit_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(run_error), Err(exit_error)) => Err(anyhow::anyhow!(
+                "{}; additionally failed to restore terminal: {}",
+                run_error,
+                exit_error
+            )),
+        }
+    }
+
+    async fn run_loop(&mut self) -> Result<()> {
         loop {
             let size = self.terminal.size()?;
             self.state.set_layout_for_width(size.width);
@@ -115,21 +145,29 @@ impl TuiApp {
             if event::poll(Duration::from_millis(
                 self.state.persistent.config.tui.refresh_rate_ms,
             ))? {
-                if let Event::Key(key) = event::read()? {
-                    if should_process_key_event(key) {
+                match event::read()? {
+                    Event::Key(key) if should_process_key_event(key) => {
                         self.handle_key(key).await?;
                     }
+                    Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    _ => {}
                 }
             }
         }
 
-        self.exit()
+        Ok(())
     }
 
     fn exit(mut self) -> Result<()> {
-        disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-        self.terminal.show_cursor()?;
+        let mouse_result = execute!(self.terminal.backend_mut(), DisableMouseCapture);
+        let leave_result = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let raw_result = disable_raw_mode();
+        let cursor_result = self.terminal.show_cursor();
+
+        mouse_result?;
+        leave_result?;
+        raw_result?;
+        cursor_result?;
         Ok(())
     }
 
@@ -185,6 +223,10 @@ impl TuiApp {
             InputMode::Prompt => self.handle_prompt_key(key).await,
             InputMode::Command => self.handle_command_key(key).await,
         }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        handle_mouse_scroll(&mut self.state, mouse);
     }
 
     async fn handle_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -747,6 +789,33 @@ fn should_process_key_event(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+fn rollback_terminal_setup() {
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, DisableMouseCapture);
+    let _ = execute!(stdout, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
+const MOUSE_SCROLL_LINES: u16 = 3;
+
+fn handle_mouse_scroll(state: &mut AppState, mouse: MouseEvent) -> bool {
+    if state.ui.modal.is_some() {
+        return false;
+    }
+
+    if state.ui.view != ViewMode::Workspace || state.ui.active_panel != ActivePanel::Session {
+        return false;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => state.scroll_conversation_up(MOUSE_SCROLL_LINES),
+        MouseEventKind::ScrollDown => state.scroll_conversation_down(MOUSE_SCROLL_LINES),
+        _ => return false,
+    }
+
+    true
+}
+
 fn handle_conversation_scroll_key(state: &mut AppState, key: KeyEvent) -> bool {
     if state.ui.view != ViewMode::Workspace || state.ui.active_panel != ActivePanel::Session {
         return false;
@@ -896,6 +965,75 @@ mod tests {
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)
         ));
         assert_eq!(state.conversation_scroll(), 8);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_session_conversation() {
+        let mut state = AppState::new(AppConfig::default(), "draft".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.ui.active_panel = ActivePanel::Session;
+        state.ui.input_mode = InputMode::Prompt;
+
+        assert!(handle_mouse_scroll(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+
+        assert_eq!(state.conversation_scroll(), MOUSE_SCROLL_LINES);
+        assert_eq!(state.ui.prompt_input, "draft");
+
+        assert!(handle_mouse_scroll(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(state.conversation_scroll(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_ignores_non_session_views() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.ui.view = ViewMode::Landing;
+        state.ui.active_panel = ActivePanel::Mcp;
+
+        assert!(!handle_mouse_scroll(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(state.conversation_scroll(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_does_not_scroll_behind_modal() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.ui.active_panel = ActivePanel::Session;
+        state.ui.modal = Some(Modal::settings("default", true));
+
+        assert!(!handle_mouse_scroll(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(state.conversation_scroll(), 0);
     }
 
     #[tokio::test]
