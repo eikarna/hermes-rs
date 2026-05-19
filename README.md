@@ -66,8 +66,11 @@ hermes test echo --args '{"message": "Hello, World!"}'
 # Create a local auth profile that references an environment variable
 hermes auth set-api-key openai --env OPENAI_API_KEY
 
+# Show supported provider names and auth methods
+hermes auth providers
+
 # Reference an existing OAuth/ADC bearer token without storing it in config
-hermes auth set-bearer-token google-gemini --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
+hermes auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
 ```
 
 ## Screenshots
@@ -144,14 +147,19 @@ See [hermes.example.toml](hermes.example.toml) for the full schema, including MC
 Hermes supports local auth metadata profiles without storing API keys in the project config. Create one with:
 
 ```bash
-hermes auth set-api-key openai --env OPENAI_API_KEY
-hermes auth set-bearer-token google-gemini --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
+hermes auth providers
+hermes auth set-api-key OpenAI --env OPENAI_API_KEY
+hermes auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
 hermes auth list
 ```
 
 Then point `[client].auth_ref` at the profile name, for example `openai-default`. The profile stores only metadata and an environment-variable reference such as `env:OPENAI_API_KEY`; the actual secret remains in your environment or external secret manager.
 
 `set-bearer-token` is intended for provider-documented OAuth/ADC access tokens that are already obtained outside Hermes and requires `--base-url` so the token is bound to the intended provider endpoint. Hermes does not refresh those tokens yet; rotate or refresh the referenced environment value with the provider's official tooling.
+
+Current provider names are `Google`, `GitHub Copilot`, `OpenAI`, and `Anthropic`. OpenAI's public API uses API keys. Anthropic's official API supports API keys and Workload Identity Federation, not a general consumer browser OAuth flow; Hermes therefore does not expose Anthropic browser OAuth login.
+
+Hermes continues to support API keys and custom base URLs through `[client].api_key`, `[client].base_url`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `--api-key`, and `--base-url`. Non-OpenAI auth profiles require `--base-url` because the current runtime client is OpenAI-compatible and credentials must be bound to the intended endpoint. When `auth_ref` is active, credentials are bound to the endpoint stored in the auth profile to prevent repo-local config from redirecting secrets.
 
 When `auth_ref` is active, Hermes binds the credential to the profile endpoint. Use `hermes auth set-api-key <provider> --base-url <url>` for non-default OpenAI-compatible endpoints instead of setting a repo-local `[client].base_url` that could redirect credentials.
 

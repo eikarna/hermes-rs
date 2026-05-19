@@ -125,6 +125,7 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommands {
+    Providers,
     SetApiKey {
         #[arg()]
         provider: String,
@@ -287,10 +288,13 @@ fn apply_auth_profile_to_client(
         .base_url
         .clone()
         .or_else(|| match profile.method {
-            AuthMethod::ApiKey => Some(hermes_core::config::ClientSettings::default().base_url),
+            AuthMethod::ApiKey if is_openai_provider(&profile.provider) => {
+                Some(hermes_core::config::ClientSettings::default().base_url)
+            }
+            AuthMethod::ApiKey => None,
             AuthMethod::BearerToken => None,
         })
-        .ok_or_else(|| anyhow::anyhow!("Bearer auth profile '{}' requires a base URL", auth_ref))?;
+        .ok_or_else(|| anyhow::anyhow!("Auth profile '{}' requires a base URL", auth_ref))?;
     let default_base_url = hermes_core::config::ClientSettings::default().base_url;
     if client.base_url != default_base_url && client.base_url != trusted_base_url {
         anyhow::bail!(
@@ -301,10 +305,9 @@ fn apply_auth_profile_to_client(
         );
     }
     match profile.method {
-        AuthMethod::ApiKey if client.api_key.is_none() => {
+        AuthMethod::ApiKey => {
             client.api_key = Some(store.resolve_api_key(auth_ref)?);
         }
-        AuthMethod::ApiKey => {}
         AuthMethod::BearerToken => {
             client.api_key = Some(store.resolve_auth_token(auth_ref)?);
         }
@@ -510,29 +513,39 @@ async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> R
 
 fn handle_auth_command(command: &AuthCommands) -> Result<()> {
     match command {
+        AuthCommands::Providers => print_auth_providers(),
         AuthCommands::SetApiKey {
             provider,
             name,
             env_var,
             base_url,
         } => {
+            let provider = canonical_provider(provider)?;
+            if provider.name != "OpenAI"
+                && base_url.as_deref().map(str::trim).unwrap_or("").is_empty()
+            {
+                anyhow::bail!(
+                    "Provider '{}' API-key profiles require --base-url so credentials are bound to the intended endpoint.",
+                    provider.name
+                );
+            }
             let profile_name = name
                 .clone()
-                .unwrap_or_else(|| format!("{}-default", provider));
+                .unwrap_or_else(|| format!("{}-default", provider.slug));
             let env_var = env_var
                 .clone()
-                .unwrap_or_else(|| default_api_key_env_var(provider));
+                .unwrap_or_else(|| provider.api_key_env.to_string());
             let mut store = AuthStore::load_default()?;
             store.upsert_api_key_env_profile(
                 profile_name.clone(),
-                provider.clone(),
+                provider.name.to_string(),
                 env_var.clone(),
                 base_url.clone(),
             )?;
             store.save_default()?;
             println!(
                 "Saved auth profile '{}' for provider '{}' using env:{}",
-                profile_name, provider, env_var
+                profile_name, provider.name, env_var
             );
             println!("Auth metadata: {}", default_auth_store_path().display());
         }
@@ -542,23 +555,30 @@ fn handle_auth_command(command: &AuthCommands) -> Result<()> {
             env_var,
             base_url,
         } => {
+            let provider = canonical_provider(provider)?;
+            let default_env_var = provider.bearer_env;
             let profile_name = name
                 .clone()
-                .unwrap_or_else(|| format!("{}-default", provider));
-            let env_var = env_var
-                .clone()
-                .unwrap_or_else(|| default_bearer_token_env_var(provider));
+                .unwrap_or_else(|| format!("{}-default", provider.slug));
+            let env_var = match (env_var, default_env_var) {
+                (Some(env_var), _) => env_var.clone(),
+                (None, Some(default_env_var)) => default_env_var.to_string(),
+                (None, None) => anyhow::bail!(
+                    "Provider '{}' does not have a default bearer-token OAuth flow. Use --env with a documented bearer token source if you know what you are doing.",
+                    provider.name
+                ),
+            };
             let mut store = AuthStore::load_default()?;
             store.upsert_bearer_token_env_profile(
                 profile_name.clone(),
-                provider.clone(),
+                provider.name.to_string(),
                 env_var.clone(),
                 base_url.clone(),
             )?;
             store.save_default()?;
             println!(
                 "Saved bearer auth profile '{}' for provider '{}' using env:{}",
-                profile_name, provider, env_var
+                profile_name, provider.name, env_var
             );
             println!("Auth metadata: {}", default_auth_store_path().display());
         }
@@ -601,21 +621,81 @@ fn handle_auth_command(command: &AuthCommands) -> Result<()> {
     Ok(())
 }
 
-fn default_api_key_env_var(provider: &str) -> String {
-    match provider.to_ascii_lowercase().as_str() {
-        "anthropic" | "claude" => "ANTHROPIC_API_KEY".to_string(),
-        "google" | "gemini" | "google-gemini" => "GOOGLE_API_KEY".to_string(),
-        _ => "OPENAI_API_KEY".to_string(),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderInfo {
+    name: &'static str,
+    slug: &'static str,
+    aliases: &'static [&'static str],
+    api_key_env: &'static str,
+    bearer_env: Option<&'static str>,
+    browser_oauth: &'static str,
+}
+
+const AUTH_PROVIDERS: &[ProviderInfo] = &[
+    ProviderInfo {
+        name: "Google",
+        slug: "google",
+        aliases: &["google", "gemini", "google-gemini", "vertex", "vertex-ai"],
+        api_key_env: "GOOGLE_API_KEY",
+        bearer_env: Some("GOOGLE_OAUTH_ACCESS_TOKEN"),
+        browser_oauth: "planned via official Google OAuth/ADC",
+    },
+    ProviderInfo {
+        name: "GitHub Copilot",
+        slug: "github-copilot",
+        aliases: &["github-copilot", "github copilot", "copilot", "github"],
+        api_key_env: "COPILOT_GITHUB_TOKEN",
+        bearer_env: Some("COPILOT_GITHUB_TOKEN"),
+        browser_oauth: "planned via GitHub device/OAuth flow",
+    },
+    ProviderInfo {
+        name: "OpenAI",
+        slug: "openai",
+        aliases: &["openai"],
+        api_key_env: "OPENAI_API_KEY",
+        bearer_env: None,
+        browser_oauth: "not implemented for general OpenAI API; use API key",
+    },
+    ProviderInfo {
+        name: "Anthropic",
+        slug: "anthropic",
+        aliases: &["anthropic", "claude"],
+        api_key_env: "ANTHROPIC_API_KEY",
+        bearer_env: None,
+        browser_oauth:
+            "not implemented; official API supports API keys and Workload Identity Federation",
+    },
+];
+
+fn canonical_provider(input: &str) -> Result<&'static ProviderInfo> {
+    let normalized = input.trim().to_ascii_lowercase();
+    AUTH_PROVIDERS
+        .iter()
+        .find(|provider| provider.aliases.contains(&normalized.as_str()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unsupported provider '{}'. Run `hermes auth providers` for supported names.",
+                input
+            )
+        })
+}
+
+fn print_auth_providers() {
+    println!("Supported auth providers:");
+    for provider in AUTH_PROVIDERS {
+        println!(
+            "{}\tslug={}\tapi_key_env={}\tbearer_env={}\tbrowser_oauth={}",
+            provider.name,
+            provider.slug,
+            provider.api_key_env,
+            provider.bearer_env.unwrap_or("-"),
+            provider.browser_oauth
+        );
     }
 }
 
-fn default_bearer_token_env_var(provider: &str) -> String {
-    match provider.to_ascii_lowercase().as_str() {
-        "google" | "gemini" | "google-gemini" | "vertex" | "vertex-ai" => {
-            "GOOGLE_OAUTH_ACCESS_TOKEN".to_string()
-        }
-        _ => "OAUTH_ACCESS_TOKEN".to_string(),
-    }
+fn is_openai_provider(provider: &str) -> bool {
+    provider.eq_ignore_ascii_case("OpenAI") || provider.eq_ignore_ascii_case("openai")
 }
 
 fn display_auth_field(value: &str) -> String {
@@ -922,26 +1002,55 @@ mod tests {
     }
 
     #[test]
-    fn default_api_key_env_var_prefers_known_providers() {
-        assert_eq!(default_api_key_env_var("openai"), "OPENAI_API_KEY");
-        assert_eq!(default_api_key_env_var("claude"), "ANTHROPIC_API_KEY");
-        assert_eq!(default_api_key_env_var("gemini"), "GOOGLE_API_KEY");
+    fn auth_providers_subcommand_parses() {
+        let cli = Cli::try_parse_from(["hermes", "auth", "providers"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                command: AuthCommands::Providers
+            }
+        ));
     }
 
     #[test]
-    fn default_bearer_token_env_var_prefers_google_oauth_token() {
+    fn canonical_provider_names_and_defaults_are_supported() {
+        let google = canonical_provider("gemini").unwrap();
+        assert_eq!(google.name, "Google");
+        assert_eq!(google.slug, "google");
+        assert_eq!(google.api_key_env, "GOOGLE_API_KEY");
+        assert_eq!(google.bearer_env, Some("GOOGLE_OAUTH_ACCESS_TOKEN"));
+
+        let copilot = canonical_provider("copilot").unwrap();
+        assert_eq!(copilot.name, "GitHub Copilot");
+        assert_eq!(copilot.bearer_env, Some("COPILOT_GITHUB_TOKEN"));
         assert_eq!(
-            default_bearer_token_env_var("google-gemini"),
-            "GOOGLE_OAUTH_ACCESS_TOKEN"
+            canonical_provider("GitHub Copilot").unwrap().slug,
+            "github-copilot"
         );
-        assert_eq!(default_bearer_token_env_var("custom"), "OAUTH_ACCESS_TOKEN");
+
+        let openai = canonical_provider("openai").unwrap();
+        assert_eq!(openai.name, "OpenAI");
+        assert_eq!(openai.bearer_env, None);
+
+        let anthropic = canonical_provider("claude").unwrap();
+        assert_eq!(anthropic.name, "Anthropic");
+        assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(anthropic.bearer_env, None);
     }
 
     #[test]
-    fn configured_api_key_takes_precedence_over_auth_profile() {
+    fn auth_profile_takes_precedence_over_configured_api_key() {
         let mut store = AuthStore::default();
+        let old_profile_key = std::env::var("HERMES_TEST_PROFILE_KEY_PRECEDENCE").ok();
+        std::env::set_var("HERMES_TEST_PROFILE_KEY_PRECEDENCE", "profile-key");
         store
-            .upsert_api_key_env_profile("openai-default", "openai", "MISSING_ENV_VAR", None)
+            .upsert_api_key_env_profile(
+                "openai-default",
+                "openai",
+                "HERMES_TEST_PROFILE_KEY_PRECEDENCE",
+                None,
+            )
             .unwrap();
         let client = ClientConfig {
             api_key: Some("configured-key".to_string()),
@@ -950,17 +1059,24 @@ mod tests {
 
         let resolved = apply_auth_profile_to_client(client, &store, "openai-default").unwrap();
 
-        assert_eq!(resolved.api_key.as_deref(), Some("configured-key"));
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+
+        match old_profile_key {
+            Some(value) => std::env::set_var("HERMES_TEST_PROFILE_KEY_PRECEDENCE", value),
+            None => std::env::remove_var("HERMES_TEST_PROFILE_KEY_PRECEDENCE"),
+        }
     }
 
     #[test]
     fn auth_profile_base_url_applies_when_default_base_url_is_unset() {
         let mut store = AuthStore::default();
+        let old_profile_key = std::env::var("HERMES_TEST_PROFILE_KEY_BASE_URL").ok();
+        std::env::set_var("HERMES_TEST_PROFILE_KEY_BASE_URL", "profile-key");
         store
             .upsert_api_key_env_profile(
                 "local-default",
                 "local",
-                "MISSING_ENV_VAR",
+                "HERMES_TEST_PROFILE_KEY_BASE_URL",
                 Some("http://127.0.0.1:11434/v1".to_string()),
             )
             .unwrap();
@@ -971,7 +1087,13 @@ mod tests {
 
         let resolved = apply_auth_profile_to_client(client, &store, "local-default").unwrap();
 
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.base_url, "http://127.0.0.1:11434/v1");
+
+        match old_profile_key {
+            Some(value) => std::env::set_var("HERMES_TEST_PROFILE_KEY_BASE_URL", value),
+            None => std::env::remove_var("HERMES_TEST_PROFILE_KEY_BASE_URL"),
+        }
     }
 
     #[test]
@@ -987,6 +1109,22 @@ mod tests {
         };
 
         let result = apply_auth_profile_to_client(client, &store, "openai-default");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn non_openai_api_key_profile_requires_base_url() {
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile("google-default", "Google", "GOOGLE_API_KEY", None)
+            .unwrap();
+        let client = ClientConfig {
+            api_key: Some("configured-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let result = apply_auth_profile_to_client(client, &store, "google-default");
 
         assert!(result.is_err());
     }

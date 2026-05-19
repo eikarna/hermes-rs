@@ -198,15 +198,17 @@ mod tests {
     #[tokio::test]
     async fn test_terminal_tool_direct_execution() {
         let tool = TerminalTool;
+        let command = if cfg!(windows) {
+            "cmd /C echo hello world"
+        } else {
+            "printf 'hello world'"
+        };
         let args = json!({
-            "command": "echo 'hello world'"
+            "command": command
         });
 
         let result = tool.execute(args, ToolContext::default()).await;
 
-        // This is a basic test to ensure the tool successfully runs directly
-        // Because of direct execution 'echo' won't process the quotes via shell, so stdout should literally be "'hello world'\n"
-        // Let's just check if it succeeds.
         assert!(result.success);
     }
 }

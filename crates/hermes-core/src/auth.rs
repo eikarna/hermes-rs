@@ -54,9 +54,10 @@ impl Default for AuthProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
+    #[default]
     ApiKey,
     BearerToken,
 }
@@ -137,12 +138,6 @@ impl LoopbackOAuthReceiver {
         );
         let _ = write_oauth_callback_response(&mut stream, result.is_ok()).await;
         result
-    }
-}
-
-impl Default for AuthMethod {
-    fn default() -> Self {
-        Self::ApiKey
     }
 }
 

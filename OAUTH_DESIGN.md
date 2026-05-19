@@ -8,9 +8,10 @@ This is a design checkpoint, not a runtime behavior change.
 
 ## Provider reality check
 
-- **OpenAI API**: official API authentication is API-key based (`Authorization: Bearer ...`). Public OAuth for third-party API clients is not documented for general API access. Do not implement reverse-engineered ChatGPT subscription OAuth as an "official" OpenAI provider path.
-- **Anthropic Claude API**: official API auth supports API keys and Workload Identity Federation token exchange. Claude Code has subscription OAuth, but that is product-specific and should not be reused unless Anthropic documents it for third-party clients.
-- **Google Gemini / Vertex AI**: official OAuth is supported through Google OAuth / Application Default Credentials for Gemini/Vertex use cases; API keys remain the easiest developer path.
+- **OpenAI**: official public API authentication is API-key based (`Authorization: Bearer ...`). Public OAuth for third-party API clients is not documented for general API access. Do not implement reverse-engineered ChatGPT subscription OAuth as an "official" OpenAI provider path.
+- **Anthropic**: official API auth supports API keys and Workload Identity Federation token exchange. Claude Code has subscription OAuth, but that is product-specific and should not be reused unless Anthropic documents it for third-party clients. Hermes should not implement Anthropic browser OAuth login at this time.
+- **Google**: official OAuth is supported through Google OAuth / Application Default Credentials for Gemini/Vertex use cases; API keys remain the easiest developer path.
+- **GitHub Copilot**: official Copilot CLI/SDK authentication supports GitHub OAuth/device flow and supported GitHub token types for Copilot access. Token storage should use system keychain/credential manager, not repo-local config.
 - **OpenCode comparison**: OpenCode stores provider credentials outside project config and exposes `/connect` flows. Hermes should copy the credential separation pattern, not vendor-private auth internals.
 
 ## Recommended architecture
@@ -43,7 +44,9 @@ Rules:
 - Never write tokens to repo-local files.
 - Never log token values.
 - Bind credentials to the endpoint stored in the auth profile, and reject repo-local base URL overrides when an `auth_ref` is active.
+- Require explicit base URLs for non-OpenAI profiles until provider-specific clients own their official endpoints.
 - Prefer OS credential storage for long-lived secrets and refresh tokens.
+- Recommended implementation: use platform credential storage (Windows Credential Manager, macOS Keychain, Linux Secret Service/libsecret) behind a small Hermes abstraction before persisting OAuth refresh tokens. Until that exists, keep tokens in environment variables or provider-managed stores such as Google ADC / GitHub CLI or Copilot CLI keychain.
 - If OS credential storage is not implemented yet, keep long-lived secrets in environment variables or explicit config only; do not silently migrate them into plaintext JSON.
 - If a plaintext fallback is ever added, it must be opt-in, clearly warned, and protected by best-effort owner-only file permissions.
 - Store non-secret provider id, auth type, created/updated timestamps, expiry, and refresh metadata in `auth.json`.
