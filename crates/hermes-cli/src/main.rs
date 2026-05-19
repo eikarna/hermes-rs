@@ -126,6 +126,10 @@ enum Commands {
 #[derive(Debug, Subcommand)]
 enum AuthCommands {
     Providers,
+    Login {
+        #[arg()]
+        provider: String,
+    },
     SetApiKey {
         #[arg()]
         provider: String,
@@ -514,6 +518,14 @@ async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> R
 fn handle_auth_command(command: &AuthCommands) -> Result<()> {
     match command {
         AuthCommands::Providers => print_auth_providers(),
+        AuthCommands::Login { provider } => {
+            let provider = canonical_provider(provider)?;
+            print_auth_login_guidance(provider);
+            anyhow::bail!(
+                "Hermes does not run '{}' login flows yet; use the listed external credential source and create an auth profile with set-api-key or set-bearer-token.",
+                provider.name
+            );
+        }
         AuthCommands::SetApiKey {
             provider,
             name,
@@ -627,43 +639,98 @@ struct ProviderInfo {
     slug: &'static str,
     aliases: &'static [&'static str],
     api_key_env: &'static str,
+    api_key_envs: &'static [&'static str],
     bearer_env: Option<&'static str>,
-    browser_oauth: &'static str,
+    documented_auth: &'static [&'static str],
+    hermes_sources: &'static [&'static str],
+    notes: &'static str,
+    login_guidance: &'static [&'static str],
 }
 
 const AUTH_PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
         name: "Google",
         slug: "google",
-        aliases: &["google", "gemini", "google-gemini", "vertex", "vertex-ai"],
+        aliases: &[
+            "google",
+            "gemini",
+            "google-gemini",
+            "google ai studio",
+            "google-ai-studio",
+            "vertex",
+            "vertex-ai",
+            "google vertex ai",
+        ],
         api_key_env: "GOOGLE_API_KEY",
+        api_key_envs: &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
         bearer_env: Some("GOOGLE_OAUTH_ACCESS_TOKEN"),
-        browser_oauth: "planned via official Google OAuth/ADC",
+        documented_auth: &["API key", "OAuth/ADC bearer token", "service account/ADC"],
+        hermes_sources: &["GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_OAUTH_ACCESS_TOKEN"],
+        notes: "Direct OAuth requires a Google OAuth client ID; ADC can be managed by gcloud.",
+        login_guidance: &[
+            "For API-key auth, create a Google AI Studio API key and run `hermes auth set-api-key Google --env GOOGLE_API_KEY --base-url <google-endpoint>`.",
+            "For OAuth/ADC, run `gcloud auth application-default login`, export an access token through your own refresh workflow, then run `hermes auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url <google-endpoint>`.",
+        ],
     },
     ProviderInfo {
         name: "GitHub Copilot",
         slug: "github-copilot",
         aliases: &["github-copilot", "github copilot", "copilot", "github"],
         api_key_env: "COPILOT_GITHUB_TOKEN",
+        api_key_envs: &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
         bearer_env: Some("COPILOT_GITHUB_TOKEN"),
-        browser_oauth: "planned via GitHub device/OAuth flow",
+        documented_auth: &["OAuth device flow", "supported GitHub token", "GitHub CLI fallback"],
+        hermes_sources: &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+        notes: "Hermes can reference tokens now; running Copilot login directly is future work.",
+        login_guidance: &[
+            "Run the official Copilot or GitHub CLI login flow, or provide a supported token in COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.",
+            "Then run `hermes auth set-bearer-token GitHub-Copilot --env COPILOT_GITHUB_TOKEN --base-url <copilot-compatible-endpoint>` only for endpoints documented to accept that token.",
+        ],
     },
     ProviderInfo {
         name: "OpenAI",
         slug: "openai",
         aliases: &["openai"],
         api_key_env: "OPENAI_API_KEY",
+        api_key_envs: &["OPENAI_API_KEY"],
         bearer_env: None,
-        browser_oauth: "not implemented for general OpenAI API; use API key",
+        documented_auth: &[
+            "API key",
+            "ChatGPT/Codex browser login",
+            "ChatGPT/Codex device login",
+        ],
+        hermes_sources: &["OPENAI_API_KEY"],
+        notes: "Hermes supports API-key metadata now; Codex/ChatGPT OAuth is documented but not wired into Hermes runtime yet.",
+        login_guidance: &[
+            "For current Hermes runtime use, create an OpenAI API key and run `hermes auth set-api-key OpenAI --env OPENAI_API_KEY`.",
+            "OpenAI Codex/ChatGPT browser and device login are documented provider flows, but Hermes does not consume Codex account tokens yet.",
+        ],
     },
     ProviderInfo {
         name: "Anthropic",
         slug: "anthropic",
-        aliases: &["anthropic", "claude"],
+        aliases: &[
+            "anthropic",
+            "claude",
+            "anthropic console",
+        ],
         api_key_env: "ANTHROPIC_API_KEY",
+        api_key_envs: &["ANTHROPIC_API_KEY"],
         bearer_env: None,
-        browser_oauth:
-            "not implemented; official API supports API keys and Workload Identity Federation",
+        documented_auth: &[
+            "Claude account login",
+            "Anthropic Console API key",
+            "Team/Enterprise account",
+            "Vertex AI",
+            "Amazon Bedrock",
+            "Microsoft Foundry",
+        ],
+        hermes_sources: &["ANTHROPIC_API_KEY"],
+        notes: "Hermes supports API-key metadata now; Claude account and cloud-provider flows need provider-specific clients before runtime use.",
+        login_guidance: &[
+            "For current Hermes runtime use, create an Anthropic Console API key and run `hermes auth set-api-key Anthropic --env ANTHROPIC_API_KEY --base-url <anthropic-compatible-endpoint>`.",
+            "Claude account login, Team/Enterprise, Vertex AI, Amazon Bedrock, and Microsoft Foundry need provider-specific clients before Hermes can use those credentials directly.",
+        ],
     },
 ];
 
@@ -684,13 +751,28 @@ fn print_auth_providers() {
     println!("Supported auth providers:");
     for provider in AUTH_PROVIDERS {
         println!(
-            "{}\tslug={}\tapi_key_env={}\tbearer_env={}\tbrowser_oauth={}",
+            "{}\tslug={}\taliases={}\tapi_key_envs={}\tbearer_env={}\tdocumented_auth={}\thermes_sources={}\tnotes={}",
             provider.name,
             provider.slug,
-            provider.api_key_env,
+            provider.aliases.join(","),
+            provider.api_key_envs.join(","),
             provider.bearer_env.unwrap_or("-"),
-            provider.browser_oauth
+            provider.documented_auth.join(","),
+            provider.hermes_sources.join(","),
+            provider.notes
         );
+    }
+}
+
+fn print_auth_login_guidance(provider: &ProviderInfo) {
+    println!("{} login is not enabled in Hermes yet.", provider.name);
+    println!("Documented auth: {}", provider.documented_auth.join(", "));
+    println!(
+        "Hermes-supported sources: {}",
+        provider.hermes_sources.join(", ")
+    );
+    for line in provider.login_guidance {
+        println!("- {}", line);
     }
 }
 
@@ -1014,16 +1096,48 @@ mod tests {
     }
 
     #[test]
+    fn auth_login_subcommand_parses() {
+        let cli = Cli::try_parse_from(["hermes", "auth", "login", "OpenAI"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                command: AuthCommands::Login { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_login_guidance_does_not_create_profile() {
+        let result = handle_auth_command(&AuthCommands::Login {
+            provider: "OpenAI".to_string(),
+        });
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not run 'OpenAI' login flows yet"));
+    }
+
+    #[test]
     fn canonical_provider_names_and_defaults_are_supported() {
         let google = canonical_provider("gemini").unwrap();
         assert_eq!(google.name, "Google");
         assert_eq!(google.slug, "google");
         assert_eq!(google.api_key_env, "GOOGLE_API_KEY");
+        assert!(google.api_key_envs.contains(&"GEMINI_API_KEY"));
         assert_eq!(google.bearer_env, Some("GOOGLE_OAUTH_ACCESS_TOKEN"));
+        assert!(google.documented_auth.contains(&"OAuth/ADC bearer token"));
+        assert!(google
+            .login_guidance
+            .iter()
+            .any(|line| line.contains("gcloud")));
 
         let copilot = canonical_provider("copilot").unwrap();
         assert_eq!(copilot.name, "GitHub Copilot");
         assert_eq!(copilot.bearer_env, Some("COPILOT_GITHUB_TOKEN"));
+        assert!(copilot.api_key_envs.contains(&"GH_TOKEN"));
         assert_eq!(
             canonical_provider("GitHub Copilot").unwrap().slug,
             "github-copilot"
@@ -1031,11 +1145,23 @@ mod tests {
 
         let openai = canonical_provider("openai").unwrap();
         assert_eq!(openai.name, "OpenAI");
+        assert!(openai
+            .documented_auth
+            .contains(&"ChatGPT/Codex device login"));
+        assert!(openai
+            .login_guidance
+            .iter()
+            .any(|line| line.contains("does not consume Codex account tokens")));
+        assert!(canonical_provider("codex").is_err());
+        assert!(!openai.hermes_sources.contains(&"CODEX_ACCESS_TOKEN"));
         assert_eq!(openai.bearer_env, None);
 
         let anthropic = canonical_provider("claude").unwrap();
         assert_eq!(anthropic.name, "Anthropic");
         assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
+        assert!(anthropic.documented_auth.contains(&"Amazon Bedrock"));
+        assert!(canonical_provider("claude-code").is_err());
+        assert!(canonical_provider("microsoft foundry").is_err());
         assert_eq!(anthropic.bearer_env, None);
     }
 

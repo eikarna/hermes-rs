@@ -66,7 +66,7 @@ hermes test echo --args '{"message": "Hello, World!"}'
 # Create a local auth profile that references an environment variable
 hermes auth set-api-key openai --env OPENAI_API_KEY
 
-# Show supported provider names and auth methods
+# Show provider names, documented auth methods, and Hermes-supported env sources
 hermes auth providers
 
 # Reference an existing OAuth/ADC bearer token without storing it in config
@@ -148,6 +148,7 @@ Hermes supports local auth metadata profiles without storing API keys in the pro
 
 ```bash
 hermes auth providers
+hermes auth login OpenAI # prints current external setup guidance; does not store tokens yet
 hermes auth set-api-key OpenAI --env OPENAI_API_KEY
 hermes auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
 hermes auth list
@@ -157,13 +158,20 @@ Then point `[client].auth_ref` at the profile name, for example `openai-default`
 
 `set-bearer-token` is intended for provider-documented OAuth/ADC access tokens that are already obtained outside Hermes and requires `--base-url` so the token is bound to the intended provider endpoint. Hermes does not refresh those tokens yet; rotate or refresh the referenced environment value with the provider's official tooling.
 
-Current provider names are `Google`, `GitHub Copilot`, `OpenAI`, and `Anthropic`. OpenAI's public API uses API keys. Anthropic's official API supports API keys and Workload Identity Federation, not a general consumer browser OAuth flow; Hermes therefore does not expose Anthropic browser OAuth login.
+Current provider names are `Google`, `GitHub Copilot`, `OpenAI`, and `Anthropic`. `hermes auth providers` prints aliases, API-key environment variables, bearer-token defaults, documented auth methods, Hermes-supported environment sources, and implementation notes. `hermes auth login <provider>` prints provider-specific setup guidance and exits without creating credentials until Hermes has secure token storage and provider-specific login flows.
+
+Provider reality check:
+
+- **OpenAI**: Hermes supports API-key profiles today. OpenAI also documents ChatGPT/Codex browser login, device/headless login, and access-token/cache workflows for Codex, but Hermes has not wired those OAuth credentials into runtime requests yet.
+- **Google**: Gemini supports API keys and OAuth/ADC. Direct desktop OAuth requires a Google OAuth client ID; using `gcloud auth application-default login` keeps token management outside Hermes.
+- **GitHub Copilot**: Copilot CLI supports OAuth device flow, supported GitHub tokens via `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, OS keychain storage, and GitHub CLI fallback. Hermes can reference external tokens today; it does not run Copilot login itself yet.
+- **Anthropic**: Claude access can come from Claude.ai / Claude Code accounts, Anthropic Console API keys, Team/Enterprise accounts, and cloud-provider routes such as Vertex AI, Amazon Bedrock, and Microsoft Foundry. Hermes supports API-key metadata today; cloud-provider and Claude-account flows need provider-specific clients before runtime use.
 
 Hermes continues to support API keys and custom base URLs through `[client].api_key`, `[client].base_url`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `--api-key`, and `--base-url`. Non-OpenAI auth profiles require `--base-url` because the current runtime client is OpenAI-compatible and credentials must be bound to the intended endpoint. When `auth_ref` is active, credentials are bound to the endpoint stored in the auth profile to prevent repo-local config from redirecting secrets.
 
 When `auth_ref` is active, Hermes binds the credential to the profile endpoint. Use `hermes auth set-api-key <provider> --base-url <url>` for non-default OpenAI-compatible endpoints instead of setting a repo-local `[client].base_url` that could redirect credentials.
 
-OAuth browser login is intentionally not enabled until provider-specific secure token storage and documented OAuth flows are implemented. See [OAUTH_DESIGN.md](OAUTH_DESIGN.md) for the phased plan.
+OAuth browser/device login is intentionally not enabled until provider-specific secure token storage and documented OAuth flows are implemented. See [OAUTH_DESIGN.md](OAUTH_DESIGN.md) for the phased plan.
 
 ## Workspace Context
 

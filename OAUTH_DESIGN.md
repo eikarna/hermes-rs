@@ -8,10 +8,10 @@ This is a design checkpoint, not a runtime behavior change.
 
 ## Provider reality check
 
-- **OpenAI**: official public API authentication is API-key based (`Authorization: Bearer ...`). Public OAuth for third-party API clients is not documented for general API access. Do not implement reverse-engineered ChatGPT subscription OAuth as an "official" OpenAI provider path.
-- **Anthropic**: official API auth supports API keys and Workload Identity Federation token exchange. Claude Code has subscription OAuth, but that is product-specific and should not be reused unless Anthropic documents it for third-party clients. Hermes should not implement Anthropic browser OAuth login at this time.
-- **Google**: official OAuth is supported through Google OAuth / Application Default Credentials for Gemini/Vertex use cases; API keys remain the easiest developer path.
-- **GitHub Copilot**: official Copilot CLI/SDK authentication supports GitHub OAuth/device flow and supported GitHub token types for Copilot access. Token storage should use system keychain/credential manager, not repo-local config.
+- **OpenAI**: public OpenAI-compatible API access continues to support API keys. OpenAI also documents ChatGPT/Codex auth for Codex clients, including browser login, device/headless login, access-token injection, and auth-cache reuse. Hermes should model this as a separate OpenAI/Codex account-auth capability, not silently treat Codex tokens as generic OpenAI API keys.
+- **Google**: Gemini supports API keys and OAuth/Application Default Credentials. Direct desktop OAuth requires a Google OAuth client ID; ADC via `gcloud auth application-default login` keeps token creation, refresh, and storage outside Hermes.
+- **GitHub Copilot**: official Copilot CLI authentication supports OAuth device flow, supported GitHub token types (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`), OS keychain storage, and GitHub CLI fallback. Hermes should reference external tokens first and only run Copilot login after provider-specific client behavior is defined.
+- **Anthropic**: Claude access is not one single OAuth path. Documented routes include Claude.ai / Claude Code account login, Anthropic Console API keys, Team/Enterprise accounts, and cloud-provider routes such as Google Vertex AI, Amazon Bedrock, and Microsoft Foundry. Hermes should keep these as separate capabilities because Vertex/Bedrock/Foundry require provider-specific request/auth behavior, not just a bearer token swap.
 - **OpenCode comparison**: OpenCode stores provider credentials outside project config and exposes `/connect` flows. Hermes should copy the credential separation pattern, not vendor-private auth internals.
 
 ## Recommended architecture
@@ -98,6 +98,8 @@ Future commands:
 
 - `hermes auth login <provider>`
 - `hermes auth set-api-key <provider>`
+- `hermes auth set-bearer-token <provider> --env <ENV_VAR> --base-url <URL>`
+- `hermes auth providers`
 - `hermes auth list`
 - `hermes auth logout <auth-ref>`
 - TUI command/modal equivalent after CLI flow is stable
@@ -105,9 +107,10 @@ Future commands:
 Login flow order:
 
 1. Prefer API key where it is the official provider API path.
-2. Offer OAuth only for providers with documented third-party or ADC flow.
-3. Use loopback PKCE for native desktop OAuth where supported.
-4. Support no-browser mode only through provider-documented flows such as device-code auth or external tools like `gcloud auth application-default login --no-browser`; do not invent copy/paste auth-code handling.
+2. Prefer provider-managed credentials first: Google ADC, GitHub/Copilot CLI keychain, Claude Code setup wizards, AWS/GCP/Foundry credential chains.
+3. Offer OAuth only for providers with documented third-party, device-code, or ADC flows.
+4. Use loopback PKCE for native desktop OAuth where supported.
+5. Support no-browser mode only through provider-documented flows such as device-code auth or external tools like `gcloud auth application-default login --no-browser`; do not invent copy/paste auth-code handling.
 
 ### 5. OAuth implementation constraints
 
@@ -117,6 +120,7 @@ Do not add OAuth until these are decided:
 - Provider allowlist and scopes.
 - Refresh behavior and expiry handling.
 - How non-OpenAI-compatible providers map into `OpenAIClient` or a new client abstraction.
+- How product-specific account auth maps to runtime endpoints, especially OpenAI Codex/ChatGPT auth and Anthropic Claude account auth.
 - Whether adding OAuth crates is acceptable, or whether to implement PKCE/loopback using existing dependencies.
 - Whether the project will use OS credential storage crates or keep OAuth behind external helper tools until secure storage exists.
 
@@ -151,6 +155,12 @@ Implemented Phase 2a:
 - Hermes still does not run browser OAuth or refresh tokens itself.
 - Bearer credentials use the same endpoint binding protections as API-key profiles.
 
+Implemented Phase 2b:
+
+- `hermes auth providers` reports provider aliases, documented auth methods, Hermes-supported environment sources, and implementation notes for Google, GitHub Copilot, OpenAI, and Anthropic.
+- OpenAI Codex/ChatGPT auth and Anthropic Claude account/cloud-provider auth are documented as distinct capabilities instead of being collapsed into generic API-key or bearer-token auth.
+- `hermes auth login <provider>` prints provider-specific external setup guidance and intentionally fails without creating credentials until secure token storage and provider-specific runtime clients are available.
+
 ### Phase 3: browser PKCE flow
 
 - Add loopback OAuth helper.
@@ -173,7 +183,7 @@ Implemented Phase 3a:
 
 ## Non-goals for the first OAuth PR
 
-- Reverse-engineered ChatGPT Plus/Pro login.
-- Reusing Claude Code private credential formats.
+- Reverse-engineered ChatGPT/Codex login beyond documented OpenAI flows.
+- Reusing Claude Code private credential formats without documented support.
 - Storing tokens in repo-local `hermes.toml`.
 - Supporting every provider in one change.
