@@ -142,6 +142,12 @@ Security requirements:
 - Use provider-documented scopes per Gemini API vs Vertex AI flow; do not hardcode a single scope globally.
 - Tests: expired token rejection/refresh boundary with mocked token provider.
 
+Implemented Phase 2a:
+
+- `hermes auth set-bearer-token <provider> --env <ENV_VAR> --base-url <URL>` stores metadata for externally managed OAuth/ADC bearer tokens.
+- Hermes still does not run browser OAuth or refresh tokens itself.
+- Bearer credentials use the same endpoint binding protections as API-key profiles.
+
 ### Phase 3: browser PKCE flow
 
 - Add loopback OAuth helper.

@@ -1075,14 +1075,16 @@ mod tests {
     #[test]
     #[serial]
     fn agent_builder_propagates_auth_profile_errors() {
-        let home =
-            std::env::temp_dir().join(format!("hermes_agent_auth_error_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        let old_home = std::env::var("HERMES_HOME").ok();
+        let auth_store_path = std::env::temp_dir().join(format!(
+            "hermes_agent_auth_error_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
         let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
         let old_api_key = std::env::var("OPENAI_API_KEY").ok();
 
-        std::env::set_var("HERMES_HOME", &home);
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
         std::env::set_var("HERMES_AUTH_REF", "missing-profile");
         std::env::remove_var("OPENAI_API_KEY");
 
@@ -1090,10 +1092,10 @@ mod tests {
 
         assert!(result.is_err());
 
-        restore_env("HERMES_HOME", old_home);
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
         restore_env("HERMES_AUTH_REF", old_auth_ref);
         restore_env("OPENAI_API_KEY", old_api_key);
-        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_file(auth_store_path);
     }
 
     fn restore_env(key: &str, value: Option<String>) {

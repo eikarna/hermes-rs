@@ -52,6 +52,7 @@ impl Default for AuthProfile {
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     ApiKey,
+    BearerToken,
 }
 
 impl Default for AuthMethod {
@@ -78,13 +79,15 @@ impl AuthStore {
                 error
             ))
         })?;
-        serde_json::from_str(&raw).map_err(|error| {
+        let store: Self = serde_json::from_str(&raw).map_err(|error| {
             Error::Config(format!(
                 "Failed to parse auth store '{}': {}",
                 path.display(),
                 error
             ))
-        })
+        })?;
+        store.validate()?;
+        Ok(store)
     }
 
     pub fn save_default(&self) -> Result<()> {
@@ -153,6 +156,33 @@ impl AuthStore {
         Ok(())
     }
 
+    pub fn upsert_bearer_token_env_profile(
+        &mut self,
+        name: impl Into<String>,
+        provider: impl Into<String>,
+        env_var: impl Into<String>,
+        base_url: Option<String>,
+    ) -> Result<()> {
+        let name = validate_name("auth profile", name.into())?;
+        let provider = validate_name("provider", provider.into())?;
+        let env_var = validate_env_var(env_var.into())?;
+        let base_url = validate_base_url(base_url)?.ok_or_else(|| {
+            Error::Config("Bearer token auth profiles require a base URL".to_string())
+        })?;
+
+        self.profiles.insert(
+            name,
+            AuthProfile {
+                provider,
+                method: AuthMethod::BearerToken,
+                base_url: Some(base_url),
+                secret_ref: format!("env:{}", env_var),
+                disabled: false,
+            },
+        );
+        Ok(())
+    }
+
     pub fn remove_profile(&mut self, name: &str) -> bool {
         self.profiles.remove(name).is_some()
     }
@@ -166,6 +196,30 @@ impl AuthStore {
             })?;
         profile.resolve_api_key()
     }
+
+    pub fn resolve_auth_token(&self, name: &str) -> Result<String> {
+        let profile = self
+            .profiles
+            .get(name)
+            .ok_or_else(|| Error::MissingConfig {
+                key: format!("auth profile '{}'", name),
+            })?;
+        profile.resolve_auth_token()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.version != AUTH_STORE_VERSION {
+            return Err(Error::Config(format!(
+                "Unsupported auth store version: {}",
+                self.version
+            )));
+        }
+        for (name, profile) in &self.profiles {
+            validate_name("auth profile", name.clone())?;
+            profile.validate()?;
+        }
+        Ok(())
+    }
 }
 
 impl AuthProfile {
@@ -174,17 +228,25 @@ impl AuthProfile {
     }
 
     pub fn resolve_api_key(&self) -> Result<String> {
+        if self.method != AuthMethod::ApiKey {
+            return Err(Error::Config(format!(
+                "Auth profile '{}' is not an API key profile",
+                self.provider
+            )));
+        }
+        self.resolve_auth_token()
+    }
+
+    pub fn resolve_auth_token(&self) -> Result<String> {
+        self.validate()?;
         if self.disabled {
             return Err(Error::Config(format!(
                 "Auth profile '{}' is disabled",
                 self.provider
             )));
         }
-        if self.method != AuthMethod::ApiKey {
-            return Err(Error::Config(format!(
-                "Unsupported auth method for provider '{}'",
-                self.provider
-            )));
+        match self.method {
+            AuthMethod::ApiKey | AuthMethod::BearerToken => {}
         }
 
         let env_var = self.resolved_env_var().ok_or_else(|| {
@@ -201,9 +263,32 @@ impl AuthProfile {
                 key: format!("environment variable {} for auth profile", env_var),
             })
     }
+
+    fn validate(&self) -> Result<()> {
+        validate_name("provider", self.provider.clone())?;
+        if self.resolved_env_var().is_none() {
+            return Err(Error::Config(format!(
+                "Auth profile '{}' uses an unsupported secret reference",
+                self.provider
+            )));
+        }
+        if self.method == AuthMethod::BearerToken && self.base_url.is_none() {
+            return Err(Error::Config(format!(
+                "Bearer auth profile '{}' requires a base URL",
+                self.provider
+            )));
+        }
+        let _ = validate_base_url(self.base_url.clone())?;
+        Ok(())
+    }
 }
 
 pub fn default_auth_store_path() -> PathBuf {
+    if let Ok(path) = env::var("HERMES_AUTH_STORE") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
     hermes_data_dir().join("auth.json")
 }
 
@@ -286,6 +371,108 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bearer_token_profile_round_trips_without_secret_values() {
+        let path = temp_auth_path("bearer_round_trip");
+        let _ = fs::remove_file(&path);
+        let mut store = AuthStore::default();
+        store
+            .upsert_bearer_token_env_profile(
+                "google-default",
+                "google-gemini",
+                "GOOGLE_OAUTH_ACCESS_TOKEN",
+                Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            )
+            .unwrap();
+
+        store.save_to(&path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("bearer_token"));
+        assert!(raw.contains("env:GOOGLE_OAUTH_ACCESS_TOKEN"));
+        assert!(!raw.contains("ya29."));
+
+        let loaded = AuthStore::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.profiles["google-default"].method,
+            AuthMethod::BearerToken
+        );
+        assert_eq!(
+            loaded.profiles["google-default"].resolved_env_var(),
+            Some("GOOGLE_OAUTH_ACCESS_TOKEN")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bearer_token_profiles_require_base_url() {
+        let mut store = AuthStore::default();
+
+        let result = store.upsert_bearer_token_env_profile(
+            "google-default",
+            "google-gemini",
+            "GOOGLE_OAUTH_ACCESS_TOKEN",
+            None,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_api_key_rejects_bearer_profiles() {
+        let mut store = AuthStore::default();
+        store
+            .upsert_bearer_token_env_profile(
+                "google-default",
+                "google-gemini",
+                "GOOGLE_OAUTH_ACCESS_TOKEN",
+                Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            )
+            .unwrap();
+
+        assert!(store.resolve_api_key("google-default").is_err());
+    }
+
+    #[test]
+    fn load_rejects_bearer_profile_without_base_url() {
+        let path = temp_auth_path("broken_bearer_load");
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "profiles": {
+    "broken-bearer": {
+      "provider": "google-gemini",
+      "method": "bearer_token",
+      "base_url": null,
+      "secret_ref": "env:GOOGLE_OAUTH_ACCESS_TOKEN",
+      "disabled": false
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let result = AuthStore::load_from(&path);
+
+        assert!(result.is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_auth_token_rejects_bearer_profile_without_base_url() {
+        let profile = AuthProfile {
+            provider: "google-gemini".to_string(),
+            method: AuthMethod::BearerToken,
+            base_url: None,
+            secret_ref: "env:GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
+            disabled: false,
+        };
+
+        assert!(profile.resolve_auth_token().is_err());
     }
 
     #[test]

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, instrument};
 
-use crate::auth::AuthStore;
+use crate::auth::{AuthMethod, AuthStore};
 use crate::config::{runtime_config, ClientSettings};
 use crate::error::{Error, Result};
 use crate::schema::ToolSchema;
@@ -115,19 +115,34 @@ impl OpenAIClient {
                 .ok_or_else(|| Error::MissingConfig {
                     key: format!("auth profile '{}'", auth_ref),
                 })?;
-            if config.api_key.is_none() {
-                config.api_key = Some(store.resolve_api_key(auth_ref)?);
-            }
             let trusted_base_url = profile
                 .base_url
                 .clone()
-                .unwrap_or_else(|| ClientSettings::default().base_url);
+                .or_else(|| match profile.method {
+                    AuthMethod::ApiKey => Some(ClientSettings::default().base_url),
+                    AuthMethod::BearerToken => None,
+                })
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "Bearer auth profile '{}' requires a base URL",
+                        auth_ref
+                    ))
+                })?;
             let default_base_url = ClientSettings::default().base_url;
             if config.base_url != default_base_url && config.base_url != trusted_base_url {
                 return Err(Error::Config(format!(
                     "Auth profile '{}' is bound to '{}'; refusing to send credentials to '{}'",
                     auth_ref, trusted_base_url, config.base_url
                 )));
+            }
+            match profile.method {
+                AuthMethod::ApiKey if config.api_key.is_none() => {
+                    config.api_key = Some(store.resolve_api_key(auth_ref)?);
+                }
+                AuthMethod::ApiKey => {}
+                AuthMethod::BearerToken => {
+                    config.api_key = Some(store.resolve_auth_token(auth_ref)?);
+                }
             }
             config.base_url = trusted_base_url;
         }
@@ -738,16 +753,18 @@ mod tests {
     #[test]
     #[serial]
     fn client_from_env_resolves_auth_ref_profile() {
-        let home =
-            std::env::temp_dir().join(format!("hermes_client_auth_ref_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        let old_home = std::env::var("HERMES_HOME").ok();
+        let auth_store_path = std::env::temp_dir().join(format!(
+            "hermes_client_auth_ref_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
         let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
         let old_api_key = std::env::var("HERMES_TEST_CLIENT_API_KEY").ok();
         let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
         let old_base_url = std::env::var("OPENAI_BASE_URL").ok();
 
-        std::env::set_var("HERMES_HOME", &home);
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
         std::env::set_var("HERMES_AUTH_REF", "test-default");
         std::env::set_var("HERMES_TEST_CLIENT_API_KEY", "profile-key");
         std::env::remove_var("OPENAI_API_KEY");
@@ -769,27 +786,29 @@ mod tests {
         assert_eq!(config.api_key.as_deref(), Some("profile-key"));
         assert_eq!(config.base_url, "http://127.0.0.1:11434/v1");
 
-        restore_env("HERMES_HOME", old_home);
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
         restore_env("HERMES_AUTH_REF", old_auth_ref);
         restore_env("HERMES_TEST_CLIENT_API_KEY", old_api_key);
         restore_env("OPENAI_API_KEY", old_openai_api_key);
         restore_env("OPENAI_BASE_URL", old_base_url);
-        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_file(auth_store_path);
     }
 
     #[test]
     #[serial]
     fn client_from_env_rejects_untrusted_auth_profile_base_url_override() {
-        let home =
-            std::env::temp_dir().join(format!("hermes_client_auth_exfil_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        let old_home = std::env::var("HERMES_HOME").ok();
+        let auth_store_path = std::env::temp_dir().join(format!(
+            "hermes_client_auth_exfil_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
         let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
         let old_api_key = std::env::var("HERMES_TEST_CLIENT_API_KEY").ok();
         let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
         let old_base_url = std::env::var("OPENAI_BASE_URL").ok();
 
-        std::env::set_var("HERMES_HOME", &home);
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
         std::env::set_var("HERMES_AUTH_REF", "test-default");
         std::env::set_var("HERMES_TEST_CLIENT_API_KEY", "profile-key");
         std::env::remove_var("OPENAI_API_KEY");
@@ -809,12 +828,100 @@ mod tests {
         let result = OpenAIClient::from_env();
         assert!(result.is_err());
 
-        restore_env("HERMES_HOME", old_home);
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
         restore_env("HERMES_AUTH_REF", old_auth_ref);
         restore_env("HERMES_TEST_CLIENT_API_KEY", old_api_key);
         restore_env("OPENAI_API_KEY", old_openai_api_key);
         restore_env("OPENAI_BASE_URL", old_base_url);
-        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_file(auth_store_path);
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_uses_bearer_profile_token_over_openai_api_key() {
+        let auth_store_path = std::env::temp_dir().join(format!(
+            "hermes_client_bearer_auth_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_bearer = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let old_base_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
+        std::env::set_var("HERMES_AUTH_REF", "google-default");
+        std::env::set_var("GOOGLE_OAUTH_ACCESS_TOKEN", "google-token");
+        std::env::set_var("OPENAI_API_KEY", "openai-key");
+        std::env::remove_var("OPENAI_BASE_URL");
+
+        let mut store = AuthStore::default();
+        store
+            .upsert_bearer_token_env_profile(
+                "google-default",
+                "google-gemini",
+                "GOOGLE_OAUTH_ACCESS_TOKEN",
+                Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            )
+            .unwrap();
+        store.save_default().unwrap();
+
+        let client = OpenAIClient::from_env().unwrap();
+        let config = client.config_clone();
+        assert_eq!(config.api_key.as_deref(), Some("google-token"));
+        assert_eq!(
+            config.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("GOOGLE_OAUTH_ACCESS_TOKEN", old_bearer);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        restore_env("OPENAI_BASE_URL", old_base_url);
+        let _ = std::fs::remove_file(auth_store_path);
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_rejects_bearer_profile_without_base_url() {
+        let auth_store_path = std::env::temp_dir().join(format!(
+            "hermes_client_broken_bearer_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_bearer = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
+        std::env::set_var("HERMES_AUTH_REF", "broken-bearer");
+        std::env::set_var("GOOGLE_OAUTH_ACCESS_TOKEN", "google-token");
+        std::env::set_var("OPENAI_API_KEY", "openai-key");
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "broken-bearer".to_string(),
+            crate::auth::AuthProfile {
+                provider: "google-gemini".to_string(),
+                method: AuthMethod::BearerToken,
+                base_url: None,
+                secret_ref: "env:GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
+                disabled: false,
+            },
+        );
+        store.save_default().unwrap();
+
+        let result = OpenAIClient::from_env();
+        assert!(result.is_err());
+
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("GOOGLE_OAUTH_ACCESS_TOKEN", old_bearer);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        let _ = std::fs::remove_file(auth_store_path);
     }
 
     fn restore_env(key: &str, value: Option<String>) {

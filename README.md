@@ -65,6 +65,9 @@ hermes test echo --args '{"message": "Hello, World!"}'
 
 # Create a local auth profile that references an environment variable
 hermes auth set-api-key openai --env OPENAI_API_KEY
+
+# Reference an existing OAuth/ADC bearer token without storing it in config
+hermes auth set-bearer-token google-gemini --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
 ```
 
 ## Screenshots
@@ -142,10 +145,13 @@ Hermes supports local auth metadata profiles without storing API keys in the pro
 
 ```bash
 hermes auth set-api-key openai --env OPENAI_API_KEY
+hermes auth set-bearer-token google-gemini --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
 hermes auth list
 ```
 
 Then point `[client].auth_ref` at the profile name, for example `openai-default`. The profile stores only metadata and an environment-variable reference such as `env:OPENAI_API_KEY`; the actual secret remains in your environment or external secret manager.
+
+`set-bearer-token` is intended for provider-documented OAuth/ADC access tokens that are already obtained outside Hermes and requires `--base-url` so the token is bound to the intended provider endpoint. Hermes does not refresh those tokens yet; rotate or refresh the referenced environment value with the provider's official tooling.
 
 When `auth_ref` is active, Hermes binds the credential to the profile endpoint. Use `hermes auth set-api-key <provider> --base-url <url>` for non-default OpenAI-compatible endpoints instead of setting a repo-local `[client].base_url` that could redirect credentials.
 

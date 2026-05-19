@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use hermes_core::agent::{AgentConfig, AgentEvent, HermesAgent};
-use hermes_core::auth::{default_auth_store_path, AuthStore};
+use hermes_core::auth::{default_auth_store_path, AuthMethod, AuthProfile, AuthStore};
 use hermes_core::client::{ClientConfig, OpenAIClient};
 use hermes_core::config::{
     install_runtime_config, load_app_config, AppConfig, BehaviorSettings, LoggingSettings,
@@ -126,6 +126,19 @@ enum Commands {
 #[derive(Debug, Subcommand)]
 enum AuthCommands {
     SetApiKey {
+        #[arg()]
+        provider: String,
+
+        #[arg(long)]
+        name: Option<String>,
+
+        #[arg(long = "env")]
+        env_var: Option<String>,
+
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    SetBearerToken {
         #[arg()]
         provider: String,
 
@@ -270,13 +283,14 @@ fn apply_auth_profile_to_client(
             auth_ref
         )
     })?;
-    if client.api_key.is_none() {
-        client.api_key = Some(store.resolve_api_key(auth_ref)?);
-    }
     let trusted_base_url = profile
         .base_url
         .clone()
-        .unwrap_or_else(|| hermes_core::config::ClientSettings::default().base_url);
+        .or_else(|| match profile.method {
+            AuthMethod::ApiKey => Some(hermes_core::config::ClientSettings::default().base_url),
+            AuthMethod::BearerToken => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("Bearer auth profile '{}' requires a base URL", auth_ref))?;
     let default_base_url = hermes_core::config::ClientSettings::default().base_url;
     if client.base_url != default_base_url && client.base_url != trusted_base_url {
         anyhow::bail!(
@@ -285,6 +299,15 @@ fn apply_auth_profile_to_client(
             trusted_base_url,
             client.base_url
         );
+    }
+    match profile.method {
+        AuthMethod::ApiKey if client.api_key.is_none() => {
+            client.api_key = Some(store.resolve_api_key(auth_ref)?);
+        }
+        AuthMethod::ApiKey => {}
+        AuthMethod::BearerToken => {
+            client.api_key = Some(store.resolve_auth_token(auth_ref)?);
+        }
     }
     client.base_url = trusted_base_url;
     Ok(client)
@@ -513,6 +536,32 @@ fn handle_auth_command(command: &AuthCommands) -> Result<()> {
             );
             println!("Auth metadata: {}", default_auth_store_path().display());
         }
+        AuthCommands::SetBearerToken {
+            provider,
+            name,
+            env_var,
+            base_url,
+        } => {
+            let profile_name = name
+                .clone()
+                .unwrap_or_else(|| format!("{}-default", provider));
+            let env_var = env_var
+                .clone()
+                .unwrap_or_else(|| default_bearer_token_env_var(provider));
+            let mut store = AuthStore::load_default()?;
+            store.upsert_bearer_token_env_profile(
+                profile_name.clone(),
+                provider.clone(),
+                env_var.clone(),
+                base_url.clone(),
+            )?;
+            store.save_default()?;
+            println!(
+                "Saved bearer auth profile '{}' for provider '{}' using env:{}",
+                profile_name, provider, env_var
+            );
+            println!("Auth metadata: {}", default_auth_store_path().display());
+        }
         AuthCommands::List => {
             let store = AuthStore::load_default()?;
             if store.profiles.is_empty() {
@@ -557,6 +606,15 @@ fn default_api_key_env_var(provider: &str) -> String {
         "anthropic" | "claude" => "ANTHROPIC_API_KEY".to_string(),
         "google" | "gemini" | "google-gemini" => "GOOGLE_API_KEY".to_string(),
         _ => "OPENAI_API_KEY".to_string(),
+    }
+}
+
+fn default_bearer_token_env_var(provider: &str) -> String {
+    match provider.to_ascii_lowercase().as_str() {
+        "google" | "gemini" | "google-gemini" | "vertex" | "vertex-ai" => {
+            "GOOGLE_OAUTH_ACCESS_TOKEN".to_string()
+        }
+        _ => "OAUTH_ACCESS_TOKEN".to_string(),
     }
 }
 
@@ -841,10 +899,41 @@ mod tests {
     }
 
     #[test]
+    fn auth_set_bearer_token_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "hermes",
+            "auth",
+            "set-bearer-token",
+            "google-gemini",
+            "--name",
+            "google-default",
+            "--env",
+            "GOOGLE_OAUTH_ACCESS_TOKEN",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                command: AuthCommands::SetBearerToken { .. }
+            }
+        ));
+    }
+
+    #[test]
     fn default_api_key_env_var_prefers_known_providers() {
         assert_eq!(default_api_key_env_var("openai"), "OPENAI_API_KEY");
         assert_eq!(default_api_key_env_var("claude"), "ANTHROPIC_API_KEY");
         assert_eq!(default_api_key_env_var("gemini"), "GOOGLE_API_KEY");
+    }
+
+    #[test]
+    fn default_bearer_token_env_var_prefers_google_oauth_token() {
+        assert_eq!(
+            default_bearer_token_env_var("google-gemini"),
+            "GOOGLE_OAUTH_ACCESS_TOKEN"
+        );
+        assert_eq!(default_bearer_token_env_var("custom"), "OAUTH_ACCESS_TOKEN");
     }
 
     #[test]
@@ -897,6 +986,61 @@ mod tests {
         };
 
         let result = apply_auth_profile_to_client(client, &store, "openai-default");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bearer_profile_overrides_ambient_api_key_for_bound_endpoint() {
+        let mut store = AuthStore::default();
+        store
+            .upsert_bearer_token_env_profile(
+                "google-default",
+                "google-gemini",
+                "GOOGLE_OAUTH_ACCESS_TOKEN",
+                Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            )
+            .unwrap();
+        let old_token = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN").ok();
+        std::env::set_var("GOOGLE_OAUTH_ACCESS_TOKEN", "google-token");
+        let client = ClientConfig {
+            api_key: Some("openai-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let resolved = apply_auth_profile_to_client(client, &store, "google-default").unwrap();
+
+        assert_eq!(resolved.api_key.as_deref(), Some("google-token"));
+        assert_eq!(
+            resolved.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        if let Some(old_token) = old_token {
+            std::env::set_var("GOOGLE_OAUTH_ACCESS_TOKEN", old_token);
+        } else {
+            std::env::remove_var("GOOGLE_OAUTH_ACCESS_TOKEN");
+        }
+    }
+
+    #[test]
+    fn bearer_profile_without_base_url_is_rejected_even_if_loaded_from_disk() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "broken-bearer".to_string(),
+            AuthProfile {
+                provider: "google-gemini".to_string(),
+                method: AuthMethod::BearerToken,
+                base_url: None,
+                secret_ref: "env:GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
+                disabled: false,
+            },
+        );
+        let client = ClientConfig {
+            api_key: Some("openai-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let result = apply_auth_profile_to_client(client, &store, "broken-bearer");
 
         assert!(result.is_err());
     }
