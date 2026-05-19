@@ -95,6 +95,7 @@ pub struct TranscriptEntry {
 
 #[derive(Debug, Clone)]
 pub struct SessionState {
+    pub title: String,
     pub transcript: Vec<TranscriptEntry>,
     pub active_query: String,
     pub streaming_response: String,
@@ -111,6 +112,7 @@ pub struct SessionState {
 impl SessionState {
     pub fn new(max_iterations: usize) -> Self {
         Self {
+            title: "New session".to_string(),
             transcript: Vec::new(),
             active_query: String::new(),
             streaming_response: String::new(),
@@ -342,6 +344,9 @@ impl AppState {
         self.remember_prompt(&query);
         self.clear_footer_notice();
         self.session.running = true;
+        if self.session.transcript.is_empty() {
+            self.session.title = derive_session_title(&query);
+        }
         self.session.error = None;
         self.session.final_message = None;
         self.session.active_query = query.clone();
@@ -518,6 +523,68 @@ impl AppState {
     }
 }
 
+fn derive_session_title(prompt: &str) -> String {
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return "New session".to_string();
+    }
+
+    let chars = normalized.chars().collect::<Vec<_>>();
+    let mut title = String::new();
+    let mut sentence_count = 0;
+    for (index, ch) in chars.iter().copied().enumerate() {
+        title.push(ch);
+        if is_sentence_boundary(&chars, index) {
+            sentence_count += 1;
+            if sentence_count >= 2 {
+                break;
+            }
+        }
+    }
+
+    if sentence_count == 0 {
+        title = normalized;
+    }
+
+    truncate(&title, 64)
+}
+
+fn is_sentence_boundary(chars: &[char], index: usize) -> bool {
+    if !matches!(chars[index], '.' | '!' | '?') {
+        return false;
+    }
+    if is_known_abbreviation_at(chars, index) {
+        return false;
+    }
+
+    chars[index + 1..]
+        .iter()
+        .copied()
+        .find(|ch| !ch.is_whitespace())
+        .is_none_or(char::is_uppercase)
+}
+
+fn is_known_abbreviation_at(chars: &[char], index: usize) -> bool {
+    let prefix = chars[..=index].iter().collect::<String>();
+    let token = prefix.split_whitespace().last().unwrap_or_default();
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "e.g."
+            | "i.e."
+            | "u.s."
+            | "u.k."
+            | "etc."
+            | "mr."
+            | "mrs."
+            | "ms."
+            | "dr."
+            | "prof."
+            | "sr."
+            | "jr."
+            | "vs."
+    )
+}
+
 fn choose_final_content(streamed: &str, final_message: &str) -> String {
     let streamed = streamed.trim();
     let final_message = final_message.trim();
@@ -654,6 +721,53 @@ mod tests {
                 .map(|notice| notice.text.as_str()),
             Some("follow-up prompt ready")
         );
+    }
+
+    #[test]
+    fn begin_run_auto_names_session_from_prompt() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+
+        state.begin_run(
+            "Fix the TUI scroll bug. Add tests for Windows terminals. Ignore unrelated files."
+                .to_string(),
+        );
+
+        assert_eq!(
+            state.session.title,
+            "Fix the TUI scroll bug. Add tests for Windows terminals."
+        );
+    }
+
+    #[test]
+    fn session_title_is_normalized_and_truncated() {
+        let title = derive_session_title(
+            "  Please   refactor the terminal user interface to support a much cleaner layout with panels, tabs, and responsive behavior across small screens  ",
+        );
+
+        assert_eq!(
+            title,
+            "Please refactor the terminal user interface to support a much..."
+        );
+    }
+
+    #[test]
+    fn follow_up_prompt_does_not_rename_existing_session() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.begin_run("Implement mouse scrolling".to_string());
+        state.apply_agent_event(AgentEvent::Done {
+            message: Message::assistant("done"),
+        });
+
+        state.begin_run("Also add tests".to_string());
+
+        assert_eq!(state.session.title, "Implement mouse scrolling");
+    }
+
+    #[test]
+    fn session_title_ignores_common_abbreviation_punctuation() {
+        let title = derive_session_title("Use e.g. Ratatui widgets. Add tests. Keep it small.");
+
+        assert_eq!(title, "Use e.g. Ratatui widgets. Add tests.");
     }
 
     #[test]

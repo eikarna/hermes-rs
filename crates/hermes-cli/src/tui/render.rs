@@ -448,6 +448,12 @@ fn header_widget(state: &AppState) -> Paragraph<'_> {
         Line::from(vec![
             Span::styled("status ", Style::default().fg(MUTED)),
             Span::styled(state.session.status.clone(), Style::default().fg(TEXT)),
+            Span::raw("  "),
+            Span::styled("session ", Style::default().fg(MUTED)),
+            Span::styled(
+                truncate_display(&state.session.title, 48),
+                Style::default().fg(HELP),
+            ),
         ]),
     ]))
     .block(
@@ -475,6 +481,11 @@ fn constrained_header_widget(state: &AppState, width: u16) -> Paragraph<'_> {
         ),
         Span::raw(" "),
         Span::styled(state.ui.active_panel.title(), Style::default().fg(ACCENT)),
+        Span::raw(" "),
+        Span::styled(
+            truncate_display(&state.session.title, width.saturating_sub(30) as usize),
+            Style::default().fg(HELP),
+        ),
     ]))
     .style(Style::default().bg(PANEL_ALT))
     .wrap(Wrap { trim: true })
@@ -1632,11 +1643,13 @@ mod tests {
     fn wide_workspace_renders_all_major_panels() {
         let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
         state.ui.view = ViewMode::Workspace;
+        state.session.title = "Fix mouse scrolling".to_string();
         state.set_layout_for_width(160);
         let text = buffer_text(&state, 160, 40);
         assert!(text.contains("Conversation"));
         assert!(text.contains("Reasoning"));
         assert!(text.contains("Activity"));
+        assert!(text.contains("Fix mouse scrolling"));
     }
 
     #[test]
