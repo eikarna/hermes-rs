@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use hermes_core::agent::AgentEvent;
+use hermes_core::agent::{AgentEvent, AgentTelemetry};
 use hermes_core::client::Message;
 use hermes_core::config::{AppConfig, BehaviorSettings, McpTransportKind};
 
@@ -93,6 +93,17 @@ pub struct TranscriptEntry {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TelemetryState {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+    pub context_window: usize,
+    pub compacted: bool,
+    pub estimated: bool,
+    pub total_cost: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub title: String,
@@ -107,6 +118,7 @@ pub struct SessionState {
     pub error: Option<String>,
     pub final_message: Option<String>,
     pub running: bool,
+    pub telemetry: TelemetryState,
 }
 
 impl SessionState {
@@ -128,6 +140,7 @@ impl SessionState {
             error: None,
             final_message: None,
             running: false,
+            telemetry: TelemetryState::default(),
         }
     }
 }
@@ -169,6 +182,7 @@ pub struct UiState {
     pub conversation_scroll: u16,
     pub conversation_follow_tail: bool,
     pub prompt_input: String,
+    pub pending_shell_command: Option<String>,
     pub prompt_history: Vec<String>,
     pub prompt_history_index: Option<usize>,
     pub prompt_history_draft: Option<String>,
@@ -217,13 +231,14 @@ impl AppState {
                 conversation_scroll: 0,
                 conversation_follow_tail: true,
                 prompt_input: prompt,
+                pending_shell_command: None,
                 prompt_history: Vec::new(),
                 prompt_history_index: None,
                 prompt_history_draft: None,
                 selected_mcp: 0,
                 selected_skill: 0,
                 selected_behavior: 0,
-                footer_help: "tab panels  w/m/s/b views  ctrl+l new session  q quit".to_string(),
+                footer_help: "tab panels  ! shell  ctrl+l new session  q quit".to_string(),
                 footer_notice: None,
                 modal: None,
                 should_quit: false,
@@ -327,6 +342,7 @@ impl AppState {
                     Tone::Info,
                 );
             }
+            AgentEvent::Telemetry { telemetry } => self.apply_telemetry(telemetry),
             AgentEvent::Error { error } => {
                 self.session.error = Some(error.clone());
                 self.session.status = "Errored".to_string();
@@ -360,6 +376,31 @@ impl AppState {
         });
     }
 
+    pub fn begin_shell_run(&mut self, command: String) {
+        self.ui.view = ViewMode::Workspace;
+        self.ui.active_panel = ActivePanel::Session;
+        self.ui.input_mode = InputMode::Command;
+        self.ui.conversation_scroll = 0;
+        self.ui.conversation_follow_tail = true;
+        self.remember_prompt(&format!("!{}", command));
+        self.clear_footer_notice();
+        self.session.running = true;
+        if self.session.transcript.is_empty() {
+            self.session.title = derive_session_title(&format!("shell: {}", command));
+        }
+        self.session.error = None;
+        self.session.final_message = None;
+        self.session.active_query = format!("$ {}", command);
+        self.session.streaming_response.clear();
+        self.session.reasoning.clear();
+        self.session.current_iteration = 0;
+        self.session.status = "Running shell command".to_string();
+        self.session.transcript.push(TranscriptEntry {
+            role: "Shell",
+            content: command,
+        });
+    }
+
     pub fn fail_run(&mut self, error: String) {
         self.session.running = false;
         self.session.error = Some(error.clone());
@@ -377,6 +418,7 @@ impl AppState {
         let max_iterations = self.persistent.behavior.max_iterations;
         self.session = SessionState::new(max_iterations);
         self.ui.prompt_input.clear();
+        self.ui.pending_shell_command = None;
         self.ui.view = ViewMode::Landing;
         self.ui.input_mode = InputMode::Command;
         self.ui.conversation_scroll = 0;
@@ -410,6 +452,7 @@ impl AppState {
     }
 
     pub fn prompt_history_previous(&mut self) {
+        self.ui.pending_shell_command = None;
         if self.ui.prompt_history.is_empty() {
             return;
         }
@@ -430,6 +473,7 @@ impl AppState {
     }
 
     pub fn prompt_history_next(&mut self) {
+        self.ui.pending_shell_command = None;
         let Some(index) = self.ui.prompt_history_index else {
             return;
         };
@@ -520,6 +564,29 @@ impl AppState {
         }
         self.push_activity("Done", "Response finished.", Tone::Success);
         self.set_footer_notice("follow-up prompt ready", Tone::Success);
+    }
+
+    fn apply_telemetry(&mut self, telemetry: AgentTelemetry) {
+        if !self.persistent.config.telemetry.enabled {
+            return;
+        }
+
+        if telemetry.billable {
+            self.session.telemetry.total_cost += self.telemetry_cost(&telemetry);
+        }
+
+        self.session.telemetry.prompt_tokens = telemetry.prompt_tokens;
+        self.session.telemetry.completion_tokens = telemetry.completion_tokens;
+        self.session.telemetry.total_tokens = telemetry.total_tokens;
+        self.session.telemetry.context_window = telemetry.context_window;
+        self.session.telemetry.compacted = telemetry.compacted;
+        self.session.telemetry.estimated = telemetry.estimated;
+    }
+
+    fn telemetry_cost(&self, telemetry: &AgentTelemetry) -> f64 {
+        let settings = &self.persistent.config.telemetry;
+        (telemetry.prompt_tokens as f64 / 1_000_000.0) * settings.input_cost_per_million
+            + (telemetry.completion_tokens as f64 / 1_000_000.0) * settings.output_cost_per_million
     }
 }
 
@@ -721,6 +788,41 @@ mod tests {
                 .map(|notice| notice.text.as_str()),
             Some("follow-up prompt ready")
         );
+    }
+
+    #[test]
+    fn telemetry_updates_context_and_cost() {
+        let mut config = AppConfig::default();
+        config.telemetry.currency = "EUR".to_string();
+        config.telemetry.input_cost_per_million = 2.0;
+        config.telemetry.output_cost_per_million = 6.0;
+        let mut state = AppState::new(config, String::new(), false);
+
+        state.apply_agent_event(AgentEvent::Telemetry {
+            telemetry: AgentTelemetry {
+                prompt_tokens: 1_000,
+                completion_tokens: 500,
+                total_tokens: 1_500,
+                context_window: 10_000,
+                compacted: true,
+                estimated: false,
+                billable: true,
+            },
+        });
+
+        assert_eq!(state.session.telemetry.total_tokens, 1_500);
+        assert!(state.session.telemetry.compacted);
+        assert!((state.session.telemetry.total_cost - 0.005).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn shell_runs_use_shell_transcript_role() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.begin_shell_run("echo hello".to_string());
+
+        assert_eq!(state.session.status, "Running shell command");
+        assert_eq!(state.session.active_query, "$ echo hello");
+        assert_eq!(state.session.transcript[0].role, "Shell");
     }
 
     #[test]

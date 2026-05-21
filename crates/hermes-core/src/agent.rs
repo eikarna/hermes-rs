@@ -14,11 +14,13 @@ use crate::client::{
     ChatResponse, ChatStreamEvent, ChatStreamResponse, Message, OpenAIClient, ToolCall,
 };
 use crate::config::{runtime_config, BehaviorSettings};
+use crate::context::{estimate_message_tokens, estimate_tokens};
 use crate::context_files::{load_default_context_files, load_workspace_context};
 use crate::distillation::distill_session_to_memory;
 use crate::error::{Error, Result};
 use crate::memory::MemoryManager;
 use crate::parser::{ToolCallParser, ToolCallStreamParser};
+use crate::schema::ToolSchema;
 use crate::tools::{ToolContext, ToolRegistry, ToolResult};
 
 /// Configuration for the Hermes agent
@@ -82,8 +84,21 @@ pub enum AgentEvent {
     Done { message: Message },
     /// Agent iteration completed
     IterationComplete { iteration: usize },
+    /// Token, context, and compaction telemetry
+    Telemetry { telemetry: AgentTelemetry },
     /// Agent error
     Error { error: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentTelemetry {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+    pub context_window: usize,
+    pub compacted: bool,
+    pub estimated: bool,
+    pub billable: bool,
 }
 
 /// Hermes Agent for tool orchestration
@@ -195,19 +210,37 @@ impl HermesAgent {
 
             // Get tool schemas
             let tools = self.registry.get_schemas().await;
+            let (request_messages, preflight_telemetry) =
+                self.prepare_request_messages(&messages, &tools)?;
+            self.emit(AgentEvent::Telemetry {
+                telemetry: preflight_telemetry.clone(),
+            })
+            .await;
 
             let response = if self.config.stream {
                 let stream = self
                     .client
-                    .chat_streaming(&self.config.model, &messages, Some(&tools))
+                    .chat_streaming(&self.config.model, &request_messages, Some(&tools))
                     .await?;
-                self.process_stream(stream).await
+                match self.process_stream(stream, &preflight_telemetry).await {
+                    Ok((response_text, reasoning_text, tool_calls)) => {
+                        self.emit_stream_telemetry(
+                            &preflight_telemetry,
+                            &response_text,
+                            &reasoning_text,
+                            &tool_calls,
+                        )
+                        .await;
+                        Ok((response_text, reasoning_text, tool_calls))
+                    }
+                    Err(error) => Err(error),
+                }
             } else {
                 let response = self
                     .client
-                    .chat(&self.config.model, &messages, Some(&tools))
+                    .chat(&self.config.model, &request_messages, Some(&tools))
                     .await?;
-                self.process_response(response).await
+                self.process_response(response, &preflight_telemetry).await
             };
 
             match response {
@@ -343,6 +376,85 @@ impl HermesAgent {
         blocks.join("\n\n")
     }
 
+    fn prepare_request_messages(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Result<(Vec<Message>, AgentTelemetry)> {
+        let context_window = self.config.context_window.max(1);
+        let tool_tokens = total_tool_schema_tokens(tools);
+        let prompt_tokens = total_message_tokens(messages) + tool_tokens;
+        let compacted = prompt_tokens > context_window;
+        let message_budget = context_window.saturating_sub(tool_tokens).max(1);
+        let request_messages = if compacted {
+            compact_request_messages(messages, message_budget)
+        } else {
+            messages.to_vec()
+        };
+        let prompt_tokens = total_message_tokens(&request_messages) + tool_tokens;
+
+        Ok((
+            request_messages,
+            AgentTelemetry {
+                prompt_tokens,
+                completion_tokens: 0,
+                total_tokens: prompt_tokens,
+                context_window,
+                compacted,
+                estimated: true,
+                billable: false,
+            },
+        ))
+    }
+
+    async fn emit_stream_telemetry(
+        &self,
+        preflight: &AgentTelemetry,
+        response_text: &str,
+        reasoning_text: &str,
+        tool_calls: &[ToolCall],
+    ) {
+        let completion_tokens = estimate_tokens(response_text)
+            + estimate_tokens(reasoning_text)
+            + total_tool_call_tokens(tool_calls);
+        self.emit(AgentEvent::Telemetry {
+            telemetry: AgentTelemetry {
+                prompt_tokens: preflight.prompt_tokens,
+                completion_tokens,
+                total_tokens: preflight.prompt_tokens + completion_tokens,
+                context_window: preflight.context_window,
+                compacted: preflight.compacted,
+                estimated: true,
+                billable: true,
+            },
+        })
+        .await;
+    }
+
+    async fn emit_stream_telemetry_snapshot(
+        &self,
+        preflight: &AgentTelemetry,
+        response_text: &str,
+        reasoning_text: &str,
+        tool_calls: &[ToolCall],
+    ) {
+        let completion_tokens = estimate_tokens(response_text)
+            + estimate_tokens(reasoning_text)
+            + total_tool_call_tokens(tool_calls);
+        self.emit(AgentEvent::Telemetry {
+            telemetry: AgentTelemetry {
+                prompt_tokens: preflight.prompt_tokens,
+                completion_tokens,
+                total_tokens: preflight.prompt_tokens + completion_tokens,
+                context_window: preflight.context_window,
+                compacted: preflight.compacted,
+                estimated: true,
+                billable: false,
+            },
+        })
+        .await;
+    }
+
     fn spawn_session_distillation(&self, history: Vec<Message>) {
         let Some(memory_manager) = self.memory_manager.clone() else {
             return;
@@ -363,6 +475,7 @@ impl HermesAgent {
     async fn process_stream(
         &self,
         mut stream: ChatStreamResponse,
+        preflight: &AgentTelemetry,
     ) -> Result<(String, String, Vec<ToolCall>)> {
         let mut parser = ToolCallStreamParser::new().on_tool_call(|tc| {
             let tc_id = tc.id.clone();
@@ -384,6 +497,13 @@ impl HermesAgent {
                         if !reasoning.is_empty() {
                             accumulated_reasoning.push_str(&reasoning);
                             self.emit(AgentEvent::Reasoning { text: reasoning }).await;
+                            self.emit_stream_telemetry_snapshot(
+                                preflight,
+                                &accumulated_text,
+                                &accumulated_reasoning,
+                                &tool_calls,
+                            )
+                            .await;
                         }
                     }
 
@@ -402,6 +522,13 @@ impl HermesAgent {
                             if !visible_text.is_empty() {
                                 accumulated_text.push_str(&visible_text);
                                 self.emit(AgentEvent::Content { text: visible_text }).await;
+                                self.emit_stream_telemetry_snapshot(
+                                    preflight,
+                                    &accumulated_text,
+                                    &accumulated_reasoning,
+                                    &tool_calls,
+                                )
+                                .await;
                             }
                         }
 
@@ -411,13 +538,30 @@ impl HermesAgent {
                                 text: reasoning_delta,
                             })
                             .await;
+                            self.emit_stream_telemetry_snapshot(
+                                preflight,
+                                &accumulated_text,
+                                &accumulated_reasoning,
+                                &tool_calls,
+                            )
+                            .await;
                         }
                     }
 
                     // Extract any tool calls from native provider tool-call deltas
                     let chunk_tool_calls = extract_tool_calls_from_event(&event);
+                    let had_native_tool_calls = !chunk_tool_calls.is_empty();
                     for tc in chunk_tool_calls {
                         merge_stream_tool_call(&mut tool_calls, tc);
+                    }
+                    if had_native_tool_calls {
+                        self.emit_stream_telemetry_snapshot(
+                            preflight,
+                            &accumulated_text,
+                            &accumulated_reasoning,
+                            &tool_calls,
+                        )
+                        .await;
                     }
                 }
                 Err(e) => {
@@ -458,7 +602,9 @@ impl HermesAgent {
     async fn process_response(
         &self,
         response: ChatResponse,
+        preflight: &AgentTelemetry,
     ) -> Result<(String, String, Vec<ToolCall>)> {
+        let usage = response.usage.clone();
         let choice = response
             .choices
             .into_iter()
@@ -492,6 +638,18 @@ impl HermesAgent {
             })
             .await;
         }
+        self.emit(AgentEvent::Telemetry {
+            telemetry: AgentTelemetry {
+                prompt_tokens: usage.prompt_tokens as usize,
+                completion_tokens: usage.completion_tokens as usize,
+                total_tokens: usage.total_tokens as usize,
+                context_window: preflight.context_window,
+                compacted: preflight.compacted,
+                estimated: false,
+                billable: true,
+            },
+        })
+        .await;
 
         Ok((content, reasoning, tool_calls))
     }
@@ -593,6 +751,100 @@ impl HermesAgent {
             }
         }
     }
+}
+
+fn total_message_tokens(messages: &[Message]) -> usize {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+fn total_tool_schema_tokens(tools: &[ToolSchema]) -> usize {
+    tools
+        .iter()
+        .map(|tool| {
+            serde_json::to_string(tool)
+                .map(|raw| estimate_tokens(&raw))
+                .unwrap_or_default()
+        })
+        .sum()
+}
+
+fn total_tool_call_tokens(tool_calls: &[ToolCall]) -> usize {
+    tool_calls
+        .iter()
+        .map(|tool_call| {
+            serde_json::to_string(tool_call)
+                .map(|raw| estimate_tokens(&raw))
+                .unwrap_or_default()
+        })
+        .sum()
+}
+
+fn compact_request_messages(messages: &[Message], max_tokens: usize) -> Vec<Message> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let (system, body) = if messages[0].role == crate::client::Role::System {
+        (Some(messages[0].clone()), &messages[1..])
+    } else {
+        (None, messages)
+    };
+
+    let mut groups = Vec::<Vec<Message>>::new();
+    let mut index = body.len();
+    while index > 0 {
+        let end = index;
+        index -= 1;
+        if body[index].role == crate::client::Role::Tool {
+            while index > 0 && body[index - 1].role == crate::client::Role::Tool {
+                index -= 1;
+            }
+            if index > 0
+                && body[index - 1].role == crate::client::Role::Assistant
+                && body[index - 1].tool_calls.is_some()
+            {
+                index -= 1;
+            }
+            groups.push(body[index..end].to_vec());
+        } else {
+            groups.push(vec![body[index].clone()]);
+        }
+    }
+
+    let latest_user_group = groups.iter().position(|group| {
+        group
+            .iter()
+            .any(|message| message.role == crate::client::Role::User)
+    });
+    let mut used_tokens = system
+        .as_ref()
+        .map(estimate_message_tokens)
+        .unwrap_or_default();
+    let mut selected = Vec::<(usize, Vec<Message>)>::new();
+    for (group_index, group) in groups.into_iter().enumerate() {
+        let group_tokens = total_message_tokens(&group);
+        if selected.is_empty()
+            || latest_user_group == Some(group_index)
+            || used_tokens + group_tokens <= max_tokens
+        {
+            used_tokens += group_tokens;
+            selected.push((group_index, group));
+        } else if latest_user_group.is_some_and(|index| group_index < index) {
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    let mut compacted = Vec::new();
+    if let Some(system) = system {
+        compacted.push(system);
+    }
+    selected.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, group) in selected {
+        compacted.extend(group);
+    }
+    compacted
 }
 
 /// Extract text content from a streaming event
@@ -809,10 +1061,14 @@ fn merge_stream_tool_call(tool_calls: &mut Vec<ToolCall>, tool_call: ToolCall) {
             existing.function.name = tool_call.function.name;
         }
         if !tool_call.function.arguments.is_empty() {
-            existing
-                .function
-                .arguments
-                .push_str(&tool_call.function.arguments);
+            if existing.function.arguments == "{}" {
+                existing.function.arguments = tool_call.function.arguments;
+            } else {
+                existing
+                    .function
+                    .arguments
+                    .push_str(&tool_call.function.arguments);
+            }
         }
     } else {
         tool_calls.push(tool_call);
@@ -1330,12 +1586,279 @@ mod tests {
             },
         };
 
-        let (content, reasoning, tool_calls) = agent.process_response(response).await.unwrap();
+        let telemetry = AgentTelemetry {
+            prompt_tokens: 1,
+            completion_tokens: 0,
+            total_tokens: 1,
+            context_window: 128_000,
+            compacted: false,
+            estimated: true,
+            billable: false,
+        };
+        let (content, reasoning, tool_calls) =
+            agent.process_response(response, &telemetry).await.unwrap();
 
         assert_eq!(content, "");
         assert_eq!(reasoning, "need tool");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].function.name, "datetime");
+    }
+
+    #[tokio::test]
+    async fn request_messages_auto_compact_when_context_is_full() {
+        let config = AgentConfig {
+            context_window: 20,
+            ..AgentConfig::default()
+        };
+        let agent = HermesAgent::new(
+            config,
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent
+            .user_message("first long message that should be compacted away")
+            .await;
+        agent
+            .user_message("second long message that should remain newest")
+            .await;
+
+        let messages = agent.build_messages().await.unwrap();
+        let (request_messages, telemetry) = agent.prepare_request_messages(&messages, &[]).unwrap();
+
+        assert!(telemetry.compacted);
+        assert!(request_messages.len() < messages.len());
+        assert!(request_messages
+            .iter()
+            .any(|message| message.content.contains("second long message")));
+    }
+
+    #[tokio::test]
+    async fn request_messages_count_tool_schema_tokens() {
+        let config = AgentConfig {
+            context_window: 80,
+            ..AgentConfig::default()
+        };
+        let agent = HermesAgent::new(
+            config,
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let messages = vec![
+            Message::system("system"),
+            Message::user("older message that can be compacted"),
+            Message::user("latest request"),
+        ];
+        let tools = vec![ToolSchema::new(
+            "large_tool",
+            "large tool description".repeat(20),
+            serde_json::json!({ "type": "object", "properties": { "query": { "type": "string" } } }),
+        )];
+
+        let (request_messages, telemetry) =
+            agent.prepare_request_messages(&messages, &tools).unwrap();
+
+        assert!(telemetry.compacted);
+        assert!(telemetry.prompt_tokens >= total_tool_schema_tokens(&tools));
+        assert!(request_messages
+            .iter()
+            .any(|message| message.content == "latest request"));
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_incremental_telemetry() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let agent = HermesAgent::with_events(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+            tx,
+        );
+        let chunks: Vec<std::result::Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"demo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello world, this is a longer streamed chunk. \"},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"demo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Second streamed chunk for telemetry.\"},\"finish_reason\":null}]}\n\n",
+            )),
+        ];
+        let stream = ChatStreamResponse::new(futures::stream::iter(chunks));
+        let preflight = AgentTelemetry {
+            prompt_tokens: 10,
+            completion_tokens: 0,
+            total_tokens: 10,
+            context_window: 100,
+            compacted: false,
+            estimated: true,
+            billable: false,
+        };
+
+        let (content, _, _) = agent.process_stream(stream, &preflight).await.unwrap();
+
+        assert!(content.contains("Second streamed chunk"));
+        let mut telemetry_events = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::Telemetry { .. }) {
+                telemetry_events += 1;
+            }
+        }
+        assert!(telemetry_events >= 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_telemetry_counts_native_tool_calls() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let agent = HermesAgent::with_events(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+            tx,
+        );
+        let chunks: Vec<std::result::Result<bytes::Bytes, reqwest::Error>> = vec![Ok(
+            bytes::Bytes::from_static(
+                b"data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"demo\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"datetime\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+            ),
+        )];
+        let stream = ChatStreamResponse::new(futures::stream::iter(chunks));
+        let preflight = AgentTelemetry {
+            prompt_tokens: 10,
+            completion_tokens: 0,
+            total_tokens: 10,
+            context_window: 100,
+            compacted: false,
+            estimated: true,
+            billable: false,
+        };
+
+        let (_, _, tool_calls) = agent.process_stream(stream, &preflight).await.unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        let mut max_completion_tokens = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Telemetry { telemetry } = event {
+                max_completion_tokens = max_completion_tokens.max(telemetry.completion_tokens);
+            }
+        }
+        assert!(max_completion_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn process_stream_handles_anthropic_style_events() {
+        let agent = HermesAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let chunks: Vec<std::result::Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"checking\"}}\n\n",
+            )),
+            Ok(bytes::Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello from Claude\"}}\n\n",
+            )),
+            Ok(bytes::Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"datetime\",\"input\":{}}}\n\n",
+            )),
+            Ok(bytes::Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            )),
+        ];
+        let stream = ChatStreamResponse::new(futures::stream::iter(chunks));
+        let preflight = AgentTelemetry {
+            prompt_tokens: 10,
+            completion_tokens: 0,
+            total_tokens: 10,
+            context_window: 100,
+            compacted: false,
+            estimated: true,
+            billable: false,
+        };
+
+        let (content, reasoning, tool_calls) =
+            agent.process_stream(stream, &preflight).await.unwrap();
+
+        assert_eq!(content, "Hello from Claude");
+        assert_eq!(reasoning, "checking");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "toolu_1");
+        assert_eq!(tool_calls[0].function.name, "datetime");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[tokio::test]
+    async fn process_stream_keeps_empty_anthropic_tool_input_valid_json() {
+        let agent = HermesAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let chunks: Vec<std::result::Result<bytes::Bytes, reqwest::Error>> = vec![Ok(
+            bytes::Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_empty\",\"name\":\"datetime\",\"input\":{}}}\n\n",
+            ),
+        )];
+        let stream = ChatStreamResponse::new(futures::stream::iter(chunks));
+        let preflight = AgentTelemetry {
+            prompt_tokens: 10,
+            completion_tokens: 0,
+            total_tokens: 10,
+            context_window: 100,
+            compacted: false,
+            estimated: true,
+            billable: false,
+        };
+
+        let (_, _, tool_calls) = agent.process_stream(stream, &preflight).await.unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn compact_request_messages_keeps_oversized_latest_user_request() {
+        let messages = vec![
+            Message::system("system"),
+            Message::user("older context that can be dropped"),
+            Message::user("latest oversized user request that must still reach the model"),
+        ];
+
+        let compacted = compact_request_messages(&messages, 4);
+
+        assert!(compacted
+            .iter()
+            .any(|message| message.content.contains("latest oversized")));
+    }
+
+    #[test]
+    fn compact_request_messages_preserves_tool_call_group() {
+        let assistant = Message::assistant("calling tool").with_tool_calls(vec![ToolCall {
+            id: "call_1".to_string(),
+            function: crate::client::ToolCallFunction {
+                name: "datetime".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        let messages = vec![
+            Message::system("system"),
+            Message::user("latest user request that caused the tool call"),
+            assistant,
+            Message::tool("call_1", "tool result"),
+        ];
+
+        let compacted = compact_request_messages(&messages, 4);
+
+        let tool_index = compacted
+            .iter()
+            .position(|message| message.role == crate::client::Role::Tool)
+            .expect("tool result should be preserved");
+        assert!(compacted
+            .iter()
+            .any(|message| message.content.contains("latest user request")));
+        assert!(tool_index > 0);
+        assert_eq!(
+            compacted[tool_index - 1].role,
+            crate::client::Role::Assistant
+        );
+        assert!(compacted[tool_index - 1].tool_calls.is_some());
     }
 
     #[tokio::test]

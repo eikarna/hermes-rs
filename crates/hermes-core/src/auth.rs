@@ -740,13 +740,21 @@ mod tests {
     use super::*;
 
     fn temp_auth_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("hermes_auth_{}_{}.json", name, std::process::id()))
+        std::env::temp_dir()
+            .join(format!("hermes_auth_{}_{}", name, std::process::id()))
+            .join("auth.json")
+    }
+
+    fn cleanup_auth_path(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 
     #[test]
     fn auth_store_round_trips_without_secret_values() {
         let path = temp_auth_path("round_trip");
-        let _ = fs::remove_file(&path);
+        cleanup_auth_path(&path);
         let mut store = AuthStore::default();
         store
             .upsert_api_key_env_profile(
@@ -769,13 +777,13 @@ mod tests {
             Some("OPENAI_API_KEY")
         );
 
-        let _ = fs::remove_file(path);
+        cleanup_auth_path(&path);
     }
 
     #[test]
     fn bearer_token_profile_round_trips_without_secret_values() {
         let path = temp_auth_path("bearer_round_trip");
-        let _ = fs::remove_file(&path);
+        cleanup_auth_path(&path);
         let mut store = AuthStore::default();
         store
             .upsert_bearer_token_env_profile(
@@ -802,7 +810,7 @@ mod tests {
             Some("GOOGLE_OAUTH_ACCESS_TOKEN")
         );
 
-        let _ = fs::remove_file(path);
+        cleanup_auth_path(&path);
     }
 
     #[test]
@@ -837,7 +845,8 @@ mod tests {
     #[test]
     fn load_rejects_bearer_profile_without_base_url() {
         let path = temp_auth_path("broken_bearer_load");
-        let _ = fs::remove_file(&path);
+        cleanup_auth_path(&path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
             r#"{
@@ -858,7 +867,7 @@ mod tests {
         let result = AuthStore::load_from(&path);
 
         assert!(result.is_err());
-        let _ = fs::remove_file(path);
+        cleanup_auth_path(&path);
     }
 
     #[test]

@@ -48,6 +48,13 @@ refresh_rate_ms = 80
 compact_width = 96
 medium_width = 120
 
+[telemetry]
+enabled = true
+currency = "USD"
+# Set these to your provider/model prices to show estimated spend.
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+
 [mcp]
 autoload = true
 

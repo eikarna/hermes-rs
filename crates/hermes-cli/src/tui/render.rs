@@ -447,7 +447,7 @@ fn header_widget(state: &AppState) -> Paragraph<'_> {
         ]),
         Line::from(vec![
             Span::styled("status ", Style::default().fg(MUTED)),
-            Span::styled(state.session.status.clone(), Style::default().fg(TEXT)),
+            Span::styled(progress_indicator(state), Style::default().fg(TEXT)),
             Span::raw("  "),
             Span::styled("session ", Style::default().fg(MUTED)),
             Span::styled(
@@ -763,6 +763,24 @@ fn status_summary(state: &AppState) -> String {
     }
 }
 
+fn progress_indicator(state: &AppState) -> String {
+    if !state.session.running {
+        return state.session.status.clone();
+    }
+
+    let max = state.persistent.behavior.max_iterations.max(1);
+    let step = state.session.current_iteration.max(1).min(max);
+    let filled = (step * 10).div_ceil(max).min(10);
+    format!(
+        "[{}{}] step {}/{} - {}",
+        "#".repeat(filled),
+        "-".repeat(10 - filled),
+        step,
+        max,
+        state.session.status
+    )
+}
+
 fn status_color(state: &AppState) -> Color {
     if state.session.running {
         ACCENT
@@ -844,6 +862,18 @@ fn session_summary_widget(state: &AppState) -> Paragraph<'_> {
             ),
         ]),
         Line::from(vec![
+            Span::styled("context ", Style::default().fg(MUTED)),
+            Span::styled(context_usage_summary(state), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("auto compaction ", Style::default().fg(MUTED)),
+            Span::styled(compaction_summary(state), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("spend ", Style::default().fg(MUTED)),
+            Span::styled(cost_summary(state), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
             Span::styled("needs rebuild ", Style::default().fg(MUTED)),
             Span::styled(
                 state.persistent.needs_rebuild.to_string(),
@@ -853,6 +883,52 @@ fn session_summary_widget(state: &AppState) -> Paragraph<'_> {
     ]))
     .block(panel_block("Session"))
     .wrap(Wrap { trim: true })
+}
+
+fn context_usage_summary(state: &AppState) -> String {
+    let telemetry = &state.session.telemetry;
+    if !state.persistent.config.telemetry.enabled {
+        return "disabled".to_string();
+    }
+    if telemetry.context_window == 0 || telemetry.total_tokens == 0 {
+        return "waiting for token usage".to_string();
+    }
+
+    let used = telemetry.total_tokens;
+    let window = telemetry.context_window;
+    let percent = (used as f64 / window as f64 * 100.0).min(999.9);
+    let remaining = 100.0_f64 - percent.min(100.0);
+    let source = if telemetry.estimated { " est" } else { "" };
+    format!("{used}/{window} tokens ({percent:.1}% full, {remaining:.1}% before full){source}")
+}
+
+fn compaction_summary(state: &AppState) -> String {
+    let telemetry = &state.session.telemetry;
+    if !state.persistent.config.telemetry.enabled {
+        return "disabled".to_string();
+    }
+    if telemetry.context_window == 0 {
+        return "waiting".to_string();
+    }
+    if telemetry.compacted {
+        "applied for latest request".to_string()
+    } else {
+        "not needed".to_string()
+    }
+}
+
+fn cost_summary(state: &AppState) -> String {
+    let settings = &state.persistent.config.telemetry;
+    if !settings.enabled {
+        return "disabled".to_string();
+    }
+    if settings.input_cost_per_million == 0.0 && settings.output_cost_per_million == 0.0 {
+        return format!("{} rates not configured", settings.currency);
+    }
+    format!(
+        "{} {:.4}",
+        settings.currency, state.session.telemetry.total_cost
+    )
 }
 
 fn render_session_compact_widget(frame: &mut Frame<'_>, state: &AppState, area: Rect) {

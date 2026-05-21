@@ -130,6 +130,13 @@ commit_message = "Auto-commit by hermes-rs"
 rich_output = true
 landing_title = "HERMES"
 prompt_placeholder = "Ask anything... \"Fix a TODO in the codebase\""
+
+[telemetry]
+enabled = true
+currency = "USD"
+# Optional provider/model rates for spend estimates.
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
 ```
 
 Or use environment variables:
@@ -207,6 +214,7 @@ OAuth browser/device login is intentionally not enabled until provider-specific 
 - `hermes chat` starts on a prompt-first landing screen
 - `i` enters prompt editing, and typing on landing also bootstraps prompt entry immediately
 - `Enter` runs the current prompt
+- Prefix a prompt with `!` or `$ ` to prepare a shell command in the workspace, then press `Enter` again to confirm and run it
 - `Up` / `Down` in prompt mode replay recent prompts from history
 - `Tab` cycles workspace panels
 - `Up` / `Down` scroll the chat in command mode
@@ -214,6 +222,8 @@ OAuth browser/device login is intentionally not enabled until provider-specific 
 - `Ctrl+L` starts a fresh session when you want to discard the current conversation history
 - The workspace uses a split desktop layout at 120 columns and above, stacks panels below that, and collapses secondary panels into popups below 65 columns or 20 rows
 - The Reasoning pane renders model thinking with quote rails, while tool calls in Activity render as compact blocks for easier scanning
+- The header shows a step progress indicator while a run is active, and the Session panel updates token/context usage during streaming, remaining context percentage, latest auto-compaction status, and estimated spend when `[telemetry]` rates are configured
+- Streaming responses normalize both OpenAI-compatible chat-completion chunks and Claude/Anthropic-style SSE text, thinking, and tool-use deltas into the same TUI event flow
 - After a run completes or fails, the workspace returns to prompt mode so you can send a follow-up in the same session
 - `stream = false` now uses the non-streaming response path instead of the streaming parser
 

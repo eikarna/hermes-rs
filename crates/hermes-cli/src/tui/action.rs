@@ -17,6 +17,7 @@ pub enum Action {
     CloseModal,
     UpdateModal(Modal),
     StartRun(String),
+    StartShellRun(String),
     AgentEvent(AgentEvent),
     ClearSession,
     SyncMcp(Vec<McpServerItem>),
@@ -43,20 +44,24 @@ impl AppState {
             }
             Action::AppendPrompt(ch) => {
                 self.detach_prompt_history_navigation();
+                self.ui.pending_shell_command = None;
                 self.ui.prompt_input.push(ch);
             }
             Action::PromptBackspace => {
                 self.detach_prompt_history_navigation();
+                self.ui.pending_shell_command = None;
                 self.ui.prompt_input.pop();
             }
             Action::ClearPrompt => {
                 self.detach_prompt_history_navigation();
+                self.ui.pending_shell_command = None;
                 self.ui.prompt_input.clear();
             }
             Action::OpenModal(modal) => self.ui.modal = Some(modal),
             Action::CloseModal => self.ui.modal = None,
             Action::UpdateModal(modal) => self.ui.modal = Some(modal),
             Action::StartRun(query) => self.begin_run(query),
+            Action::StartShellRun(command) => self.begin_shell_run(command),
             Action::AgentEvent(event) => self.apply_agent_event(event),
             Action::ClearSession => self.clear_session(),
             Action::SyncMcp(servers) => {

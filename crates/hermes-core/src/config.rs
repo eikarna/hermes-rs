@@ -15,10 +15,31 @@ pub struct AppConfig {
     pub autonomous: AutonomousSettings,
     pub logging: LoggingSettings,
     pub tui: TuiSettings,
+    pub telemetry: TelemetrySettings,
     pub mcp: McpSettings,
     pub skills: SkillsSettings,
     pub gateway: GatewaySettings,
     pub tools: ToolSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetrySettings {
+    pub enabled: bool,
+    pub currency: String,
+    pub input_cost_per_million: f64,
+    pub output_cost_per_million: f64,
+}
+
+impl Default for TelemetrySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            currency: "USD".to_string(),
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

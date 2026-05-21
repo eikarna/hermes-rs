@@ -17,6 +17,7 @@ use hermes_core::client::Message;
 use hermes_core::config::{AppConfig, McpServerConfig, McpTransportKind};
 use hermes_core::mcp::McpManager;
 use hermes_core::skills::SkillManager;
+use hermes_core::tools::{HermesTool, TerminalTool, ToolContext, ToolResult};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -426,6 +427,31 @@ impl TuiApp {
             return;
         }
 
+        if let Some(command) = parse_shell_input(&query) {
+            if self.state.ui.pending_shell_command.as_deref() != Some(command.as_str()) {
+                self.state.ui.pending_shell_command = Some(command);
+                self.state.set_footer_notice(
+                    "shell command ready; press Enter again to run",
+                    Tone::Warning,
+                );
+                return;
+            }
+            self.state.ui.pending_shell_command = None;
+            if self.agent.is_none() || self.state.persistent.needs_rebuild {
+                if let Err(error) = self.rebuild_agent().await {
+                    self.record_app_event(
+                        "Agent context sync skipped",
+                        format!("Shell will run without agent context sync: {}", error),
+                        Tone::Warning,
+                        "shell will run without agent context sync",
+                    );
+                }
+            }
+            self.start_shell_run(command, self.agent.clone()).await;
+            return;
+        }
+        self.state.ui.pending_shell_command = None;
+
         if self.state.persistent.needs_rebuild && !self.state.session.transcript.is_empty() {
             let prompt = query.clone();
             self.state.reduce(Action::ClearSession);
@@ -450,6 +476,31 @@ impl TuiApp {
         self.state.reduce(Action::StartRun(query.clone()));
         self.state.reduce(Action::ClearPrompt);
         self.run_handle = Some(tokio::spawn(async move { agent.run(query).await }));
+    }
+
+    async fn start_shell_run(&mut self, command: String, agent: Option<Arc<HermesAgent>>) {
+        self.state.reduce(Action::StartShellRun(command.clone()));
+        self.state.reduce(Action::ClearPrompt);
+        let event_tx = self.event_tx.clone();
+        self.run_handle = Some(tokio::spawn(async move {
+            let _ = event_tx
+                .send(AgentEvent::Thinking {
+                    content: format!("Running shell command: {}", command),
+                })
+                .await;
+
+            let result = run_prompt_shell_command(&command).await;
+            let content = format_shell_result(&command, &result);
+            record_shell_context(agent, &command, &content).await;
+            let message = Message::assistant(content.clone());
+            let _ = event_tx.send(AgentEvent::Content { text: content }).await;
+            let _ = event_tx
+                .send(AgentEvent::Done {
+                    message: message.clone(),
+                })
+                .await;
+            Ok(message)
+        }));
     }
 
     async fn rebuild_agent(&mut self) -> Result<()> {
@@ -750,6 +801,81 @@ fn non_empty(value: &str) -> Option<String> {
     }
 }
 
+fn parse_shell_input(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if let Some(command) = trimmed.strip_prefix('!') {
+        let command = command.trim();
+        return (!command.is_empty()).then(|| command.to_string());
+    }
+
+    if let Some(command) = trimmed.strip_prefix("$ ") {
+        let command = command.trim();
+        return (!command.is_empty()).then(|| command.to_string());
+    }
+
+    None
+}
+
+async fn run_prompt_shell_command(command: &str) -> ToolResult {
+    TerminalTool
+        .execute(
+            serde_json::json!({
+                "command": command,
+                "useShell": true,
+            }),
+            ToolContext::default(),
+        )
+        .await
+}
+
+async fn record_shell_context(agent: Option<Arc<HermesAgent>>, command: &str, output: &str) {
+    if let Some(agent) = agent {
+        agent
+            .add_message(Message::user(format!("Shell command:\n{command}")))
+            .await;
+        agent
+            .add_message(Message::assistant(format!("Shell output:\n{output}")))
+            .await;
+    }
+}
+
+fn format_shell_result(command: &str, result: &ToolResult) -> String {
+    let value: serde_json::Value = serde_json::from_str(&result.content).unwrap_or_default();
+    if !result.success {
+        return format!(
+            "$ {command}\n\n{}",
+            result.error.as_deref().unwrap_or("Command failed")
+        );
+    }
+
+    let exit_code = value
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let stdout = value
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim_end();
+    let stderr = value
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim_end();
+
+    let mut output = format!("$ {command}\n\nexit code: {exit_code}");
+    if !stdout.is_empty() {
+        output.push_str("\n\nstdout:\n");
+        output.push_str(stdout);
+    }
+    if !stderr.is_empty() {
+        output.push_str("\n\nstderr:\n");
+        output.push_str(stderr);
+    }
+    output
+}
+
 fn parse_bool(value: &str) -> Result<bool> {
     match value.to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Ok(true),
@@ -894,6 +1020,36 @@ mod tests {
         };
 
         assert_eq!(landing_prompt_bootstrap_char(&state, key), Some('a'));
+    }
+
+    #[test]
+    fn shell_input_uses_explicit_prefixes() {
+        assert_eq!(
+            parse_shell_input("!cargo test"),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(
+            parse_shell_input("$ cargo test"),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(parse_shell_input("!   "), None);
+        assert_eq!(parse_shell_input("what is $PATH"), None);
+    }
+
+    #[tokio::test]
+    async fn shell_context_is_added_to_agent_history() {
+        let agent = Arc::new(HermesAgent::new(
+            hermes_core::agent::AgentConfig::default(),
+            hermes_core::client::OpenAIClient::new(hermes_core::client::ClientConfig::default()),
+            hermes_core::tools::ToolRegistry::new(Duration::from_secs(1)),
+        ));
+
+        record_shell_context(Some(agent.clone()), "echo hello", "stdout: hello").await;
+
+        let conversation = agent.conversation().await;
+        assert_eq!(conversation.len(), 2);
+        assert!(conversation[0].content.contains("Shell command"));
+        assert!(conversation[1].content.contains("Shell output"));
     }
 
     #[test]
