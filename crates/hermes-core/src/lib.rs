@@ -68,7 +68,8 @@ pub use config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
     BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings,
     LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TelemetrySettings,
-    TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
+    TerminalSettings, ToolSettings, TuiSettings, VoiceSettings, VoiceTransportKind,
+    WebToolSettings,
 };
 pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use context_files::{

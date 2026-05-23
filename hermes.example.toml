@@ -29,6 +29,16 @@ commit_message = "Auto-commit by hermes-rs"
 command_timeout_secs = 900
 max_failures_per_state = 3
 
+[voice]
+enabled = false
+transport = "webrtc"
+bind_addr = "127.0.0.1:8787"
+# input_device = "default"
+# output_device = "default"
+sample_rate_hz = 48000
+frame_ms = 20
+allow_interruptions = true
+
 [logging]
 level = "info"
 format = "pretty"
