@@ -56,6 +56,7 @@ pub mod schema;
 pub mod skills;
 pub mod tools;
 pub mod trajectory;
+pub mod voice;
 
 pub use agent::{AgentConfig, AgentEvent, AgentTelemetry, HermesAgent};
 pub use auth::{
@@ -88,3 +89,8 @@ pub use tools::{
     ToolResult,
 };
 pub use trajectory::{Trajectory, TrajectoryBuilder, TrajectoryExporter};
+pub use voice::{
+    AudioFrame, HermesVoiceResponder, NoopSpeechToText, NoopTextToSpeech, SpeechToText,
+    TextToSpeech, VoiceFrame, VoiceFrameSink, VoiceInput, VoiceOutput, VoiceResponder,
+    VoiceRunSummary, VoiceRuntime,
+};

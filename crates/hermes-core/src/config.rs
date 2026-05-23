@@ -129,8 +129,8 @@ impl Default for AutonomousSettings {
 #[serde(rename_all = "snake_case")]
 pub enum VoiceTransportKind {
     #[default]
-    Webrtc,
     Local,
+    Webrtc,
     Websocket,
 }
 
@@ -151,7 +151,7 @@ impl Default for VoiceSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            transport: VoiceTransportKind::Webrtc,
+            transport: VoiceTransportKind::Local,
             bind_addr: "127.0.0.1:8787".to_string(),
             input_device: None,
             output_device: None,
@@ -696,7 +696,7 @@ mod tests {
         assert!(config.tui.rich_output);
         assert_eq!(config.autonomous.git_branch, "agent-dev");
         assert!(!config.voice.enabled);
-        assert_eq!(config.voice.transport, VoiceTransportKind::Webrtc);
+        assert_eq!(config.voice.transport, VoiceTransportKind::Local);
         assert_eq!(
             config.autonomous.status_path,
             PathBuf::from("autonomous-status.toml")

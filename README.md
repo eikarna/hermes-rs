@@ -58,6 +58,9 @@ hermes run --query "What is 2 + 2?"
 # Start 24/7 autonomous workspace mode
 hermes autonomous
 
+# Start the Rust-native voice runtime with the local transcript transport
+hermes voice
+
 # List available tools
 hermes tools
 
@@ -129,7 +132,7 @@ commit_message = "Auto-commit by hermes-rs"
 
 [voice]
 enabled = false
-transport = "webrtc"
+transport = "local"
 bind_addr = "127.0.0.1:8787"
 # input_device = "default"
 # output_device = "default"
@@ -162,9 +165,24 @@ See [hermes.example.toml](hermes.example.toml) for the full schema, including MC
 
 ## Voice Mode Roadmap
 
-Hermes does not run a microphone yet. The checked-in `[voice]` section reserves the runtime shape for a Rust-native voice mode where Hermes owns audio capture/playback, transport, turn detection, speech-to-text, text-to-speech, interruptions, conversation state, workspace context, memory, and tool execution.
+Hermes includes an initial Rust-native voice runtime built as a frame pipeline inspired by low-latency voice systems, without a Python sidecar or external voice runtime. The current `local` transport is a transcript-backed runtime: it accepts one text transcript per turn, streams assistant deltas through the same `HermesAgent` event path used by the TUI, and supports `/interrupt` control frames. Microphone capture, STT/TTS adapters, and WebRTC transport are the next implementation layers.
 
-The intended path is documented in [VOICE_DESIGN.md](VOICE_DESIGN.md). The first implementation should stream `AgentEvent::Content` deltas into the voice runtime so TTS can start before a final assistant message is complete.
+Enable the current runtime in `hermes.toml`:
+
+```toml
+[voice]
+enabled = true
+transport = "local"
+allow_interruptions = true
+```
+
+Then run:
+
+```bash
+hermes voice
+```
+
+The intended path for real audio devices and WebRTC is documented in [VOICE_DESIGN.md](VOICE_DESIGN.md).
 
 ## Authentication profiles
 

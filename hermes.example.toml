@@ -31,7 +31,7 @@ max_failures_per_state = 3
 
 [voice]
 enabled = false
-transport = "webrtc"
+transport = "local"
 bind_addr = "127.0.0.1:8787"
 # input_device = "default"
 # output_device = "default"

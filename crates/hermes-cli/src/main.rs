@@ -10,19 +10,26 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use clap::{ArgAction, Parser, Subcommand};
 use hermes_core::agent::{AgentConfig, AgentEvent, HermesAgent};
 use hermes_core::auth::{default_auth_store_path, AuthMethod, AuthStore};
 use hermes_core::client::{ClientConfig, OpenAIClient};
 use hermes_core::config::{
     install_runtime_config, load_app_config, AppConfig, BehaviorSettings, LoggingSettings,
-    McpServerConfig, McpTransportKind,
+    McpServerConfig, McpTransportKind, VoiceTransportKind,
 };
+use hermes_core::error::Error as HermesError;
 use hermes_core::mcp::McpManager;
 use hermes_core::memory::MemoryManager;
 use hermes_core::tools::{HermesTool, ToolContext, ToolRegistry};
+use hermes_core::voice::{
+    HermesVoiceResponder, NoopSpeechToText, NoopTextToSpeech, VoiceFrame, VoiceInput, VoiceOutput,
+    VoiceRuntime,
+};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::mpsc;
 use tracing::Level;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -107,6 +114,10 @@ enum Commands {
         verbose: bool,
     },
     Chat {
+        #[arg(short, long)]
+        system: Option<String>,
+    },
+    Voice {
         #[arg(short, long)]
         system: Option<String>,
     },
@@ -468,6 +479,138 @@ async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result
         }
     }
 
+    Ok(())
+}
+
+struct StdinVoiceInput {
+    lines: Lines<BufReader<Stdin>>,
+}
+
+impl StdinVoiceInput {
+    fn new() -> Self {
+        Self {
+            lines: BufReader::new(tokio::io::stdin()).lines(),
+        }
+    }
+}
+
+#[async_trait]
+impl VoiceInput for StdinVoiceInput {
+    async fn next_frame(&mut self) -> hermes_core::Result<Option<VoiceFrame>> {
+        loop {
+            print!("voice> ");
+            io::stdout().flush().map_err(|error| {
+                HermesError::Agent(format!("Failed to write voice prompt: {}", error))
+            })?;
+
+            let line = self.lines.next_line().await.map_err(|error| {
+                HermesError::Agent(format!("Failed to read voice input: {}", error))
+            })?;
+
+            let Some(line) = line else {
+                return Ok(Some(VoiceFrame::Shutdown));
+            };
+
+            let text = line.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if matches!(text, "/quit" | "/exit") {
+                return Ok(Some(VoiceFrame::Shutdown));
+            }
+            if text == "/interrupt" {
+                return Ok(Some(VoiceFrame::Interruption));
+            }
+
+            return Ok(Some(VoiceFrame::UserTranscriptFinal {
+                text: text.to_string(),
+            }));
+        }
+    }
+}
+
+struct StdoutVoiceOutput;
+
+#[async_trait]
+impl VoiceOutput for StdoutVoiceOutput {
+    async fn send_frame(&mut self, frame: VoiceFrame) -> hermes_core::Result<()> {
+        match frame {
+            VoiceFrame::AssistantTextDelta { text } => {
+                print!("{}", text);
+                io::stdout().flush().map_err(|error| {
+                    HermesError::Agent(format!("Failed to write assistant voice text: {}", error))
+                })?;
+            }
+            VoiceFrame::AssistantTextFinal { .. } => {
+                println!();
+            }
+            VoiceFrame::Interruption => {
+                println!("[interrupted]");
+            }
+            VoiceFrame::Error { message } => {
+                eprintln!("voice error: {}", message);
+            }
+            VoiceFrame::Shutdown => {
+                println!("voice session closed");
+            }
+            VoiceFrame::OutputAudio(audio) => {
+                println!(
+                    "[audio: {} samples, {} Hz, {} channel(s)]",
+                    audio.samples.len(),
+                    audio.sample_rate_hz,
+                    audio.channels
+                );
+            }
+            VoiceFrame::InputAudio(_)
+            | VoiceFrame::UserTranscriptDelta { .. }
+            | VoiceFrame::UserTranscriptFinal { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+async fn run_voice_runtime(config: &AppConfig, system_prompt: Option<&str>) -> Result<()> {
+    if !config.voice.enabled {
+        anyhow::bail!(
+            "Voice runtime is disabled. Set [voice].enabled = true in hermes.toml to start voice mode."
+        );
+    }
+    if config.voice.transport != VoiceTransportKind::Local {
+        anyhow::bail!(
+            "Voice transport '{:?}' is not implemented yet. Use transport = \"local\" for the current Rust-native text transport.",
+            config.voice.transport
+        );
+    }
+
+    let (event_tx, event_rx) = mpsc::channel(config.tools.event_channel_size);
+    let mut mcp_manager = McpManager::new();
+    let agent = create_runtime_agent(
+        config,
+        &config.agent,
+        system_prompt,
+        event_tx,
+        &mut mcp_manager,
+    )
+    .await?;
+    let responder = HermesVoiceResponder::new(agent, event_rx);
+    let mut runtime = VoiceRuntime::new(
+        StdinVoiceInput::new(),
+        StdoutVoiceOutput,
+        NoopSpeechToText,
+        NoopTextToSpeech,
+        responder,
+        config.voice.allow_interruptions,
+    );
+
+    println!("Rust-native voice runtime started with local text transport.");
+    println!(
+        "Type one transcript per turn. Use /interrupt to send an interruption or /quit to exit."
+    );
+    let summary = runtime.run().await?;
+    println!(
+        "Voice session ended after {} turn(s).",
+        summary.completed_turns
+    );
     Ok(())
 }
 
@@ -963,6 +1106,9 @@ async fn main() -> Result<()> {
                 chat_non_tui(&loaded.config, system.as_deref()).await?;
             }
         }
+        Commands::Voice { system } => {
+            run_voice_runtime(&loaded.config, system.as_deref()).await?;
+        }
         Commands::Tools { verbose } => {
             list_tools(&loaded.config, *verbose).await?;
         }
@@ -1037,6 +1183,13 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn voice_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["hermes", "voice", "--system", "Use short replies."]).unwrap();
+        assert!(matches!(cli.command, Commands::Voice { .. }));
     }
 
     #[test]
