@@ -840,7 +840,7 @@ fn compact_request_messages(messages: &[Message], max_tokens: usize) -> Vec<Mess
     if let Some(system) = system {
         compacted.push(system);
     }
-    selected.sort_by(|left, right| right.0.cmp(&left.0));
+    selected.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     for (_, group) in selected {
         compacted.extend(group);
     }
