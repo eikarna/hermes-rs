@@ -56,6 +56,7 @@ pub mod schema;
 pub mod skills;
 pub mod tools;
 pub mod trajectory;
+pub mod voice;
 
 pub use agent::{AgentConfig, AgentEvent, AgentTelemetry, HermesAgent};
 pub use auth::{
@@ -68,7 +69,8 @@ pub use config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
     BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings,
     LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TelemetrySettings,
-    TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
+    TerminalSettings, ToolSettings, TuiSettings, VoiceSettings, VoiceTransportKind,
+    WebToolSettings,
 };
 pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use context_files::{
@@ -87,3 +89,8 @@ pub use tools::{
     ToolResult,
 };
 pub use trajectory::{Trajectory, TrajectoryBuilder, TrajectoryExporter};
+pub use voice::{
+    AudioFrame, HermesVoiceResponder, NoopSpeechToText, NoopTextToSpeech, SpeechToText,
+    TextToSpeech, VoiceFrame, VoiceFrameSink, VoiceInput, VoiceOutput, VoiceResponder,
+    VoiceRunSummary, VoiceRuntime,
+};

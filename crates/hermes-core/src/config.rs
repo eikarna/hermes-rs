@@ -13,6 +13,7 @@ pub struct AppConfig {
     pub client: ClientSettings,
     pub agent: BehaviorSettings,
     pub autonomous: AutonomousSettings,
+    pub voice: VoiceSettings,
     pub logging: LoggingSettings,
     pub tui: TuiSettings,
     pub telemetry: TelemetrySettings,
@@ -120,6 +121,43 @@ impl Default for AutonomousSettings {
             commit_message: "Auto-commit by hermes-rs".to_string(),
             command_timeout_secs: 900,
             max_failures_per_state: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceTransportKind {
+    #[default]
+    Local,
+    Webrtc,
+    Websocket,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VoiceSettings {
+    pub enabled: bool,
+    pub transport: VoiceTransportKind,
+    pub bind_addr: String,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub sample_rate_hz: u32,
+    pub frame_ms: u16,
+    pub allow_interruptions: bool,
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            transport: VoiceTransportKind::Local,
+            bind_addr: "127.0.0.1:8787".to_string(),
+            input_device: None,
+            output_device: None,
+            sample_rate_hz: 48_000,
+            frame_ms: 20,
+            allow_interruptions: true,
         }
     }
 }
@@ -657,10 +695,46 @@ mod tests {
         assert_eq!(config.agent.model, "gpt-4");
         assert!(config.tui.rich_output);
         assert_eq!(config.autonomous.git_branch, "agent-dev");
+        assert!(!config.voice.enabled);
+        assert_eq!(config.voice.transport, VoiceTransportKind::Local);
         assert_eq!(
             config.autonomous.status_path,
             PathBuf::from("autonomous-status.toml")
         );
+    }
+
+    #[test]
+    fn voice_settings_parse_from_toml() {
+        let config = parse_config_str(
+            r#"
+[voice]
+enabled = true
+transport = "local"
+bind_addr = "127.0.0.1:9000"
+input_device = "Studio Microphone"
+output_device = "Studio Headphones"
+sample_rate_hz = 16000
+frame_ms = 10
+allow_interruptions = false
+"#,
+            Path::new("voice.toml"),
+        )
+        .unwrap();
+
+        assert!(config.voice.enabled);
+        assert_eq!(config.voice.transport, VoiceTransportKind::Local);
+        assert_eq!(config.voice.bind_addr, "127.0.0.1:9000");
+        assert_eq!(
+            config.voice.input_device.as_deref(),
+            Some("Studio Microphone")
+        );
+        assert_eq!(
+            config.voice.output_device.as_deref(),
+            Some("Studio Headphones")
+        );
+        assert_eq!(config.voice.sample_rate_hz, 16_000);
+        assert_eq!(config.voice.frame_ms, 10);
+        assert!(!config.voice.allow_interruptions);
     }
 
     #[test]

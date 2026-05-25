@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI progress and telemetry display for active run progress, context-token usage, remaining context percentage, auto-compaction status, and configurable spend estimates
 - Prompt-prefixed shell input in the TUI with `!command` or `$ command`
 - Streaming normalization for Claude/Anthropic-style SSE text, thinking, and tool-use deltas alongside OpenAI-compatible streaming chunks
+- Optional `[voice]` runtime configuration, Rust-native voice pipeline primitives, and `hermes voice` local transcript runtime for future low-latency voice interactions
 
 ### Changed
 

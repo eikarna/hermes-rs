@@ -12,6 +12,7 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 - **Shared TOML Configuration**: One runtime config model across `hermes-cli` and `hermes-core`
 - **Ratatui TUI**: Prompt-first landing view, responsive workspace panes, constrained-terminal fallback, blockquote-style reasoning, block-style tool activity, MCP/Skills/Behavior management
 - **Autonomous Coding Mode**: 24/7 workspace-driven loop that reads `TODO.md`, validates with local tests, and only pushes after success
+- **Voice Mode Planning**: Optional `[voice]` config and Rust-native design for low-latency speech interactions
 - **Structured Logging**: Comprehensive observability via the `tracing` crate
 
 ## Architecture
@@ -56,6 +57,9 @@ hermes run --query "What is 2 + 2?"
 
 # Start 24/7 autonomous workspace mode
 hermes autonomous
+
+# Start the Rust-native voice runtime with the local transcript transport
+hermes voice
 
 # List available tools
 hermes tools
@@ -126,6 +130,16 @@ git_remote = "origin"
 git_branch = "agent-dev"
 commit_message = "Auto-commit by hermes-rs"
 
+[voice]
+enabled = false
+transport = "local"
+bind_addr = "127.0.0.1:8787"
+# input_device = "default"
+# output_device = "default"
+sample_rate_hz = 48000
+frame_ms = 20
+allow_interruptions = true
+
 [tui]
 rich_output = true
 landing_title = "HERMES"
@@ -148,6 +162,27 @@ export HERMES_MODEL=gpt-4
 ```
 
 See [hermes.example.toml](hermes.example.toml) for the full schema, including MCP, Skills, gateway, and tool/runtime defaults.
+
+## Voice Mode Roadmap
+
+Hermes includes an initial Rust-native voice runtime built as a frame pipeline inspired by low-latency voice systems, without a Python sidecar or external voice runtime. The current `local` transport is a transcript-backed runtime: it accepts one text transcript per turn, streams assistant deltas through the same `HermesAgent` event path used by the TUI, and supports `/interrupt` control frames. Microphone capture, STT/TTS adapters, and WebRTC transport are the next implementation layers.
+
+Enable the current runtime in `hermes.toml`:
+
+```toml
+[voice]
+enabled = true
+transport = "local"
+allow_interruptions = true
+```
+
+Then run:
+
+```bash
+hermes voice
+```
+
+The intended path for real audio devices and WebRTC is documented in [VOICE_DESIGN.md](VOICE_DESIGN.md).
 
 ## Authentication profiles
 
