@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use hermes_core::agent::{AgentConfig, AgentEvent, HermesAgent};
+use hermes_core::auth::{default_auth_store_path, AuthMethod, AuthStore};
 use hermes_core::client::{ClientConfig, OpenAIClient};
 use hermes_core::config::{
     install_runtime_config, load_app_config, AppConfig, BehaviorSettings, LoggingSettings,
@@ -115,6 +116,50 @@ enum Commands {
 
         #[arg(short, long)]
         args: Option<String>,
+    },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommands {
+    Providers,
+    Login {
+        #[arg()]
+        provider: String,
+    },
+    SetApiKey {
+        #[arg()]
+        provider: String,
+
+        #[arg(long)]
+        name: Option<String>,
+
+        #[arg(long = "env")]
+        env_var: Option<String>,
+
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    SetBearerToken {
+        #[arg()]
+        provider: String,
+
+        #[arg(long)]
+        name: Option<String>,
+
+        #[arg(long = "env")]
+        env_var: Option<String>,
+
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    List,
+    Logout {
+        #[arg()]
+        name: String,
     },
 }
 
@@ -223,8 +268,56 @@ fn apply_cli_overrides(cli: &Cli, config: &mut AppConfig) {
     }
 }
 
-fn client_config(config: &AppConfig) -> ClientConfig {
-    ClientConfig::from(&config.client)
+fn client_config(config: &AppConfig) -> Result<ClientConfig> {
+    let client = ClientConfig::from(&config.client);
+    if let Some(auth_ref) = config.client.auth_ref.as_deref() {
+        let store = AuthStore::load_default()?;
+        return apply_auth_profile_to_client(client, &store, auth_ref);
+    }
+    Ok(client)
+}
+
+fn apply_auth_profile_to_client(
+    mut client: ClientConfig,
+    store: &AuthStore,
+    auth_ref: &str,
+) -> Result<ClientConfig> {
+    let profile = store.profiles.get(auth_ref).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Missing required configuration: auth profile '{}'",
+            auth_ref
+        )
+    })?;
+    let trusted_base_url = profile
+        .base_url
+        .clone()
+        .or_else(|| match profile.method {
+            AuthMethod::ApiKey if is_openai_provider(&profile.provider) => {
+                Some(hermes_core::config::ClientSettings::default().base_url)
+            }
+            AuthMethod::ApiKey => None,
+            AuthMethod::BearerToken => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("Auth profile '{}' requires a base URL", auth_ref))?;
+    let default_base_url = hermes_core::config::ClientSettings::default().base_url;
+    if client.base_url != default_base_url && client.base_url != trusted_base_url {
+        anyhow::bail!(
+            "Auth profile '{}' is bound to '{}'; refusing to send credentials to '{}'",
+            auth_ref,
+            trusted_base_url,
+            client.base_url
+        );
+    }
+    match profile.method {
+        AuthMethod::ApiKey => {
+            client.api_key = Some(store.resolve_api_key(auth_ref)?);
+        }
+        AuthMethod::BearerToken => {
+            client.api_key = Some(store.resolve_auth_token(auth_ref)?);
+        }
+    }
+    client.base_url = trusted_base_url;
+    Ok(client)
 }
 
 fn agent_config(
@@ -302,7 +395,7 @@ pub(crate) async fn create_runtime_agent(
     event_tx: mpsc::Sender<AgentEvent>,
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
-    let client = OpenAIClient::new(client_config(config));
+    let client = OpenAIClient::new(client_config(config)?);
     let registry = build_registry(config, mcp_manager, &client, &behavior.model).await?;
     let agent_config = agent_config(config, behavior, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
@@ -317,7 +410,7 @@ async fn create_agent_without_events(
     system_prompt: Option<&str>,
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
-    let client = OpenAIClient::new(client_config(config));
+    let client = OpenAIClient::new(client_config(config)?);
     let registry = build_registry(config, mcp_manager, &client, &config.agent.model).await?;
     let agent_config = agent_config(config, &config.agent, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
@@ -380,7 +473,7 @@ async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result
 
 async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let client = OpenAIClient::new(client_config(config));
+    let client = OpenAIClient::new(client_config(config)?);
     let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let tools = registry.get_schemas().await;
 
@@ -396,7 +489,7 @@ async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
 
 async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let client = OpenAIClient::new(client_config(config));
+    let client = OpenAIClient::new(client_config(config)?);
     let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let parsed_args: Value = if let Some(args) = args {
         serde_json::from_str(args).context("Failed to parse tool arguments as JSON")?
@@ -420,6 +513,278 @@ async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> R
     }
 
     Ok(())
+}
+
+fn handle_auth_command(command: &AuthCommands) -> Result<()> {
+    match command {
+        AuthCommands::Providers => print_auth_providers(),
+        AuthCommands::Login { provider } => {
+            let provider = canonical_provider(provider)?;
+            print_auth_login_guidance(provider);
+            anyhow::bail!(
+                "Hermes does not run '{}' login flows yet; use the listed external credential source and create an auth profile with set-api-key or set-bearer-token.",
+                provider.name
+            );
+        }
+        AuthCommands::SetApiKey {
+            provider,
+            name,
+            env_var,
+            base_url,
+        } => {
+            let provider = canonical_provider(provider)?;
+            if provider.name != "OpenAI"
+                && base_url.as_deref().map(str::trim).unwrap_or("").is_empty()
+            {
+                anyhow::bail!(
+                    "Provider '{}' API-key profiles require --base-url so credentials are bound to the intended endpoint.",
+                    provider.name
+                );
+            }
+            let profile_name = name
+                .clone()
+                .unwrap_or_else(|| format!("{}-default", provider.slug));
+            let env_var = env_var
+                .clone()
+                .unwrap_or_else(|| provider.api_key_env.to_string());
+            let mut store = AuthStore::load_default()?;
+            store.upsert_api_key_env_profile(
+                profile_name.clone(),
+                provider.name.to_string(),
+                env_var.clone(),
+                base_url.clone(),
+            )?;
+            store.save_default()?;
+            println!(
+                "Saved auth profile '{}' for provider '{}' using env:{}",
+                profile_name, provider.name, env_var
+            );
+            println!("Auth metadata: {}", default_auth_store_path().display());
+        }
+        AuthCommands::SetBearerToken {
+            provider,
+            name,
+            env_var,
+            base_url,
+        } => {
+            let provider = canonical_provider(provider)?;
+            let default_env_var = provider.bearer_env;
+            let profile_name = name
+                .clone()
+                .unwrap_or_else(|| format!("{}-default", provider.slug));
+            let env_var = match (env_var, default_env_var) {
+                (Some(env_var), _) => env_var.clone(),
+                (None, Some(default_env_var)) => default_env_var.to_string(),
+                (None, None) => anyhow::bail!(
+                    "Provider '{}' does not have a default bearer-token OAuth flow. Use --env with a documented bearer token source if you know what you are doing.",
+                    provider.name
+                ),
+            };
+            let mut store = AuthStore::load_default()?;
+            store.upsert_bearer_token_env_profile(
+                profile_name.clone(),
+                provider.name.to_string(),
+                env_var.clone(),
+                base_url.clone(),
+            )?;
+            store.save_default()?;
+            println!(
+                "Saved bearer auth profile '{}' for provider '{}' using env:{}",
+                profile_name, provider.name, env_var
+            );
+            println!("Auth metadata: {}", default_auth_store_path().display());
+        }
+        AuthCommands::List => {
+            let store = AuthStore::load_default()?;
+            if store.profiles.is_empty() {
+                println!("No auth profiles configured.");
+                return Ok(());
+            }
+            for (name, profile) in store.profiles {
+                let secret_ref = profile
+                    .resolved_env_var()
+                    .map(|env_var| display_auth_field(&format!("env:{}", env_var)))
+                    .unwrap_or_else(|| "unsupported".to_string());
+                let base_url = profile
+                    .base_url
+                    .as_deref()
+                    .map(display_auth_field)
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{}\tprovider={}\tmethod={:?}\tsecret={}\tbase_url={}",
+                    display_auth_field(&name),
+                    display_auth_field(&profile.provider),
+                    profile.method,
+                    secret_ref,
+                    base_url
+                );
+            }
+        }
+        AuthCommands::Logout { name } => {
+            let mut store = AuthStore::load_default()?;
+            if !store.remove_profile(name) {
+                anyhow::bail!("Auth profile '{}' was not found", name);
+            }
+            store.save_default()?;
+            println!("Removed auth profile '{}'", name);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderInfo {
+    name: &'static str,
+    slug: &'static str,
+    aliases: &'static [&'static str],
+    api_key_env: &'static str,
+    api_key_envs: &'static [&'static str],
+    bearer_env: Option<&'static str>,
+    documented_auth: &'static [&'static str],
+    hermes_sources: &'static [&'static str],
+    notes: &'static str,
+    login_guidance: &'static [&'static str],
+}
+
+const AUTH_PROVIDERS: &[ProviderInfo] = &[
+    ProviderInfo {
+        name: "Google",
+        slug: "google",
+        aliases: &[
+            "google",
+            "gemini",
+            "google-gemini",
+            "google ai studio",
+            "google-ai-studio",
+            "vertex",
+            "vertex-ai",
+            "google vertex ai",
+        ],
+        api_key_env: "GOOGLE_API_KEY",
+        api_key_envs: &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+        bearer_env: Some("GOOGLE_OAUTH_ACCESS_TOKEN"),
+        documented_auth: &["API key", "OAuth/ADC bearer token", "service account/ADC"],
+        hermes_sources: &["GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_OAUTH_ACCESS_TOKEN"],
+        notes: "Direct OAuth requires a Google OAuth client ID; ADC can be managed by gcloud.",
+        login_guidance: &[
+            "For API-key auth, create a Google AI Studio API key and run `hermes auth set-api-key Google --env GOOGLE_API_KEY --base-url <google-endpoint>`.",
+            "For OAuth/ADC, run `gcloud auth application-default login`, export an access token through your own refresh workflow, then run `hermes auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url <google-endpoint>`.",
+        ],
+    },
+    ProviderInfo {
+        name: "GitHub Copilot",
+        slug: "github-copilot",
+        aliases: &["github-copilot", "github copilot", "copilot", "github"],
+        api_key_env: "COPILOT_GITHUB_TOKEN",
+        api_key_envs: &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+        bearer_env: Some("COPILOT_GITHUB_TOKEN"),
+        documented_auth: &["OAuth device flow", "supported GitHub token", "GitHub CLI fallback"],
+        hermes_sources: &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+        notes: "Hermes can reference tokens now; running Copilot login directly is future work.",
+        login_guidance: &[
+            "Run the official Copilot or GitHub CLI login flow, or provide a supported token in COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.",
+            "Then run `hermes auth set-bearer-token GitHub-Copilot --env COPILOT_GITHUB_TOKEN --base-url <copilot-compatible-endpoint>` only for endpoints documented to accept that token.",
+        ],
+    },
+    ProviderInfo {
+        name: "OpenAI",
+        slug: "openai",
+        aliases: &["openai"],
+        api_key_env: "OPENAI_API_KEY",
+        api_key_envs: &["OPENAI_API_KEY"],
+        bearer_env: None,
+        documented_auth: &[
+            "API key",
+            "ChatGPT/Codex browser login",
+            "ChatGPT/Codex device login",
+        ],
+        hermes_sources: &["OPENAI_API_KEY"],
+        notes: "Hermes supports API-key metadata now; Codex/ChatGPT OAuth is documented but not wired into Hermes runtime yet.",
+        login_guidance: &[
+            "For current Hermes runtime use, create an OpenAI API key and run `hermes auth set-api-key OpenAI --env OPENAI_API_KEY`.",
+            "OpenAI Codex/ChatGPT browser and device login are documented provider flows, but Hermes does not consume Codex account tokens yet.",
+        ],
+    },
+    ProviderInfo {
+        name: "Anthropic",
+        slug: "anthropic",
+        aliases: &[
+            "anthropic",
+            "claude",
+            "anthropic console",
+        ],
+        api_key_env: "ANTHROPIC_API_KEY",
+        api_key_envs: &["ANTHROPIC_API_KEY"],
+        bearer_env: None,
+        documented_auth: &[
+            "Claude account login",
+            "Anthropic Console API key",
+            "Team/Enterprise account",
+            "Vertex AI",
+            "Amazon Bedrock",
+            "Microsoft Foundry",
+        ],
+        hermes_sources: &["ANTHROPIC_API_KEY"],
+        notes: "Hermes supports API-key metadata now; Claude account and cloud-provider flows need provider-specific clients before runtime use.",
+        login_guidance: &[
+            "For current Hermes runtime use, create an Anthropic Console API key and run `hermes auth set-api-key Anthropic --env ANTHROPIC_API_KEY --base-url <anthropic-compatible-endpoint>`.",
+            "Claude account login, Team/Enterprise, Vertex AI, Amazon Bedrock, and Microsoft Foundry need provider-specific clients before Hermes can use those credentials directly.",
+        ],
+    },
+];
+
+fn canonical_provider(input: &str) -> Result<&'static ProviderInfo> {
+    let normalized = input.trim().to_ascii_lowercase();
+    AUTH_PROVIDERS
+        .iter()
+        .find(|provider| provider.aliases.contains(&normalized.as_str()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unsupported provider '{}'. Run `hermes auth providers` for supported names.",
+                input
+            )
+        })
+}
+
+fn print_auth_providers() {
+    println!("Supported auth providers:");
+    for provider in AUTH_PROVIDERS {
+        println!(
+            "{}\tslug={}\taliases={}\tapi_key_envs={}\tbearer_env={}\tdocumented_auth={}\thermes_sources={}\tnotes={}",
+            provider.name,
+            provider.slug,
+            provider.aliases.join(","),
+            provider.api_key_envs.join(","),
+            provider.bearer_env.unwrap_or("-"),
+            provider.documented_auth.join(","),
+            provider.hermes_sources.join(","),
+            provider.notes
+        );
+    }
+}
+
+fn print_auth_login_guidance(provider: &ProviderInfo) {
+    println!("{} login is not enabled in Hermes yet.", provider.name);
+    println!("Documented auth: {}", provider.documented_auth.join(", "));
+    println!(
+        "Hermes-supported sources: {}",
+        provider.hermes_sources.join(", ")
+    );
+    for line in provider.login_guidance {
+        println!("- {}", line);
+    }
+}
+
+fn is_openai_provider(provider: &str) -> bool {
+    provider.eq_ignore_ascii_case("OpenAI") || provider.eq_ignore_ascii_case("openai")
+}
+
+fn display_auth_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect()
 }
 
 struct EchoTool;
@@ -607,6 +972,9 @@ async fn main() -> Result<()> {
         Commands::Test { tool_name, args } => {
             test_tool(&loaded.config, tool_name, args.as_deref()).await?;
         }
+        Commands::Auth { command } => {
+            handle_auth_command(command)?;
+        }
     }
 
     Ok(())
@@ -615,6 +983,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hermes_core::auth::AuthProfile;
 
     #[test]
     fn rich_tui_without_log_file_uses_sink() {
@@ -668,5 +1037,281 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn auth_set_api_key_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "hermes",
+            "auth",
+            "set-api-key",
+            "openai",
+            "--name",
+            "openai-default",
+            "--env",
+            "OPENAI_API_KEY",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                command: AuthCommands::SetApiKey { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_set_bearer_token_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "hermes",
+            "auth",
+            "set-bearer-token",
+            "google-gemini",
+            "--name",
+            "google-default",
+            "--env",
+            "GOOGLE_OAUTH_ACCESS_TOKEN",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                command: AuthCommands::SetBearerToken { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_providers_subcommand_parses() {
+        let cli = Cli::try_parse_from(["hermes", "auth", "providers"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                command: AuthCommands::Providers
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_login_subcommand_parses() {
+        let cli = Cli::try_parse_from(["hermes", "auth", "login", "OpenAI"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                command: AuthCommands::Login { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_login_guidance_does_not_create_profile() {
+        let result = handle_auth_command(&AuthCommands::Login {
+            provider: "OpenAI".to_string(),
+        });
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not run 'OpenAI' login flows yet"));
+    }
+
+    #[test]
+    fn canonical_provider_names_and_defaults_are_supported() {
+        let google = canonical_provider("gemini").unwrap();
+        assert_eq!(google.name, "Google");
+        assert_eq!(google.slug, "google");
+        assert_eq!(google.api_key_env, "GOOGLE_API_KEY");
+        assert!(google.api_key_envs.contains(&"GEMINI_API_KEY"));
+        assert_eq!(google.bearer_env, Some("GOOGLE_OAUTH_ACCESS_TOKEN"));
+        assert!(google.documented_auth.contains(&"OAuth/ADC bearer token"));
+        assert!(google
+            .login_guidance
+            .iter()
+            .any(|line| line.contains("gcloud")));
+
+        let copilot = canonical_provider("copilot").unwrap();
+        assert_eq!(copilot.name, "GitHub Copilot");
+        assert_eq!(copilot.bearer_env, Some("COPILOT_GITHUB_TOKEN"));
+        assert!(copilot.api_key_envs.contains(&"GH_TOKEN"));
+        assert_eq!(
+            canonical_provider("GitHub Copilot").unwrap().slug,
+            "github-copilot"
+        );
+
+        let openai = canonical_provider("openai").unwrap();
+        assert_eq!(openai.name, "OpenAI");
+        assert!(openai
+            .documented_auth
+            .contains(&"ChatGPT/Codex device login"));
+        assert!(openai
+            .login_guidance
+            .iter()
+            .any(|line| line.contains("does not consume Codex account tokens")));
+        assert!(canonical_provider("codex").is_err());
+        assert!(!openai.hermes_sources.contains(&"CODEX_ACCESS_TOKEN"));
+        assert_eq!(openai.bearer_env, None);
+
+        let anthropic = canonical_provider("claude").unwrap();
+        assert_eq!(anthropic.name, "Anthropic");
+        assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
+        assert!(anthropic.documented_auth.contains(&"Amazon Bedrock"));
+        assert!(canonical_provider("claude-code").is_err());
+        assert!(canonical_provider("microsoft foundry").is_err());
+        assert_eq!(anthropic.bearer_env, None);
+    }
+
+    #[test]
+    fn auth_profile_takes_precedence_over_configured_api_key() {
+        let mut store = AuthStore::default();
+        let old_profile_key = std::env::var("HERMES_TEST_PROFILE_KEY_PRECEDENCE").ok();
+        std::env::set_var("HERMES_TEST_PROFILE_KEY_PRECEDENCE", "profile-key");
+        store
+            .upsert_api_key_env_profile(
+                "openai-default",
+                "openai",
+                "HERMES_TEST_PROFILE_KEY_PRECEDENCE",
+                None,
+            )
+            .unwrap();
+        let client = ClientConfig {
+            api_key: Some("configured-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let resolved = apply_auth_profile_to_client(client, &store, "openai-default").unwrap();
+
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+
+        match old_profile_key {
+            Some(value) => std::env::set_var("HERMES_TEST_PROFILE_KEY_PRECEDENCE", value),
+            None => std::env::remove_var("HERMES_TEST_PROFILE_KEY_PRECEDENCE"),
+        }
+    }
+
+    #[test]
+    fn auth_profile_base_url_applies_when_default_base_url_is_unset() {
+        let mut store = AuthStore::default();
+        let old_profile_key = std::env::var("HERMES_TEST_PROFILE_KEY_BASE_URL").ok();
+        std::env::set_var("HERMES_TEST_PROFILE_KEY_BASE_URL", "profile-key");
+        store
+            .upsert_api_key_env_profile(
+                "local-default",
+                "local",
+                "HERMES_TEST_PROFILE_KEY_BASE_URL",
+                Some("http://127.0.0.1:11434/v1".to_string()),
+            )
+            .unwrap();
+        let client = ClientConfig {
+            api_key: Some("configured-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let resolved = apply_auth_profile_to_client(client, &store, "local-default").unwrap();
+
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+        assert_eq!(resolved.base_url, "http://127.0.0.1:11434/v1");
+
+        match old_profile_key {
+            Some(value) => std::env::set_var("HERMES_TEST_PROFILE_KEY_BASE_URL", value),
+            None => std::env::remove_var("HERMES_TEST_PROFILE_KEY_BASE_URL"),
+        }
+    }
+
+    #[test]
+    fn auth_profile_rejects_untrusted_base_url_override() {
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile("openai-default", "openai", "OPENAI_API_KEY", None)
+            .unwrap();
+        let client = ClientConfig {
+            base_url: "https://attacker.example/v1".to_string(),
+            api_key: Some("configured-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let result = apply_auth_profile_to_client(client, &store, "openai-default");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn non_openai_api_key_profile_requires_base_url() {
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile("google-default", "Google", "GOOGLE_API_KEY", None)
+            .unwrap();
+        let client = ClientConfig {
+            api_key: Some("configured-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let result = apply_auth_profile_to_client(client, &store, "google-default");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bearer_profile_overrides_ambient_api_key_for_bound_endpoint() {
+        let mut store = AuthStore::default();
+        store
+            .upsert_bearer_token_env_profile(
+                "google-default",
+                "google-gemini",
+                "GOOGLE_OAUTH_ACCESS_TOKEN",
+                Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            )
+            .unwrap();
+        let old_token = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN").ok();
+        std::env::set_var("GOOGLE_OAUTH_ACCESS_TOKEN", "google-token");
+        let client = ClientConfig {
+            api_key: Some("openai-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let resolved = apply_auth_profile_to_client(client, &store, "google-default").unwrap();
+
+        assert_eq!(resolved.api_key.as_deref(), Some("google-token"));
+        assert_eq!(
+            resolved.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        if let Some(old_token) = old_token {
+            std::env::set_var("GOOGLE_OAUTH_ACCESS_TOKEN", old_token);
+        } else {
+            std::env::remove_var("GOOGLE_OAUTH_ACCESS_TOKEN");
+        }
+    }
+
+    #[test]
+    fn bearer_profile_without_base_url_is_rejected_even_if_loaded_from_disk() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "broken-bearer".to_string(),
+            AuthProfile {
+                provider: "google-gemini".to_string(),
+                method: AuthMethod::BearerToken,
+                base_url: None,
+                secret_ref: "env:GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
+                disabled: false,
+            },
+        );
+        let client = ClientConfig {
+            api_key: Some("openai-key".to_string()),
+            ..ClientConfig::default()
+        };
+
+        let result = apply_auth_profile_to_client(client, &store, "broken-bearer");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn auth_list_fields_escape_control_characters() {
+        assert_eq!(display_auth_field("good\nspoof"), "good?spoof");
     }
 }

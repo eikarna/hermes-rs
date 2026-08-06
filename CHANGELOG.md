@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Async state distillation that extracts durable session facts into repo-local `MEMORY.md` after completed agent runs
 - Workspace context-file auto-loading for `AGENTS.md`, `CLAUDE.md`, `.hermes.md`, `HERMES.md`, and `.cursorrules` with prompt-injection scanning and truncation
 - `delegate_to_sub_agent` tool for opt-in isolated child-agent delegation from the parent ReAct loop
+- `hermes auth providers` for listing canonical auth provider names, documented auth methods, aliases, and Hermes-supported environment sources
+- `hermes auth login <provider>` guidance for provider-specific external credential setup without storing tokens
+- TUI progress and telemetry display for active run progress, context-token usage, remaining context percentage, auto-compaction status, and configurable spend estimates
+- Prompt-prefixed shell input in the TUI with `!command` or `$ command`
+- Streaming normalization for Claude/Anthropic-style SSE text, thinking, and tool-use deltas alongside OpenAI-compatible streaming chunks
 
 ### Changed
 
@@ -26,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI, TUI, and autonomous sessions now reload persisted long-term memory from the current workspace before constructing agents
 - The TUI workspace now uses the desktop split at 120 columns and gracefully collapses secondary panels into popups below 65 columns or 20 rows
 - TUI agent reasoning now renders with quote rails, and tool activity now renders as compact blocks for clearer tool-call scanning
+- Auth profiles now use canonical provider names for Google, GitHub Copilot, OpenAI, and Anthropic, distinguish product-specific account auth from API-key/bearer-token auth, and require non-OpenAI endpoint binding through `--base-url`
+- Agent requests now auto-compact oversized message context to fit the configured context window before calling the model
 
 ### Fixed
 

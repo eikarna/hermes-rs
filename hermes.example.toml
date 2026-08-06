@@ -3,6 +3,7 @@
 [client]
 base_url = "https://api.openai.com/v1"
 # api_key = "set me or use OPENAI_API_KEY"
+# auth_ref = "openai-default" # optional profile from `hermes auth set-api-key openai`
 timeout_secs = 60
 max_context_length = 128000
 
@@ -46,6 +47,13 @@ prompt_placeholder = "Ask anything... \"Fix a TODO in the codebase\""
 refresh_rate_ms = 80
 compact_width = 96
 medium_width = 120
+
+[telemetry]
+enabled = true
+currency = "USD"
+# Set these to your provider/model prices to show estimated spend.
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
 
 [mcp]
 autoload = true

@@ -5,60 +5,15 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::tui::layout::{
+    build_compact_layout, build_constrained_layout, build_desktop_layout,
+    build_landing_compact_layout, build_landing_constrained_layout, build_medium_layout,
+    centered_rect_percent, is_constrained, DESKTOP_HEIGHT, DESKTOP_WIDTH,
+};
 use crate::tui::state::{
     ActivePanel, AppState, InputMode, LayoutMode, McpServerItem, SkillItem, Tone, TranscriptEntry,
 };
-
-const BG: Color = Color::Black;
-const PANEL: Color = Color::Rgb(26, 24, 22);
-const PANEL_ALT: Color = Color::Rgb(18, 17, 15);
-const ACCENT: Color = Color::Rgb(232, 165, 54);
-const TEXT: Color = Color::Rgb(230, 228, 222);
-const MUTED: Color = Color::Rgb(134, 132, 126);
-const HELP: Color = Color::Rgb(188, 184, 176);
-const SUCCESS: Color = Color::Rgb(115, 185, 115);
-const ERROR: Color = Color::Rgb(220, 98, 87);
-const WARN: Color = Color::Rgb(208, 170, 82);
-const CONSTRAINED_WIDTH: u16 = 65;
-const CONSTRAINED_HEIGHT: u16 = 20;
-const DESKTOP_WIDTH: u16 = 120;
-const DESKTOP_HEIGHT: u16 = 24;
-
-#[derive(Clone, Copy)]
-struct DesktopWorkspaceLayout {
-    header: Rect,
-    conversation: Rect,
-    panel: Rect,
-    reasoning: Rect,
-    activity: Rect,
-    footer: Rect,
-}
-
-#[derive(Clone, Copy)]
-struct MediumWorkspaceLayout {
-    header: Rect,
-    conversation: Rect,
-    tabs: Rect,
-    panel: Rect,
-    reasoning: Rect,
-    footer: Rect,
-}
-
-#[derive(Clone, Copy)]
-struct CompactWorkspaceLayout {
-    header: Rect,
-    tabs: Rect,
-    content: Rect,
-    footer: Rect,
-}
-
-#[derive(Clone, Copy)]
-struct ConstrainedWorkspaceLayout {
-    header: Rect,
-    content: Rect,
-    footer: Rect,
-    popup: Rect,
-}
+use crate::tui::theme::{ACCENT, BG, ERROR, HELP, MUTED, PANEL, PANEL_ALT, SUCCESS, TEXT, WARN};
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
@@ -104,7 +59,27 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         ])
         .split(area);
 
-    let title = Paragraph::new(Text::from(vec![
+    let title = build_landing_title(state);
+    frame.render_widget(title, vertical[1]);
+
+    let prompt = build_landing_prompt(state, area.width);
+    let prompt_area = centered_rect_percent(area, 52, 40, 100, 8);
+    frame.render_widget(prompt, prompt_area);
+
+    let footer_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(vertical[4]);
+
+    let footer = build_landing_footer();
+    frame.render_widget(footer, footer_row[1]);
+
+    let status = build_landing_status(state);
+    frame.render_widget(status, footer_row[0]);
+}
+
+fn build_landing_title<'a>(state: &'a AppState) -> Paragraph<'a> {
+    Paragraph::new(Text::from(vec![
         Line::from(Span::styled(
             state.persistent.config.tui.landing_title.clone(),
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -115,9 +90,10 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         )),
     ]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Center);
-    frame.render_widget(title, vertical[1]);
+    .alignment(Alignment::Center)
+}
 
+fn build_landing_prompt<'a>(state: &'a AppState, area_width: u16) -> Paragraph<'a> {
     let prompt_block = Block::default()
         .borders(Borders::LEFT | Borders::BOTTOM)
         .border_style(Style::default().fg(ACCENT))
@@ -128,7 +104,7 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     } else {
         state.ui.prompt_input.clone()
     };
-    let prompt = Paragraph::new(Text::from(vec![
+    Paragraph::new(Text::from(vec![
         Line::from(Span::styled(
             prompt_text,
             Style::default()
@@ -151,22 +127,17 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             ),
             Span::raw(" · "),
             Span::styled(
-                truncate_display(&state.persistent.behavior.model, area.width as usize / 2),
+                truncate_display(&state.persistent.behavior.model, area_width as usize / 2),
                 Style::default().fg(TEXT),
             ),
         ]),
     ]))
     .block(prompt_block)
-    .wrap(Wrap { trim: true });
-    let prompt_area = centered_rect_percent(area, 52, 40, 100, 8);
-    frame.render_widget(prompt, prompt_area);
+    .wrap(Wrap { trim: true })
+}
 
-    let footer_row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(vertical[4]);
-
-    let footer = Paragraph::new(Text::from(vec![Line::from(vec![
+fn build_landing_footer<'a>() -> Paragraph<'a> {
+    Paragraph::new(Text::from(vec![Line::from(vec![
         Span::styled(
             "tab",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -184,18 +155,18 @@ fn render_landing(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         Span::styled(" run", Style::default().fg(HELP)),
     ])]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Right);
-    frame.render_widget(footer, footer_row[1]);
+    .alignment(Alignment::Right)
+}
 
-    let status = Paragraph::new(Line::from(vec![Span::styled(
+fn build_landing_status<'a>(state: &'a AppState) -> Paragraph<'a> {
+    Paragraph::new(Line::from(vec![Span::styled(
         status_summary(state),
         Style::default()
             .fg(status_color(state))
             .add_modifier(Modifier::BOLD),
     )]))
     .style(Style::default().bg(BG))
-    .alignment(Alignment::Left);
-    frame.render_widget(status, footer_row[0]);
+    .alignment(Alignment::Left)
 }
 
 fn build_compact_title<'a>(state: &'a AppState) -> Paragraph<'a> {
@@ -298,43 +269,16 @@ fn build_compact_status<'a>(state: &'a AppState) -> Paragraph<'a> {
 
 fn render_landing_compact(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let is_portrait_like = area.width < 56;
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if is_portrait_like {
-            [
-                Constraint::Max(4),
-                Constraint::Min(7),
-                Constraint::Max(4),
-                Constraint::Min(1),
-                Constraint::Max(2),
-            ]
-        } else {
-            [
-                Constraint::Max(4),
-                Constraint::Min(7),
-                Constraint::Max(3),
-                Constraint::Min(1),
-                Constraint::Max(2),
-            ]
-        })
-        .split(area);
+    let layout = build_landing_compact_layout(area, is_portrait_like);
 
-    frame.render_widget(build_compact_title(state), outer[0]);
-    frame.render_widget(build_compact_prompt(state, area.width), outer[1]);
-    frame.render_widget(build_compact_controls(is_portrait_like), outer[2]);
-    frame.render_widget(build_compact_status(state), outer[4]);
+    frame.render_widget(build_compact_title(state), layout.title);
+    frame.render_widget(build_compact_prompt(state, area.width), layout.prompt);
+    frame.render_widget(build_compact_controls(is_portrait_like), layout.controls);
+    frame.render_widget(build_compact_status(state), layout.status);
 }
 
 fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Max(2),
-            Constraint::Min(4),
-            Constraint::Max(2),
-            Constraint::Max(1),
-        ])
-        .split(area);
+    let layout = build_landing_constrained_layout(area);
 
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -349,7 +293,7 @@ fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rec
     .style(Style::default().bg(BG))
     .alignment(Alignment::Left)
     .wrap(Wrap { trim: true });
-    frame.render_widget(title, outer[0]);
+    frame.render_widget(title, layout.title);
 
     let prompt_text = if state.ui.prompt_input.is_empty() {
         state.persistent.config.tui.prompt_placeholder.clone()
@@ -388,7 +332,7 @@ fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rec
     ]))
     .block(panel_block("Prompt"))
     .wrap(Wrap { trim: true });
-    frame.render_widget(prompt, outer[1]);
+    frame.render_widget(prompt, layout.prompt);
 
     let help = Paragraph::new(Text::from(vec![Line::from(vec![
         keycap("q"),
@@ -402,7 +346,7 @@ fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rec
     ])]))
     .style(Style::default().bg(BG))
     .wrap(Wrap { trim: true });
-    frame.render_widget(help, outer[2]);
+    frame.render_widget(help, layout.help);
 
     let status = Paragraph::new(Line::from(Span::styled(
         status_summary(state),
@@ -412,7 +356,7 @@ fn render_landing_constrained(frame: &mut Frame<'_>, state: &AppState, area: Rec
     )))
     .style(Style::default().bg(BG))
     .wrap(Wrap { trim: true });
-    frame.render_widget(status, outer[3]);
+    frame.render_widget(status, layout.status);
 }
 
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
@@ -473,10 +417,6 @@ fn render_workspace_constrained(frame: &mut Frame<'_>, state: &AppState, area: R
     frame.render_widget(constrained_footer_widget(state, area.width), layout.footer);
 }
 
-fn is_constrained(area: Rect) -> bool {
-    area.width < CONSTRAINED_WIDTH || area.height < CONSTRAINED_HEIGHT
-}
-
 fn responsive_workspace_mode(mode: LayoutMode, area: Rect) -> LayoutMode {
     if area.height < DESKTOP_HEIGHT {
         return LayoutMode::Compact;
@@ -485,94 +425,6 @@ fn responsive_workspace_mode(mode: LayoutMode, area: Rect) -> LayoutMode {
         return LayoutMode::Medium;
     }
     mode
-}
-
-fn build_desktop_layout(area: Rect) -> DesktopWorkspaceLayout {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(8),
-            Constraint::Length(4),
-        ])
-        .split(area);
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(outer[1]);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(42),
-            Constraint::Percentage(33),
-            Constraint::Percentage(25),
-        ])
-        .split(body[1]);
-
-    DesktopWorkspaceLayout {
-        header: outer[0],
-        conversation: body[0],
-        panel: right[0],
-        reasoning: right[1],
-        activity: right[2],
-        footer: outer[2],
-    }
-}
-
-fn build_medium_layout(area: Rect) -> MediumWorkspaceLayout {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Ratio(1, 2),
-            Constraint::Length(3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 6),
-            Constraint::Length(4),
-        ])
-        .split(area);
-
-    MediumWorkspaceLayout {
-        header: outer[0],
-        conversation: outer[1],
-        tabs: outer[2],
-        panel: outer[3],
-        reasoning: outer[4],
-        footer: outer[5],
-    }
-}
-
-fn build_compact_layout(area: Rect) -> CompactWorkspaceLayout {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Length(3),
-            Constraint::Min(6),
-            Constraint::Length(4),
-        ])
-        .split(area);
-
-    CompactWorkspaceLayout {
-        header: outer[0],
-        tabs: outer[1],
-        content: outer[2],
-        footer: outer[3],
-    }
-}
-
-fn build_constrained_layout(area: Rect) -> ConstrainedWorkspaceLayout {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Max(1), Constraint::Min(3), Constraint::Max(2)])
-        .split(area);
-
-    ConstrainedWorkspaceLayout {
-        header: outer[0],
-        content: outer[1],
-        footer: outer[2],
-        popup: centered_rect_percent(outer[1], 92, 88, 80, 16),
-    }
 }
 
 fn header_widget(state: &AppState) -> Paragraph<'_> {
@@ -595,7 +447,13 @@ fn header_widget(state: &AppState) -> Paragraph<'_> {
         ]),
         Line::from(vec![
             Span::styled("status ", Style::default().fg(MUTED)),
-            Span::styled(state.session.status.clone(), Style::default().fg(TEXT)),
+            Span::styled(progress_indicator(state), Style::default().fg(TEXT)),
+            Span::raw("  "),
+            Span::styled("session ", Style::default().fg(MUTED)),
+            Span::styled(
+                truncate_display(&state.session.title, 48),
+                Style::default().fg(HELP),
+            ),
         ]),
     ]))
     .block(
@@ -623,6 +481,11 @@ fn constrained_header_widget(state: &AppState, width: u16) -> Paragraph<'_> {
         ),
         Span::raw(" "),
         Span::styled(state.ui.active_panel.title(), Style::default().fg(ACCENT)),
+        Span::raw(" "),
+        Span::styled(
+            truncate_display(&state.session.title, width.saturating_sub(30) as usize),
+            Style::default().fg(HELP),
+        ),
     ]))
     .style(Style::default().bg(PANEL_ALT))
     .wrap(Wrap { trim: true })
@@ -900,6 +763,24 @@ fn status_summary(state: &AppState) -> String {
     }
 }
 
+fn progress_indicator(state: &AppState) -> String {
+    if !state.session.running {
+        return state.session.status.clone();
+    }
+
+    let max = state.persistent.behavior.max_iterations.max(1);
+    let step = state.session.current_iteration.max(1).min(max);
+    let filled = (step * 10).div_ceil(max).min(10);
+    format!(
+        "[{}{}] step {}/{} - {}",
+        "#".repeat(filled),
+        "-".repeat(10 - filled),
+        step,
+        max,
+        state.session.status
+    )
+}
+
 fn status_color(state: &AppState) -> Color {
     if state.session.running {
         ACCENT
@@ -981,6 +862,18 @@ fn session_summary_widget(state: &AppState) -> Paragraph<'_> {
             ),
         ]),
         Line::from(vec![
+            Span::styled("context ", Style::default().fg(MUTED)),
+            Span::styled(context_usage_summary(state), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("auto compaction ", Style::default().fg(MUTED)),
+            Span::styled(compaction_summary(state), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("spend ", Style::default().fg(MUTED)),
+            Span::styled(cost_summary(state), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
             Span::styled("needs rebuild ", Style::default().fg(MUTED)),
             Span::styled(
                 state.persistent.needs_rebuild.to_string(),
@@ -990,6 +883,52 @@ fn session_summary_widget(state: &AppState) -> Paragraph<'_> {
     ]))
     .block(panel_block("Session"))
     .wrap(Wrap { trim: true })
+}
+
+fn context_usage_summary(state: &AppState) -> String {
+    let telemetry = &state.session.telemetry;
+    if !state.persistent.config.telemetry.enabled {
+        return "disabled".to_string();
+    }
+    if telemetry.context_window == 0 || telemetry.total_tokens == 0 {
+        return "waiting for token usage".to_string();
+    }
+
+    let used = telemetry.total_tokens;
+    let window = telemetry.context_window;
+    let percent = (used as f64 / window as f64 * 100.0).min(999.9);
+    let remaining = 100.0_f64 - percent.min(100.0);
+    let source = if telemetry.estimated { " est" } else { "" };
+    format!("{used}/{window} tokens ({percent:.1}% full, {remaining:.1}% before full){source}")
+}
+
+fn compaction_summary(state: &AppState) -> String {
+    let telemetry = &state.session.telemetry;
+    if !state.persistent.config.telemetry.enabled {
+        return "disabled".to_string();
+    }
+    if telemetry.context_window == 0 {
+        return "waiting".to_string();
+    }
+    if telemetry.compacted {
+        "applied for latest request".to_string()
+    } else {
+        "not needed".to_string()
+    }
+}
+
+fn cost_summary(state: &AppState) -> String {
+    let settings = &state.persistent.config.telemetry;
+    if !settings.enabled {
+        return "disabled".to_string();
+    }
+    if settings.input_cost_per_million == 0.0 && settings.output_cost_per_million == 0.0 {
+        return format!("{} rates not configured", settings.currency);
+    }
+    format!(
+        "{} {:.4}",
+        settings.currency, state.session.telemetry.total_cost
+    )
 }
 
 fn render_session_compact_widget(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
@@ -1649,40 +1588,6 @@ fn render_table_row(line: &str, header: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-fn centered_rect_percent(
-    area: Rect,
-    width_percent: u16,
-    height_percent: u16,
-    max_width: u16,
-    max_height: u16,
-) -> Rect {
-    if area.width == 0 || area.height == 0 {
-        return area;
-    }
-
-    let width = area
-        .width
-        .saturating_mul(width_percent.min(100))
-        .saturating_div(100)
-        .min(max_width)
-        .max(1)
-        .min(area.width.max(1));
-    let height = area
-        .height
-        .saturating_mul(height_percent.min(100))
-        .saturating_div(100)
-        .min(max_height)
-        .max(1)
-        .min(area.height.max(1));
-
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    }
-}
-
 fn truncate_text(text: &str, max: usize) -> String {
     truncate_display(text, max)
 }
@@ -1814,11 +1719,13 @@ mod tests {
     fn wide_workspace_renders_all_major_panels() {
         let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
         state.ui.view = ViewMode::Workspace;
+        state.session.title = "Fix mouse scrolling".to_string();
         state.set_layout_for_width(160);
         let text = buffer_text(&state, 160, 40);
         assert!(text.contains("Conversation"));
         assert!(text.contains("Reasoning"));
         assert!(text.contains("Activity"));
+        assert!(text.contains("Fix mouse scrolling"));
     }
 
     #[test]

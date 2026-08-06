@@ -36,6 +36,8 @@ tracing = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
 regex = "1.10"
 lazy_static = "1.4"
 dirs = { workspace = true }
@@ -46,3 +48,15 @@ tokio-test = "0.4"
 mockito = "1.4"
 tracing-subscriber = { workspace = true }
 serial_test = "3.2"
+
+[dev-dependencies.criterion]
+version = "0.5.1"
+features = ["async_tokio"]
+
+[[bench]]
+name = "patch_tool"
+harness = false
+
+[[bench]]
+name = "file_read"
+harness = false

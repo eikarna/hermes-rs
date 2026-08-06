@@ -40,6 +40,7 @@
 //! ```
 
 pub mod agent;
+pub mod auth;
 pub mod client;
 pub mod config;
 pub mod context;
@@ -56,13 +57,18 @@ pub mod skills;
 pub mod tools;
 pub mod trajectory;
 
-pub use agent::{AgentConfig, AgentEvent, HermesAgent};
+pub use agent::{AgentConfig, AgentEvent, AgentTelemetry, HermesAgent};
+pub use auth::{
+    build_oauth_authorization_url, default_auth_store_path, exchange_oauth_authorization_code,
+    generate_oauth_state, generate_pkce_challenge, parse_loopback_authorization_code, AuthMethod,
+    AuthProfile, AuthStore, LoopbackOAuthReceiver, OAuthTokenResponse, PkceChallenge,
+};
 pub use client::{Message, OpenAIClient};
 pub use config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
     BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings,
-    LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TerminalSettings,
-    ToolSettings, TuiSettings, WebToolSettings,
+    LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TelemetrySettings,
+    TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
 };
 pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use context_files::{

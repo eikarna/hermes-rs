@@ -4,6 +4,8 @@
 //! Supports Server-Sent Events for streaming responses.
 //! Supports reasoning_content for extended-thinking models.
 
+use std::collections::HashMap;
+use std::env;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -18,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, instrument};
 
+use crate::auth::{AuthMethod, AuthStore};
 use crate::config::{runtime_config, ClientSettings};
 use crate::error::{Error, Result};
 use crate::schema::ToolSchema;
@@ -92,18 +95,59 @@ impl OpenAIClient {
     /// Create from environment variables
     pub fn from_env() -> Result<Self> {
         let base = runtime_config();
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty());
+        let api_key = env_var_non_empty("OPENAI_API_KEY");
 
-        let base_url = std::env::var("OPENAI_BASE_URL").unwrap_or(base.client.base_url);
+        let base_url = env_var_non_empty("OPENAI_BASE_URL").unwrap_or(base.client.base_url);
 
-        Ok(Self::new(ClientConfig {
+        let mut config = ClientConfig {
             base_url,
             api_key: api_key.or(base.client.api_key),
             timeout: Duration::from_secs(base.client.timeout_secs),
             max_context_length: base.client.max_context_length,
-        }))
+        };
+
+        let auth_ref = env_var_non_empty("HERMES_AUTH_REF").or(base.client.auth_ref);
+
+        if let Some(auth_ref) = auth_ref.as_deref() {
+            let store = AuthStore::load_default()?;
+            let profile = store
+                .profiles
+                .get(auth_ref)
+                .ok_or_else(|| Error::MissingConfig {
+                    key: format!("auth profile '{}'", auth_ref),
+                })?;
+            let trusted_base_url = profile
+                .base_url
+                .clone()
+                .or_else(|| match profile.method {
+                    AuthMethod::ApiKey if is_openai_provider(&profile.provider) => {
+                        Some(ClientSettings::default().base_url)
+                    }
+                    AuthMethod::ApiKey => None,
+                    AuthMethod::BearerToken => None,
+                })
+                .ok_or_else(|| {
+                    Error::Config(format!("Auth profile '{}' requires a base URL", auth_ref))
+                })?;
+            let default_base_url = ClientSettings::default().base_url;
+            if config.base_url != default_base_url && config.base_url != trusted_base_url {
+                return Err(Error::Config(format!(
+                    "Auth profile '{}' is bound to '{}'; refusing to send credentials to '{}'",
+                    auth_ref, trusted_base_url, config.base_url
+                )));
+            }
+            match profile.method {
+                AuthMethod::ApiKey => {
+                    config.api_key = Some(store.resolve_api_key(auth_ref)?);
+                }
+                AuthMethod::BearerToken => {
+                    config.api_key = Some(store.resolve_auth_token(auth_ref)?);
+                }
+            }
+            config.base_url = trusted_base_url;
+        }
+
+        Ok(Self::new(config))
     }
 
     /// Build authorization headers
@@ -500,6 +544,13 @@ pub struct StreamingToolCallDelta {
 pub struct ChatStreamResponse {
     inner: Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + Unpin>,
     buffer: String,
+    anthropic_tool_blocks: HashMap<usize, AnthropicToolBlock>,
+}
+
+#[derive(Debug, Clone)]
+struct AnthropicToolBlock {
+    id: String,
+    name: String,
 }
 
 impl ChatStreamResponse {
@@ -509,6 +560,7 @@ impl ChatStreamResponse {
         Self {
             inner: Box::new(stream),
             buffer: String::new(),
+            anthropic_tool_blocks: HashMap::new(),
         }
     }
 }
@@ -520,8 +572,13 @@ impl Stream for ChatStreamResponse {
         let this = self.get_mut();
 
         loop {
-            if let Some(event) = try_parse_next_sse_event(&mut this.buffer, false) {
+            if let Some(event) =
+                try_parse_next_sse_event(&mut this.buffer, false, &mut this.anthropic_tool_blocks)
+            {
                 return Poll::Ready(Some(Ok(event)));
+            }
+            if has_complete_sse_event(&this.buffer) {
+                continue;
             }
 
             match Pin::new(&mut this.inner).poll_next(cx) {
@@ -532,7 +589,14 @@ impl Stream for ChatStreamResponse {
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(Error::Network(e)))),
                 Poll::Ready(None) => {
-                    return Poll::Ready(try_parse_next_sse_event(&mut this.buffer, true).map(Ok));
+                    return Poll::Ready(
+                        try_parse_next_sse_event(
+                            &mut this.buffer,
+                            true,
+                            &mut this.anthropic_tool_blocks,
+                        )
+                        .map(Ok),
+                    );
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -540,7 +604,22 @@ impl Stream for ChatStreamResponse {
     }
 }
 
-fn try_parse_next_sse_event(buffer: &mut String, allow_partial: bool) -> Option<ChatStreamEvent> {
+fn env_var_non_empty(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn is_openai_provider(provider: &str) -> bool {
+    provider.eq_ignore_ascii_case("OpenAI") || provider.eq_ignore_ascii_case("openai")
+}
+
+fn try_parse_next_sse_event(
+    buffer: &mut String,
+    allow_partial: bool,
+    anthropic_tool_blocks: &mut HashMap<usize, AnthropicToolBlock>,
+) -> Option<ChatStreamEvent> {
     normalize_sse_buffer(buffer);
 
     let event_end = if let Some(index) = buffer.find("\n\n") {
@@ -559,11 +638,16 @@ fn try_parse_next_sse_event(buffer: &mut String, allow_partial: bool) -> Option<
     };
     buffer.drain(..drain_len);
 
-    let payload = event_data
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut event_name = None;
+    let mut payload_lines = Vec::new();
+    for line in event_data.lines() {
+        if let Some(value) = line.strip_prefix("event:") {
+            event_name = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            payload_lines.push(value.trim_start());
+        }
+    }
+    let payload = payload_lines.join("\n");
 
     if payload.is_empty() {
         return None;
@@ -582,9 +666,173 @@ fn try_parse_next_sse_event(buffer: &mut String, allow_partial: bool) -> Option<
                     return Some(event);
                 }
             }
+            if let Some(event) = parse_anthropic_stream_event(
+                event_name.as_deref(),
+                payload.trim(),
+                anthropic_tool_blocks,
+            ) {
+                return Some(event);
+            }
             debug!(error = %e, payload = %payload, "Failed to parse SSE event");
             None
         }
+    }
+}
+
+fn parse_anthropic_stream_event(
+    event_name: Option<&str>,
+    payload: &str,
+    tool_blocks: &mut HashMap<usize, AnthropicToolBlock>,
+) -> Option<ChatStreamEvent> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    let event_type = value.get("type").and_then(Value::as_str).or(event_name)?;
+
+    match event_type {
+        "content_block_start" => parse_anthropic_content_block_start(&value, tool_blocks),
+        "content_block_delta" => parse_anthropic_content_block_delta(&value, tool_blocks),
+        "message_delta" => {
+            let finish_reason = value
+                .get("delta")
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            finish_reason
+                .map(|finish_reason| normalized_stream_event(default_delta(), Some(finish_reason)))
+        }
+        "message_stop" => Some(normalized_stream_event(
+            default_delta(),
+            Some("stop".to_string()),
+        )),
+        _ => None,
+    }
+}
+
+fn parse_anthropic_content_block_start(
+    value: &Value,
+    tool_blocks: &mut HashMap<usize, AnthropicToolBlock>,
+) -> Option<ChatStreamEvent> {
+    let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let block = value.get("content_block")?;
+    match block.get("type").and_then(Value::as_str)? {
+        "text" => block
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| normalized_stream_event(delta_with_content(text), None)),
+        "thinking" => block
+            .get("thinking")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| normalized_stream_event(delta_with_reasoning(text), None)),
+        "tool_use" => {
+            let id = block.get("id")?.as_str()?.to_string();
+            let name = block.get("name")?.as_str()?.to_string();
+            tool_blocks.insert(
+                index,
+                AnthropicToolBlock {
+                    id: id.clone(),
+                    name: name.clone(),
+                },
+            );
+            let arguments = block
+                .get("input")
+                .filter(|input| !input.is_null())
+                .map(|input| input.to_string())
+                .unwrap_or_else(|| "{}".to_string());
+            Some(normalized_stream_event(
+                delta_with_tool_call(index, id, name, arguments),
+                None,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn parse_anthropic_content_block_delta(
+    value: &Value,
+    tool_blocks: &HashMap<usize, AnthropicToolBlock>,
+) -> Option<ChatStreamEvent> {
+    let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let delta = value.get("delta")?;
+    match delta.get("type").and_then(Value::as_str)? {
+        "text_delta" => delta
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| normalized_stream_event(delta_with_content(text), None)),
+        "thinking_delta" => delta
+            .get("thinking")
+            .and_then(Value::as_str)
+            .map(|text| normalized_stream_event(delta_with_reasoning(text), None)),
+        "input_json_delta" => {
+            let tool = tool_blocks.get(&index)?;
+            let arguments = delta
+                .get("partial_json")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(normalized_stream_event(
+                delta_with_tool_call(index, tool.id.clone(), tool.name.clone(), arguments),
+                None,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn normalized_stream_event(
+    delta: StreamingMessageDelta,
+    finish_reason: Option<String>,
+) -> ChatStreamEvent {
+    ChatStreamEvent {
+        id: String::new(),
+        object: "chat.completion.chunk".to_string(),
+        created: 0,
+        model: String::new(),
+        choices: vec![StreamChoice {
+            index: 0,
+            delta,
+            finish_reason,
+        }],
+    }
+}
+
+fn default_delta() -> StreamingMessageDelta {
+    StreamingMessageDelta {
+        role: None,
+        content: None,
+        reasoning_content: None,
+        tool_calls: None,
+    }
+}
+
+fn delta_with_content(content: &str) -> StreamingMessageDelta {
+    StreamingMessageDelta {
+        content: Some(content.to_string()),
+        ..default_delta()
+    }
+}
+
+fn delta_with_reasoning(reasoning: &str) -> StreamingMessageDelta {
+    StreamingMessageDelta {
+        reasoning_content: Some(reasoning.to_string()),
+        ..default_delta()
+    }
+}
+
+fn delta_with_tool_call(
+    index: usize,
+    id: String,
+    name: String,
+    arguments: String,
+) -> StreamingMessageDelta {
+    StreamingMessageDelta {
+        tool_calls: Some(vec![StreamingToolCallDelta {
+            index,
+            id: Some(id),
+            call_type: Some("function".to_string()),
+            function: Some(ToolCallFunction { name, arguments }),
+        }]),
+        ..default_delta()
     }
 }
 
@@ -592,6 +840,10 @@ fn normalize_sse_buffer(buffer: &mut String) {
     if buffer.contains('\r') {
         *buffer = buffer.replace("\r\n", "\n").replace('\r', "\n");
     }
+}
+
+fn has_complete_sse_event(buffer: &str) -> bool {
+    buffer.contains("\n\n")
 }
 
 /// Builder for constructing messages
@@ -634,6 +886,24 @@ impl MessageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthStore;
+    use serial_test::serial;
+
+    fn temp_auth_store_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "hermes_client_auth_{}_{}",
+                name,
+                std::process::id()
+            ))
+            .join("auth.json")
+    }
+
+    fn cleanup_auth_store_path(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
 
     #[test]
     fn test_message_to_value() {
@@ -672,7 +942,8 @@ mod tests {
     #[test]
     fn streaming_parser_handles_crlf_events() {
         let mut buffer = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"demo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\r\n\r\n".to_string();
-        let event = try_parse_next_sse_event(&mut buffer, false).expect("event should parse");
+        let event = try_parse_next_sse_event(&mut buffer, false, &mut HashMap::new())
+            .expect("event should parse");
 
         assert_eq!(event.choices.len(), 1);
         assert_eq!(event.choices[0].delta.content.as_deref(), Some("Hello"));
@@ -682,17 +953,331 @@ mod tests {
     #[test]
     fn streaming_parser_handles_partial_final_event() {
         let mut buffer = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"demo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Done\"},\"finish_reason\":\"stop\"}]}".to_string();
-        let event =
-            try_parse_next_sse_event(&mut buffer, true).expect("trailing event should parse");
+        let event = try_parse_next_sse_event(&mut buffer, true, &mut HashMap::new())
+            .expect("trailing event should parse");
 
         assert_eq!(event.choices[0].delta.content.as_deref(), Some("Done"));
         assert!(buffer.is_empty());
     }
 
+    #[test]
+    fn streaming_parser_normalizes_anthropic_text_delta() {
+        let mut buffer = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello Claude\"}}\n\n".to_string();
+        let event = try_parse_next_sse_event(&mut buffer, false, &mut HashMap::new())
+            .expect("anthropic text delta should parse");
+
+        assert_eq!(
+            event.choices[0].delta.content.as_deref(),
+            Some("Hello Claude")
+        );
+    }
+
+    #[test]
+    fn streaming_parser_normalizes_anthropic_thinking_delta() {
+        let mut buffer = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"checking\"}}\n\n".to_string();
+        let event = try_parse_next_sse_event(&mut buffer, false, &mut HashMap::new())
+            .expect("anthropic thinking delta should parse");
+
+        assert_eq!(
+            event.choices[0].delta.reasoning_content.as_deref(),
+            Some("checking")
+        );
+    }
+
+    #[test]
+    fn streaming_parser_normalizes_anthropic_tool_use_deltas() {
+        let mut tool_blocks = HashMap::new();
+        let mut start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{}}}\n\n".to_string();
+        let start_event = try_parse_next_sse_event(&mut start, false, &mut tool_blocks)
+            .expect("anthropic tool start should parse");
+        let start_call = start_event.choices[0].delta.tool_calls.as_ref().unwrap()[0].clone();
+        assert_eq!(start_call.id.as_deref(), Some("toolu_1"));
+        assert_eq!(start_call.function.as_ref().unwrap().name, "read_file");
+        assert_eq!(start_call.function.as_ref().unwrap().arguments, "{}");
+
+        let mut delta = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n".to_string();
+        let delta_event = try_parse_next_sse_event(&mut delta, false, &mut tool_blocks)
+            .expect("anthropic tool input delta should parse");
+        let delta_call = delta_event.choices[0].delta.tool_calls.as_ref().unwrap()[0].clone();
+
+        assert_eq!(delta_call.id.as_deref(), Some("toolu_1"));
+        assert_eq!(delta_call.function.as_ref().unwrap().name, "read_file");
+        assert_eq!(
+            delta_call.function.as_ref().unwrap().arguments,
+            "{\"path\":\"README.md\"}"
+        );
+    }
+
     #[tokio::test]
+    async fn streaming_response_skips_ignored_anthropic_events_in_same_chunk() {
+        use futures::StreamExt;
+
+        let chunks: Vec<std::result::Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"after ignored\"}}\n\n",
+        ))];
+        let mut stream = ChatStreamResponse::new(futures::stream::iter(chunks));
+        let event = stream
+            .next()
+            .await
+            .expect("stream should yield normalized event")
+            .expect("normalized event should parse");
+
+        assert_eq!(
+            event.choices[0].delta.content.as_deref(),
+            Some("after ignored")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_client_from_env() {
         // This will succeed even without env vars (uses defaults)
         let client = OpenAIClient::from_env();
         assert!(client.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_resolves_auth_ref_profile() {
+        let auth_store_path = temp_auth_store_path("auth_ref");
+        cleanup_auth_store_path(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_api_key = std::env::var("HERMES_TEST_CLIENT_API_KEY").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let old_base_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
+        std::env::set_var("HERMES_AUTH_REF", "test-default");
+        std::env::set_var("HERMES_TEST_CLIENT_API_KEY", "profile-key");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_BASE_URL");
+
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile(
+                "test-default",
+                "openai",
+                "HERMES_TEST_CLIENT_API_KEY",
+                Some("http://127.0.0.1:11434/v1".to_string()),
+            )
+            .unwrap();
+        store.save_default().unwrap();
+
+        let client = OpenAIClient::from_env().unwrap();
+        let config = client.config_clone();
+        assert_eq!(config.api_key.as_deref(), Some("profile-key"));
+        assert_eq!(config.base_url, "http://127.0.0.1:11434/v1");
+
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("HERMES_TEST_CLIENT_API_KEY", old_api_key);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        restore_env("OPENAI_BASE_URL", old_base_url);
+        cleanup_auth_store_path(&auth_store_path);
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_rejects_untrusted_auth_profile_base_url_override() {
+        let auth_store_path = temp_auth_store_path("auth_exfil");
+        cleanup_auth_store_path(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_api_key = std::env::var("HERMES_TEST_CLIENT_API_KEY").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let old_base_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
+        std::env::set_var("HERMES_AUTH_REF", "test-default");
+        std::env::set_var("HERMES_TEST_CLIENT_API_KEY", "profile-key");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_BASE_URL", "https://attacker.example/v1");
+
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile(
+                "test-default",
+                "openai",
+                "HERMES_TEST_CLIENT_API_KEY",
+                None,
+            )
+            .unwrap();
+        store.save_default().unwrap();
+
+        let result = OpenAIClient::from_env();
+        assert!(result.is_err());
+
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("HERMES_TEST_CLIENT_API_KEY", old_api_key);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        restore_env("OPENAI_BASE_URL", old_base_url);
+        cleanup_auth_store_path(&auth_store_path);
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_uses_bearer_profile_token_over_openai_api_key() {
+        let auth_store_path = temp_auth_store_path("bearer_auth");
+        cleanup_auth_store_path(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_bearer = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let old_base_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
+        std::env::set_var("HERMES_AUTH_REF", "google-default");
+        std::env::set_var("GOOGLE_OAUTH_ACCESS_TOKEN", "google-token");
+        std::env::set_var("OPENAI_API_KEY", "openai-key");
+        std::env::remove_var("OPENAI_BASE_URL");
+
+        let mut store = AuthStore::default();
+        store
+            .upsert_bearer_token_env_profile(
+                "google-default",
+                "google-gemini",
+                "GOOGLE_OAUTH_ACCESS_TOKEN",
+                Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            )
+            .unwrap();
+        store.save_default().unwrap();
+
+        let client = OpenAIClient::from_env().unwrap();
+        let config = client.config_clone();
+        assert_eq!(config.api_key.as_deref(), Some("google-token"));
+        assert_eq!(
+            config.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("GOOGLE_OAUTH_ACCESS_TOKEN", old_bearer);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        restore_env("OPENAI_BASE_URL", old_base_url);
+        cleanup_auth_store_path(&auth_store_path);
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_uses_api_key_profile_over_openai_api_key() {
+        let auth_store_path = temp_auth_store_path("google_api_key_precedence");
+        cleanup_auth_store_path(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_google_api_key = std::env::var("GOOGLE_API_KEY").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let old_base_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
+        std::env::set_var("HERMES_AUTH_REF", "google-default");
+        std::env::set_var("GOOGLE_API_KEY", "google-key");
+        std::env::set_var("OPENAI_API_KEY", "openai-key");
+        std::env::remove_var("OPENAI_BASE_URL");
+
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile(
+                "google-default",
+                "Google",
+                "GOOGLE_API_KEY",
+                Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            )
+            .unwrap();
+        store.save_default().unwrap();
+
+        let client = OpenAIClient::from_env().unwrap();
+        let config = client.config_clone();
+        assert_eq!(config.api_key.as_deref(), Some("google-key"));
+        assert_eq!(
+            config.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("GOOGLE_API_KEY", old_google_api_key);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        restore_env("OPENAI_BASE_URL", old_base_url);
+        cleanup_auth_store_path(&auth_store_path);
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_rejects_bearer_profile_without_base_url() {
+        let auth_store_path = temp_auth_store_path("broken_bearer");
+        cleanup_auth_store_path(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_bearer = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
+        std::env::set_var("HERMES_AUTH_REF", "broken-bearer");
+        std::env::set_var("GOOGLE_OAUTH_ACCESS_TOKEN", "google-token");
+        std::env::set_var("OPENAI_API_KEY", "openai-key");
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "broken-bearer".to_string(),
+            crate::auth::AuthProfile {
+                provider: "google-gemini".to_string(),
+                method: AuthMethod::BearerToken,
+                base_url: None,
+                secret_ref: "env:GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
+                disabled: false,
+            },
+        );
+        store.save_default().unwrap();
+
+        let result = OpenAIClient::from_env();
+        assert!(result.is_err());
+
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("GOOGLE_OAUTH_ACCESS_TOKEN", old_bearer);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        cleanup_auth_store_path(&auth_store_path);
+    }
+
+    #[test]
+    #[serial]
+    fn client_from_env_rejects_non_openai_api_key_profile_without_base_url() {
+        let auth_store_path = temp_auth_store_path("google_api_key");
+        cleanup_auth_store_path(&auth_store_path);
+        let old_auth_store = std::env::var("HERMES_AUTH_STORE").ok();
+        let old_auth_ref = std::env::var("HERMES_AUTH_REF").ok();
+        let old_google_api_key = std::env::var("GOOGLE_API_KEY").ok();
+        let old_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+
+        std::env::set_var("HERMES_AUTH_STORE", &auth_store_path);
+        std::env::set_var("HERMES_AUTH_REF", "google-default");
+        std::env::set_var("GOOGLE_API_KEY", "google-key");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let mut store = AuthStore::default();
+        store
+            .upsert_api_key_env_profile("google-default", "Google", "GOOGLE_API_KEY", None)
+            .unwrap();
+        store.save_default().unwrap();
+
+        let result = OpenAIClient::from_env();
+        assert!(result.is_err());
+
+        restore_env("HERMES_AUTH_STORE", old_auth_store);
+        restore_env("HERMES_AUTH_REF", old_auth_ref);
+        restore_env("GOOGLE_API_KEY", old_google_api_key);
+        restore_env("OPENAI_API_KEY", old_openai_api_key);
+        cleanup_auth_store_path(&auth_store_path);
+    }
+
+    fn restore_env(key: &str, value: Option<String>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
     }
 }

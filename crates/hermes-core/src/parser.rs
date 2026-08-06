@@ -9,6 +9,7 @@
 //! - **Early detection**: Fire callbacks as soon as `</tool_call>` is detected
 //! - **Tolerant**: Handle malformed tags, unclosed JSON, and other imperfect input
 //! - **Zero-copy**: Work with string slices to minimize allocations
+use lazy_static::lazy_static;
 
 use regex::Regex;
 use serde_json::Value;
@@ -16,6 +17,15 @@ use tracing::{debug, warn};
 
 use crate::client::{ToolCall, ToolCallFunction};
 use crate::error::Result;
+
+lazy_static! {
+    static ref JSON_RE: Regex =
+        Regex::new(r#"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"#).expect("Failed to compile JSON regex");
+    static ref NAME_RE: Regex =
+        Regex::new(r#""(?:name|function)":\s*"([^"]+)""#).expect("Failed to compile name regex");
+    static ref ARGS_RE: Regex = Regex::new(r#""arguments":\s*"?(\{[^}]*\}|"[^"]*")"?"#)
+        .expect("Failed to compile args regex");
+}
 
 /// Events emitted by the parser
 #[derive(Debug, Clone)]
@@ -65,8 +75,6 @@ pub struct ToolCallParser {
     position: usize,
     /// Callback for early tool call detection
     on_tool_call: Option<ToolCallCallback>,
-    /// Regex for extracting JSON from tool_call content
-    json_re: Regex,
 }
 
 impl Default for ToolCallParser {
@@ -86,7 +94,6 @@ impl ToolCallParser {
             in_tool_call: false,
             position: 0,
             on_tool_call: None,
-            json_re: Regex::new(r#"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"#).unwrap(),
         }
     }
 
@@ -256,7 +263,7 @@ impl ToolCallParser {
     /// Try to parse tool call using regex-based extraction
     fn try_parse_tool_call(&self, content: &str) -> Option<ToolCall> {
         // Look for JSON object pattern
-        let json_candidates = self.json_re.find_iter(content);
+        let json_candidates = JSON_RE.find_iter(content);
 
         for m in json_candidates {
             let json_str = m.as_str();
@@ -296,15 +303,12 @@ impl ToolCallParser {
     /// Aggressive parsing for malformed content
     fn aggressive_parse(&self, content: &str) -> Option<ToolCall> {
         // Try to find "name" or "function" followed by a string
-        let name_re = Regex::new(r#""(?:name|function)":\s*"([^"]+)""#).ok()?;
-        let args_re = Regex::new(r#""arguments":\s*"?(\{[^}]*\}|"[^"]*")"?"#).ok()?;
-
-        let name = name_re
+        let name = NAME_RE
             .captures(content)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
 
-        let args = args_re
+        let args = ARGS_RE
             .captures(content)
             .map(|c| c.get(1).map(|m| m.as_str().to_string()).unwrap_or_default())
             .unwrap_or_else(|| "{}".to_string());

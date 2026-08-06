@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -14,6 +17,7 @@ use hermes_core::client::Message;
 use hermes_core::config::{AppConfig, McpServerConfig, McpTransportKind};
 use hermes_core::mcp::McpManager;
 use hermes_core::skills::SkillManager;
+use hermes_core::tools::{HermesTool, TerminalTool, ToolContext, ToolResult};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -52,10 +56,22 @@ impl TuiApp {
     ) -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+            rollback_terminal_setup();
+            return Err(error.into());
+        }
         let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-        terminal.clear()?;
+        let mut terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                rollback_terminal_setup();
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = terminal.clear() {
+            rollback_terminal_setup();
+            return Err(error.into());
+        }
         let (event_tx, event_rx) = mpsc::channel(config.tools.event_channel_size);
         let prompt = match &launch {
             LaunchMode::Landing => String::new(),
@@ -99,6 +115,21 @@ impl TuiApp {
     }
 
     pub async fn run(mut self) -> Result<()> {
+        let run_result = self.run_loop().await;
+        let exit_result = self.exit();
+
+        match (run_result, exit_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(run_error), Err(exit_error)) => Err(anyhow::anyhow!(
+                "{}; additionally failed to restore terminal: {}",
+                run_error,
+                exit_error
+            )),
+        }
+    }
+
+    async fn run_loop(&mut self) -> Result<()> {
         loop {
             let size = self.terminal.size()?;
             self.state.set_layout_for_width(size.width);
@@ -115,21 +146,29 @@ impl TuiApp {
             if event::poll(Duration::from_millis(
                 self.state.persistent.config.tui.refresh_rate_ms,
             ))? {
-                if let Event::Key(key) = event::read()? {
-                    if should_process_key_event(key) {
+                match event::read()? {
+                    Event::Key(key) if should_process_key_event(key) => {
                         self.handle_key(key).await?;
                     }
+                    Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    _ => {}
                 }
             }
         }
 
-        self.exit()
+        Ok(())
     }
 
     fn exit(mut self) -> Result<()> {
-        disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-        self.terminal.show_cursor()?;
+        let mouse_result = execute!(self.terminal.backend_mut(), DisableMouseCapture);
+        let leave_result = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let raw_result = disable_raw_mode();
+        let cursor_result = self.terminal.show_cursor();
+
+        mouse_result?;
+        leave_result?;
+        raw_result?;
+        cursor_result?;
         Ok(())
     }
 
@@ -185,6 +224,10 @@ impl TuiApp {
             InputMode::Prompt => self.handle_prompt_key(key).await,
             InputMode::Command => self.handle_command_key(key).await,
         }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        handle_mouse_scroll(&mut self.state, mouse);
     }
 
     async fn handle_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -384,6 +427,31 @@ impl TuiApp {
             return;
         }
 
+        if let Some(command) = parse_shell_input(&query) {
+            if self.state.ui.pending_shell_command.as_deref() != Some(command.as_str()) {
+                self.state.ui.pending_shell_command = Some(command);
+                self.state.set_footer_notice(
+                    "shell command ready; press Enter again to run",
+                    Tone::Warning,
+                );
+                return;
+            }
+            self.state.ui.pending_shell_command = None;
+            if self.agent.is_none() || self.state.persistent.needs_rebuild {
+                if let Err(error) = self.rebuild_agent().await {
+                    self.record_app_event(
+                        "Agent context sync skipped",
+                        format!("Shell will run without agent context sync: {}", error),
+                        Tone::Warning,
+                        "shell will run without agent context sync",
+                    );
+                }
+            }
+            self.start_shell_run(command, self.agent.clone()).await;
+            return;
+        }
+        self.state.ui.pending_shell_command = None;
+
         if self.state.persistent.needs_rebuild && !self.state.session.transcript.is_empty() {
             let prompt = query.clone();
             self.state.reduce(Action::ClearSession);
@@ -408,6 +476,31 @@ impl TuiApp {
         self.state.reduce(Action::StartRun(query.clone()));
         self.state.reduce(Action::ClearPrompt);
         self.run_handle = Some(tokio::spawn(async move { agent.run(query).await }));
+    }
+
+    async fn start_shell_run(&mut self, command: String, agent: Option<Arc<HermesAgent>>) {
+        self.state.reduce(Action::StartShellRun(command.clone()));
+        self.state.reduce(Action::ClearPrompt);
+        let event_tx = self.event_tx.clone();
+        self.run_handle = Some(tokio::spawn(async move {
+            let _ = event_tx
+                .send(AgentEvent::Thinking {
+                    content: format!("Running shell command: {}", command),
+                })
+                .await;
+
+            let result = run_prompt_shell_command(&command).await;
+            let content = format_shell_result(&command, &result);
+            record_shell_context(agent, &command, &content).await;
+            let message = Message::assistant(content.clone());
+            let _ = event_tx.send(AgentEvent::Content { text: content }).await;
+            let _ = event_tx
+                .send(AgentEvent::Done {
+                    message: message.clone(),
+                })
+                .await;
+            Ok(message)
+        }));
     }
 
     async fn rebuild_agent(&mut self) -> Result<()> {
@@ -708,6 +801,81 @@ fn non_empty(value: &str) -> Option<String> {
     }
 }
 
+fn parse_shell_input(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if let Some(command) = trimmed.strip_prefix('!') {
+        let command = command.trim();
+        return (!command.is_empty()).then(|| command.to_string());
+    }
+
+    if let Some(command) = trimmed.strip_prefix("$ ") {
+        let command = command.trim();
+        return (!command.is_empty()).then(|| command.to_string());
+    }
+
+    None
+}
+
+async fn run_prompt_shell_command(command: &str) -> ToolResult {
+    TerminalTool
+        .execute(
+            serde_json::json!({
+                "command": command,
+                "useShell": true,
+            }),
+            ToolContext::default(),
+        )
+        .await
+}
+
+async fn record_shell_context(agent: Option<Arc<HermesAgent>>, command: &str, output: &str) {
+    if let Some(agent) = agent {
+        agent
+            .add_message(Message::user(format!("Shell command:\n{command}")))
+            .await;
+        agent
+            .add_message(Message::assistant(format!("Shell output:\n{output}")))
+            .await;
+    }
+}
+
+fn format_shell_result(command: &str, result: &ToolResult) -> String {
+    let value: serde_json::Value = serde_json::from_str(&result.content).unwrap_or_default();
+    if !result.success {
+        return format!(
+            "$ {command}\n\n{}",
+            result.error.as_deref().unwrap_or("Command failed")
+        );
+    }
+
+    let exit_code = value
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let stdout = value
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim_end();
+    let stderr = value
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim_end();
+
+    let mut output = format!("$ {command}\n\nexit code: {exit_code}");
+    if !stdout.is_empty() {
+        output.push_str("\n\nstdout:\n");
+        output.push_str(stdout);
+    }
+    if !stderr.is_empty() {
+        output.push_str("\n\nstderr:\n");
+        output.push_str(stderr);
+    }
+    output
+}
+
 fn parse_bool(value: &str) -> Result<bool> {
     match value.to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Ok(true),
@@ -745,6 +913,33 @@ fn landing_prompt_bootstrap_char(state: &AppState, key: KeyEvent) -> Option<char
 
 fn should_process_key_event(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+fn rollback_terminal_setup() {
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, DisableMouseCapture);
+    let _ = execute!(stdout, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
+const MOUSE_SCROLL_LINES: u16 = 3;
+
+fn handle_mouse_scroll(state: &mut AppState, mouse: MouseEvent) -> bool {
+    if state.ui.modal.is_some() {
+        return false;
+    }
+
+    if state.ui.view != ViewMode::Workspace || state.ui.active_panel != ActivePanel::Session {
+        return false;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => state.scroll_conversation_up(MOUSE_SCROLL_LINES),
+        MouseEventKind::ScrollDown => state.scroll_conversation_down(MOUSE_SCROLL_LINES),
+        _ => return false,
+    }
+
+    true
 }
 
 fn handle_conversation_scroll_key(state: &mut AppState, key: KeyEvent) -> bool {
@@ -828,6 +1023,36 @@ mod tests {
     }
 
     #[test]
+    fn shell_input_uses_explicit_prefixes() {
+        assert_eq!(
+            parse_shell_input("!cargo test"),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(
+            parse_shell_input("$ cargo test"),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(parse_shell_input("!   "), None);
+        assert_eq!(parse_shell_input("what is $PATH"), None);
+    }
+
+    #[tokio::test]
+    async fn shell_context_is_added_to_agent_history() {
+        let agent = Arc::new(HermesAgent::new(
+            hermes_core::agent::AgentConfig::default(),
+            hermes_core::client::OpenAIClient::new(hermes_core::client::ClientConfig::default()),
+            hermes_core::tools::ToolRegistry::new(Duration::from_secs(1)),
+        ));
+
+        record_shell_context(Some(agent.clone()), "echo hello", "stdout: hello").await;
+
+        let conversation = agent.conversation().await;
+        assert_eq!(conversation.len(), 2);
+        assert!(conversation[0].content.contains("Shell command"));
+        assert!(conversation[1].content.contains("Shell output"));
+    }
+
+    #[test]
     fn workspace_typing_does_not_bootstrap_prompt_input() {
         let state = AppState::new(AppConfig::default(), String::new(), true);
         let key = KeyEvent {
@@ -896,6 +1121,75 @@ mod tests {
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)
         ));
         assert_eq!(state.conversation_scroll(), 8);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_session_conversation() {
+        let mut state = AppState::new(AppConfig::default(), "draft".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.ui.active_panel = ActivePanel::Session;
+        state.ui.input_mode = InputMode::Prompt;
+
+        assert!(handle_mouse_scroll(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+
+        assert_eq!(state.conversation_scroll(), MOUSE_SCROLL_LINES);
+        assert_eq!(state.ui.prompt_input, "draft");
+
+        assert!(handle_mouse_scroll(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(state.conversation_scroll(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_ignores_non_session_views() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), false);
+        state.ui.view = ViewMode::Landing;
+        state.ui.active_panel = ActivePanel::Mcp;
+
+        assert!(!handle_mouse_scroll(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(state.conversation_scroll(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_does_not_scroll_behind_modal() {
+        let mut state = AppState::new(AppConfig::default(), String::new(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.ui.active_panel = ActivePanel::Session;
+        state.ui.modal = Some(Modal::settings("default", true));
+
+        assert!(!handle_mouse_scroll(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(state.conversation_scroll(), 0);
     }
 
     #[tokio::test]

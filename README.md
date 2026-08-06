@@ -62,6 +62,15 @@ hermes tools
 
 # Test a specific tool
 hermes test echo --args '{"message": "Hello, World!"}'
+
+# Create a local auth profile that references an environment variable
+hermes auth set-api-key openai --env OPENAI_API_KEY
+
+# Show provider names, documented auth methods, and Hermes-supported env sources
+hermes auth providers
+
+# Reference an existing OAuth/ADC bearer token without storing it in config
+hermes auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
 ```
 
 ## Screenshots
@@ -98,6 +107,7 @@ Configuration is TOML, not YAML. Example:
 base_url = "https://api.openai.com/v1"
 timeout_secs = 60
 # api_key = "set me or use OPENAI_API_KEY"
+# auth_ref = "openai-default"
 
 [agent]
 model = "gpt-4"
@@ -120,6 +130,13 @@ commit_message = "Auto-commit by hermes-rs"
 rich_output = true
 landing_title = "HERMES"
 prompt_placeholder = "Ask anything... \"Fix a TODO in the codebase\""
+
+[telemetry]
+enabled = true
+currency = "USD"
+# Optional provider/model rates for spend estimates.
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
 ```
 
 Or use environment variables:
@@ -131,6 +148,37 @@ export HERMES_MODEL=gpt-4
 ```
 
 See [hermes.example.toml](hermes.example.toml) for the full schema, including MCP, Skills, gateway, and tool/runtime defaults.
+
+## Authentication profiles
+
+Hermes supports local auth metadata profiles without storing API keys in the project config. Create one with:
+
+```bash
+hermes auth providers
+hermes auth login OpenAI # prints current external setup guidance; does not store tokens yet
+hermes auth set-api-key OpenAI --env OPENAI_API_KEY
+hermes auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
+hermes auth list
+```
+
+Then point `[client].auth_ref` at the profile name, for example `openai-default`. The profile stores only metadata and an environment-variable reference such as `env:OPENAI_API_KEY`; the actual secret remains in your environment or external secret manager.
+
+`set-bearer-token` is intended for provider-documented OAuth/ADC access tokens that are already obtained outside Hermes and requires `--base-url` so the token is bound to the intended provider endpoint. Hermes does not refresh those tokens yet; rotate or refresh the referenced environment value with the provider's official tooling.
+
+Current provider names are `Google`, `GitHub Copilot`, `OpenAI`, and `Anthropic`. `hermes auth providers` prints aliases, API-key environment variables, bearer-token defaults, documented auth methods, Hermes-supported environment sources, and implementation notes. `hermes auth login <provider>` prints provider-specific setup guidance and exits without creating credentials until Hermes has secure token storage and provider-specific login flows.
+
+Provider reality check:
+
+- **OpenAI**: Hermes supports API-key profiles today. OpenAI also documents ChatGPT/Codex browser login, device/headless login, and access-token/cache workflows for Codex, but Hermes has not wired those OAuth credentials into runtime requests yet.
+- **Google**: Gemini supports API keys and OAuth/ADC. Direct desktop OAuth requires a Google OAuth client ID; using `gcloud auth application-default login` keeps token management outside Hermes.
+- **GitHub Copilot**: Copilot CLI supports OAuth device flow, supported GitHub tokens via `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, OS keychain storage, and GitHub CLI fallback. Hermes can reference external tokens today; it does not run Copilot login itself yet.
+- **Anthropic**: Claude access can come from Claude.ai / Claude Code accounts, Anthropic Console API keys, Team/Enterprise accounts, and cloud-provider routes such as Vertex AI, Amazon Bedrock, and Microsoft Foundry. Hermes supports API-key metadata today; cloud-provider and Claude-account flows need provider-specific clients before runtime use.
+
+Hermes continues to support API keys and custom base URLs through `[client].api_key`, `[client].base_url`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `--api-key`, and `--base-url`. Non-OpenAI auth profiles require `--base-url` because the current runtime client is OpenAI-compatible and credentials must be bound to the intended endpoint. When `auth_ref` is active, credentials are bound to the endpoint stored in the auth profile to prevent repo-local config from redirecting secrets.
+
+When `auth_ref` is active, Hermes binds the credential to the profile endpoint. Use `hermes auth set-api-key <provider> --base-url <url>` for non-default OpenAI-compatible endpoints instead of setting a repo-local `[client].base_url` that could redirect credentials.
+
+OAuth browser/device login is intentionally not enabled until provider-specific secure token storage and documented OAuth flows are implemented. See [OAUTH_DESIGN.md](OAUTH_DESIGN.md) for the phased plan.
 
 ## Workspace Context
 
@@ -166,6 +214,7 @@ See [hermes.example.toml](hermes.example.toml) for the full schema, including MC
 - `hermes chat` starts on a prompt-first landing screen
 - `i` enters prompt editing, and typing on landing also bootstraps prompt entry immediately
 - `Enter` runs the current prompt
+- Prefix a prompt with `!` or `$ ` to prepare a shell command in the workspace, then press `Enter` again to confirm and run it
 - `Up` / `Down` in prompt mode replay recent prompts from history
 - `Tab` cycles workspace panels
 - `Up` / `Down` scroll the chat in command mode
@@ -173,6 +222,8 @@ See [hermes.example.toml](hermes.example.toml) for the full schema, including MC
 - `Ctrl+L` starts a fresh session when you want to discard the current conversation history
 - The workspace uses a split desktop layout at 120 columns and above, stacks panels below that, and collapses secondary panels into popups below 65 columns or 20 rows
 - The Reasoning pane renders model thinking with quote rails, while tool calls in Activity render as compact blocks for easier scanning
+- The header shows a step progress indicator while a run is active, and the Session panel updates token/context usage during streaming, remaining context percentage, latest auto-compaction status, and estimated spend when `[telemetry]` rates are configured
+- Streaming responses normalize both OpenAI-compatible chat-completion chunks and Claude/Anthropic-style SSE text, thinking, and tool-use deltas into the same TUI event flow
 - After a run completes or fails, the workspace returns to prompt mode so you can send a follow-up in the same session
 - `stream = false` now uses the non-streaming response path instead of the streaming parser
 

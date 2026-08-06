@@ -635,12 +635,16 @@ impl MemoryManager {
         };
         let store = MemoryStore::new(dir.clone());
 
-        let memories = self.long_term.read().await;
-        store.write_memories(&memories)?;
-        drop(memories);
+        let memories = self.long_term.read().await.clone();
+        let profiles = self.profiles.read().await.clone();
 
-        let profiles = self.profiles.read().await;
-        store.write_profiles(&profiles)?;
+        tokio::task::spawn_blocking(move || {
+            store.write_memories(&memories)?;
+            store.write_profiles(&profiles)?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .unwrap()?;
 
         Ok(())
     }

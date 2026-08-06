@@ -31,7 +31,7 @@ pub struct McpClient {
     /// HTTP client
     client: reqwest::Client,
     /// Connected tools from this server
-    tools: Arc<RwLock<Vec<McpTool>>>,
+    tools: Arc<RwLock<Arc<Vec<McpTool>>>>,
     /// Server capabilities
     capabilities: Arc<RwLock<McpCapabilities>>,
     /// Whether connected
@@ -183,7 +183,7 @@ impl McpClient {
             url: url.into(),
             auth_token,
             client: reqwest::Client::new(),
-            tools: Arc::new(RwLock::new(Vec::new())),
+            tools: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             capabilities: Arc::new(RwLock::new(McpCapabilities::default())),
             connected: Arc::new(RwLock::new(false)),
         }
@@ -245,7 +245,7 @@ impl McpClient {
     /// Disconnect from the MCP server
     pub async fn disconnect(&self) -> Result<()> {
         *self.connected.write().await = false;
-        self.tools.write().await.clear();
+        *self.tools.write().await = Arc::new(Vec::new());
         info!(url = %self.url, "Disconnected from MCP server");
         Ok(())
     }
@@ -268,7 +268,7 @@ impl McpClient {
             .map(|def| McpTool::new(self.clone(), def))
             .collect();
 
-        *self.tools.write().await = tools;
+        *self.tools.write().await = Arc::new(tools);
 
         debug!(count = self.tools.read().await.len(), "Listed MCP tools");
         Ok(self
@@ -292,7 +292,7 @@ impl McpClient {
     }
 
     /// Get all tools
-    pub async fn get_tools(&self) -> Vec<McpTool> {
+    pub async fn get_tools(&self) -> Arc<Vec<McpTool>> {
         self.tools.read().await.clone()
     }
 
@@ -394,7 +394,7 @@ pub struct McpStdioClient {
     /// Stdin/stdout IO pair (locked together for request-response atomicity)
     io: Arc<tokio::sync::Mutex<Option<StdioIo>>>,
     /// Connected tools from this server
-    tools: Arc<RwLock<Vec<McpTool>>>,
+    tools: Arc<RwLock<Arc<Vec<McpTool>>>>,
     /// Server capabilities
     capabilities: Arc<RwLock<McpCapabilities>>,
     /// Whether connected
@@ -416,7 +416,7 @@ impl McpStdioClient {
             env,
             child: Arc::new(RwLock::new(None)),
             io: Arc::new(tokio::sync::Mutex::new(None)),
-            tools: Arc::new(RwLock::new(Vec::new())),
+            tools: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             capabilities: Arc::new(RwLock::new(McpCapabilities::default())),
             connected: Arc::new(RwLock::new(false)),
             request_id: Arc::new(AtomicU64::new(1)),
@@ -510,7 +510,7 @@ impl McpStdioClient {
     /// Disconnect from the MCP server by killing the child process
     pub async fn disconnect(&self) -> Result<()> {
         *self.connected.write().await = false;
-        self.tools.write().await.clear();
+        *self.tools.write().await = Arc::new(Vec::new());
 
         // Drop IO handles to close stdin (signals EOF to child)
         *self.io.lock().await = None;
@@ -546,7 +546,7 @@ impl McpStdioClient {
             .map(|def| McpTool::new_stdio(self.clone(), def))
             .collect();
 
-        *self.tools.write().await = tools;
+        *self.tools.write().await = Arc::new(tools);
 
         debug!(
             count = self.tools.read().await.len(),
@@ -573,7 +573,7 @@ impl McpStdioClient {
     }
 
     /// Get all tools
-    pub async fn get_tools(&self) -> Vec<McpTool> {
+    pub async fn get_tools(&self) -> Arc<Vec<McpTool>> {
         self.tools.read().await.clone()
     }
 
@@ -690,7 +690,7 @@ impl McpTransport {
     }
 
     /// Get all tools from this transport
-    pub async fn get_tools(&self) -> Vec<McpTool> {
+    pub async fn get_tools(&self) -> Arc<Vec<McpTool>> {
         match self {
             McpTransport::Http(c) => c.get_tools().await,
             McpTransport::Stdio(c) => c.get_tools().await,
@@ -841,7 +841,7 @@ impl McpManager {
         let mut tools = Vec::new();
         for transport in self.servers.values() {
             if transport.is_connected().await {
-                tools.extend(transport.get_tools().await);
+                tools.extend(transport.get_tools().await.iter().cloned());
             }
         }
         tools
@@ -851,6 +851,10 @@ impl McpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{ToolContext, ToolRegistry};
+    use mockito::Matcher;
+    use std::fs;
+    use std::time::Duration;
 
     #[test]
     fn test_tool_definition() {
@@ -872,5 +876,290 @@ mod tests {
     async fn test_mcp_manager_empty() {
         let manager = McpManager::new();
         assert!(manager.servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_client_connects_lists_and_calls_tool() {
+        let mut server = mockito::Server::new_async().await;
+        let initialize = server
+            .mock("POST", "/")
+            .match_header("authorization", "Bearer test-token")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "initialize"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "protocol_version": MCP_VERSION,
+                        "capabilities": { "tools": {} },
+                        "server_info": { "name": "mock", "version": "1.0.0" }
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let initialized = server
+            .mock("POST", "/")
+            .match_header("authorization", "Bearer test-token")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "initialized",
+                "id": 0
+            })))
+            .with_status(200)
+            .create_async()
+            .await;
+        let tools_list = server
+            .mock("POST", "/")
+            .match_header("authorization", "Bearer test-token")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "tools/list"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {
+                        "tools": [{
+                            "name": "echo",
+                            "description": "Echoes text",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": { "text": { "type": "string" } }
+                            }
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let tools_call = server
+            .mock("POST", "/")
+            .match_header("authorization", "Bearer test-token")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "echo",
+                    "arguments": { "text": "hello" }
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": { "content": [{ "type": "text", "text": "hello" }] }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = McpClient::new(server.url(), Some("test-token".to_string()));
+        client.connect().await.unwrap();
+
+        assert!(client.is_connected().await);
+        let caps = client.get_capabilities().await;
+        assert!(caps.tools);
+        let tools = client.get_tools().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "echo");
+
+        let result = client
+            .call_tool("echo", serde_json::json!({ "text": "hello" }))
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "hello");
+
+        initialize.assert_async().await;
+        initialized.assert_async().await;
+        tools_list.assert_async().await;
+        tools_call.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn manager_exposes_http_mcp_tools_to_registry() {
+        let mut server = mockito::Server::new_async().await;
+        let _initialize = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "initialize"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "protocol_version": MCP_VERSION,
+                        "capabilities": { "tools": {} },
+                        "server_info": { "name": "mock", "version": "1.0.0" }
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let _initialized = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "initialized"
+            })))
+            .with_status(200)
+            .create_async()
+            .await;
+        let _tools_list = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "tools/list"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {
+                        "tools": [{
+                            "name": "remote_echo",
+                            "description": "Echoes text remotely",
+                            "input_schema": { "type": "object", "properties": {} }
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let tools_call = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "remote_echo",
+                    "arguments": { "text": "hello" }
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": { "content": [{ "type": "text", "text": "hello" }] }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let mut manager = McpManager::new();
+        manager
+            .add_server("mock", server.url(), None)
+            .await
+            .unwrap();
+        let tools = manager.get_all_tools().await;
+
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        for tool in tools {
+            registry.register(tool).await.unwrap();
+        }
+
+        assert!(registry.contains("remote_echo").await);
+        let schemas = registry.get_schemas().await;
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].name, "remote_echo");
+
+        let result = registry
+            .execute(
+                "remote_echo",
+                "call_1",
+                serde_json::json!({ "text": "hello" }),
+                ToolContext::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.content.contains("hello"));
+        tools_call.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn stdio_client_connects_lists_and_calls_tool() {
+        let server_path = fake_stdio_server_path();
+        let client = McpStdioClient::new("python", vec![server_path], HashMap::new());
+
+        client.connect().await.unwrap();
+
+        assert!(client.is_connected().await);
+        let caps = client.get_capabilities().await;
+        assert!(caps.tools);
+        let tools = client.get_tools().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "stdio_echo");
+
+        let result = client
+            .call_tool("stdio_echo", serde_json::json!({ "text": "hello" }))
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "hello");
+
+        client.disconnect().await.unwrap();
+    }
+
+    fn fake_stdio_server_path() -> String {
+        let dir = std::env::temp_dir().join(format!("hermes-mcp-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fake_mcp_server.py");
+        fs::write(
+            &path,
+            r#"
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialized":
+        continue
+    if method == "initialize":
+        result = {
+            "protocol_version": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "server_info": {"name": "fake-stdio", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {
+            "tools": [{
+                "name": "stdio_echo",
+                "description": "Echoes text over stdio",
+                "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}},
+            }]
+        }
+    elif method == "tools/call":
+        text = request.get("params", {}).get("arguments", {}).get("text", "")
+        result = {"content": [{"type": "text", "text": text}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        path.to_string_lossy().into_owned()
     }
 }
