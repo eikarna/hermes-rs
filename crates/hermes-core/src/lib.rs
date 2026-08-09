@@ -52,6 +52,7 @@ pub mod mcp;
 pub mod memory;
 pub mod parser;
 pub mod platform;
+pub mod repomap;
 pub mod schema;
 pub mod skills;
 pub mod tools;
@@ -86,6 +87,10 @@ pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};
 pub use memory::{MemoryBlock, MemoryManager, Session, UserProfile};
 pub use parser::ToolCallParser;
 pub use platform::PlatformInfo;
+pub use repomap::{
+    discover_source_files, extract_file_tags, rank_and_render, Language as RepoMapLanguage,
+    MinimalRepoMap, RepoMapRenderer, RepoTag, TagKind,
+};
 pub use skills::{Skill, SkillManager};
 pub use tools::{
     register_builtin_tools, register_builtin_tools_with_provider_sub_agent,

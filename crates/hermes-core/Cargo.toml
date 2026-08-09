@@ -42,6 +42,12 @@ regex = "1.10"
 lazy_static = "1.4"
 dirs = { workspace = true }
 shell-words = "1.1.1"
+tree-sitter = "0.26"
+tree-sitter-language = "0.1"
+tree-sitter-c = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
 
 [dev-dependencies]
 tokio-test = "0.4"
