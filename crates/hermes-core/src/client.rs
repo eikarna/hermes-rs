@@ -610,13 +610,18 @@ impl LLMProvider for AnthropicClient {
         self.chat_streaming(model, messages, tools).await
     }
 
-    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+    fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        if let Some(table) = provider::lookup_capabilities(model) {
+            return table;
+        }
         ProviderCapabilities {
             max_input_tokens: self.config.max_context_length,
             max_output_tokens: 8_192,
             edit_format: EditFormat::SearchReplace,
             supports_streaming: true,
             supports_reasoning: true,
+            supports_vision: false,
+            supports_tool_calls: true,
         }
     }
 }
@@ -642,13 +647,18 @@ impl LLMProvider for OpenAIClient {
         self.chat_streaming(model, messages, tools).await
     }
 
-    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+    fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        if let Some(table) = provider::lookup_capabilities(model) {
+            return table;
+        }
         ProviderCapabilities {
             max_input_tokens: self.config.max_context_length,
             max_output_tokens: 16_384,
             edit_format: EditFormat::FullFile,
             supports_streaming: true,
             supports_reasoning: false,
+            supports_vision: false,
+            supports_tool_calls: true,
         }
     }
 }

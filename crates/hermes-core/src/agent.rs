@@ -364,17 +364,22 @@ impl HermesAgent {
             system_prompt.push_str("\n</workspace_context>");
         }
 
-        if matches!(
-            self.client.capabilities(&self.config.model).edit_format,
-            crate::client::EditFormat::SearchReplace
-        ) {
-            system_prompt.push_str(
+        match self.client.capabilities(&self.config.model).edit_format {
+            crate::client::EditFormat::SearchReplace => system_prompt.push_str(
                 "\n\n<edit_format>\n\
                 This model supports token-efficient search/replace edits. Prefer the \
                 `edit_block` tool (ordered search/replace pairs, applied atomically) over \
                 rewriting whole files with `file_write`.\n\
                 </edit_format>",
-            );
+            ),
+            crate::client::EditFormat::Patch => system_prompt.push_str(
+                "\n\n<edit_format>\n\
+                This model prefers targeted patches. Use the `patch` tool (single exact \
+                find-and-replace with fuzzy fallback) for edits instead of rewriting whole \
+                files with `file_write`.\n\
+                </edit_format>",
+            ),
+            crate::client::EditFormat::FullFile => {}
         }
 
         // Add system prompt
@@ -1463,6 +1468,45 @@ mod tests {
             .map(|m| m.content.as_str())
             .unwrap_or_default();
         assert!(!system.contains("<edit_format>"));
+    }
+
+    #[tokio::test]
+    async fn build_messages_routes_patch_capability() {
+        // o3 advertises EditFormat::Patch via the capability table.
+        let config = AgentConfig {
+            model: "o3-mini".to_string(),
+            ..AgentConfig::default()
+        };
+        let agent = HermesAgent::new(
+            config,
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+        assert!(system.contains("<edit_format>"));
+        assert!(system.contains("`patch` tool"));
+        assert!(!system.contains("edit_block"));
+
+        // Known search/replace models still route to edit_block.
+        let config = AgentConfig {
+            model: "gpt-4o".to_string(),
+            ..AgentConfig::default()
+        };
+        let agent = HermesAgent::new(
+            config,
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+        assert!(system.contains("edit_block"));
     }
 
     #[test]

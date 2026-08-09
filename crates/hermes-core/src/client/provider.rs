@@ -36,6 +36,10 @@ pub struct ProviderCapabilities {
     pub edit_format: EditFormat,
     pub supports_streaming: bool,
     pub supports_reasoning: bool,
+    /// Whether the model accepts image inputs.
+    pub supports_vision: bool,
+    /// Whether the model emits native structured tool calls.
+    pub supports_tool_calls: bool,
 }
 
 impl Default for ProviderCapabilities {
@@ -46,8 +50,139 @@ impl Default for ProviderCapabilities {
             edit_format: EditFormat::FullFile,
             supports_streaming: true,
             supports_reasoning: false,
+            supports_vision: false,
+            supports_tool_calls: true,
         }
     }
+}
+
+/// Per-model capability rows. A row applies to any model whose name starts
+/// with the prefix (case-insensitive); the longest matching prefix wins.
+/// Rows are provider-agnostic defaults — adapters merge these over their own
+/// baseline in [`lookup_capabilities`].
+const CAPABILITY_TABLE: &[(&str, ProviderCapabilities)] = &[
+    // Anthropic Claude
+    (
+        "claude-opus-4",
+        ProviderCapabilities {
+            max_input_tokens: 200_000,
+            max_output_tokens: 32_000,
+            edit_format: EditFormat::SearchReplace,
+            supports_streaming: true,
+            supports_reasoning: true,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
+    (
+        "claude-sonnet-4",
+        ProviderCapabilities {
+            max_input_tokens: 200_000,
+            max_output_tokens: 64_000,
+            edit_format: EditFormat::SearchReplace,
+            supports_streaming: true,
+            supports_reasoning: true,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
+    (
+        "claude-haiku",
+        ProviderCapabilities {
+            max_input_tokens: 200_000,
+            max_output_tokens: 8_192,
+            edit_format: EditFormat::SearchReplace,
+            supports_streaming: true,
+            supports_reasoning: false,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
+    // OpenAI
+    (
+        "gpt-4o",
+        ProviderCapabilities {
+            max_input_tokens: 128_000,
+            max_output_tokens: 16_384,
+            edit_format: EditFormat::SearchReplace,
+            supports_streaming: true,
+            supports_reasoning: false,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
+    (
+        "gpt-4.1",
+        ProviderCapabilities {
+            max_input_tokens: 1_000_000,
+            max_output_tokens: 32_768,
+            edit_format: EditFormat::SearchReplace,
+            supports_streaming: true,
+            supports_reasoning: false,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
+    (
+        "o1",
+        ProviderCapabilities {
+            max_input_tokens: 200_000,
+            max_output_tokens: 100_000,
+            edit_format: EditFormat::Patch,
+            supports_streaming: true,
+            supports_reasoning: true,
+            supports_vision: false,
+            supports_tool_calls: true,
+        },
+    ),
+    (
+        "o3",
+        ProviderCapabilities {
+            max_input_tokens: 200_000,
+            max_output_tokens: 100_000,
+            edit_format: EditFormat::Patch,
+            supports_streaming: true,
+            supports_reasoning: true,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
+    (
+        "o4-mini",
+        ProviderCapabilities {
+            max_input_tokens: 200_000,
+            max_output_tokens: 100_000,
+            edit_format: EditFormat::Patch,
+            supports_streaming: true,
+            supports_reasoning: true,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
+    (
+        "gpt-3.5",
+        ProviderCapabilities {
+            max_input_tokens: 16_385,
+            max_output_tokens: 4_096,
+            edit_format: EditFormat::FullFile,
+            supports_streaming: true,
+            supports_reasoning: false,
+            supports_vision: false,
+            supports_tool_calls: true,
+        },
+    ),
+];
+
+/// Look up per-model capabilities from [`CAPABILITY_TABLE`] by longest
+/// case-insensitive prefix match. Returns `None` for unknown models so the
+/// caller can fall back to adapter defaults.
+pub fn lookup_capabilities(model: &str) -> Option<ProviderCapabilities> {
+    let model = model.to_ascii_lowercase();
+    CAPABILITY_TABLE
+        .iter()
+        .filter(|(prefix, _)| model.starts_with(&prefix.to_ascii_lowercase()))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, caps)| caps.clone())
 }
 
 /// Stable identifier for a provider backend.
@@ -339,6 +474,8 @@ mod tests {
             edit_format: EditFormat::SearchReplace,
             supports_streaming: false,
             supports_reasoning: true,
+            supports_vision: false,
+            supports_tool_calls: true,
         };
         let json = serde_json::to_string(&caps).unwrap();
         let parsed: ProviderCapabilities = serde_json::from_str(&json).unwrap();
@@ -352,6 +489,26 @@ mod tests {
         let resolved = resolve_provider_settings(&settings).unwrap();
         assert_eq!(resolved.kind, ProviderKind::Openai);
         assert_eq!(resolved.config.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn lookup_capabilities_matches_longest_prefix() {
+        let caps = lookup_capabilities("claude-sonnet-4-20250514").unwrap();
+        assert_eq!(caps.max_input_tokens, 200_000);
+        assert_eq!(caps.max_output_tokens, 64_000);
+        assert_eq!(caps.edit_format, EditFormat::SearchReplace);
+        assert!(caps.supports_reasoning);
+
+        // "o4-mini" is longer than "o4"/"o1"; verify exact row wins
+        let caps = lookup_capabilities("o4-mini-2025-04-16").unwrap();
+        assert_eq!(caps.edit_format, EditFormat::Patch);
+        assert!(caps.supports_reasoning);
+    }
+
+    #[test]
+    fn lookup_capabilities_is_case_insensitive_and_unknown_returns_none() {
+        assert!(lookup_capabilities("GPT-4O-MINI").is_some());
+        assert!(lookup_capabilities("totally-unknown-model").is_none());
     }
 
     #[test]
