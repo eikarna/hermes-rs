@@ -48,6 +48,7 @@ pub mod context_files;
 pub mod distillation;
 pub mod error;
 pub mod gateway;
+pub mod githarness;
 pub mod mcp;
 pub mod memory;
 pub mod parser;
@@ -83,6 +84,7 @@ pub use context_files::{
 pub use distillation::{distill_session_to_memory, distill_session_with_provider};
 pub use error::{Error, Result};
 pub use gateway::{Gateway, GatewayConfig, PlatformAdapter};
+pub use githarness::{GitHarness, RepoSnapshot};
 pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};
 pub use memory::{MemoryBlock, MemoryManager, Session, UserProfile};
 pub use parser::ToolCallParser;

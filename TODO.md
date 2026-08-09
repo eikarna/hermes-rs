@@ -21,9 +21,8 @@
 - Tree-sitter AST symbol extraction (C, Python, Rust, TypeScript) with personalized PageRank repository mapping and token-budgeted `<repo_map>` rendering
 - Aider-style SEARCH/REPLACE edit block parser (`parse_edit_blocks`), atomic multi-edit `edit_block` tool with exact + fuzzy matching, and capability-driven routing that injects an `<edit_format>` hint when the provider advertises `EditFormat::SearchReplace`
 - Per-model capability tables with longest-prefix matching (`lookup_capabilities`) covering Claude, GPT, and o-series models, richer metadata (`supports_vision`, `supports_tool_calls`), and a `patch`-tool hint for models advertising `EditFormat::Patch`
+- Repo-map context injection: `[agent] repo_map_tokens` budget renders a `<repo_map>` block into the system prompt (parsed once per agent, off the async worker)
+- Transactional git harness (`hermes_core::githarness`): pre-run snapshots with dirty-tree protection, Conventional Commit message derivation from staged diffs, `commit_transaction`, `undo`, and a TUI `/undo` command that rolls back the last run's file changes
 
 ## Pending
-
-- Wire repo map into agent context injection (currently exposed for consumers but not auto-attached to sessions)
-- [Aider Phase 4] Implement transactional git harness (dirty tree protection, Conventional Commit generation, `/undo` command)
 - [Aider Phase 5] Port skill & memory lifecycle management (curator background task, skill distillation, auto-archiving)

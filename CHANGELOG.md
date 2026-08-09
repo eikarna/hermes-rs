@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI progress and telemetry display for active run progress, context-token usage, remaining context percentage, auto-compaction status, and configurable spend estimates
 - Prompt-prefixed shell input in the TUI with `!command` or `$ command`
 - Streaming normalization for Claude/Anthropic-style SSE text, thinking, and tool-use deltas alongside OpenAI-compatible streaming chunks
+- Tree-sitter repo map: AST symbol extraction for C/Python/Rust/TypeScript, personalized PageRank over the file-reference graph, and a token-budgeted `<repo_map>` renderer
+- `[agent] repo_map_tokens` config to inject the rendered `<repo_map>` into the system prompt (parsed once per agent, off the async worker)
+- Aider-style SEARCH/REPLACE edit-block parsing (`parse_edit_blocks`) and an atomic multi-edit `edit_block` tool with exact + fuzzy matching
+- Per-model capability tables with longest-prefix lookup (`client::lookup_capabilities`), richer `ProviderCapabilities` metadata (`supports_vision`, `supports_tool_calls`), and `<edit_format>` prompt hints steering models toward `edit_block` or `patch` based on advertised capabilities
+- Transactional git harness (`hermes_core::githarness`) with pre-run snapshots, dirty-tree protection, Conventional Commit message derivation, `commit_transaction`, and `undo`
+- TUI `/undo` command restoring the workspace to the snapshot taken before the last agent run
 
 ### Changed
 

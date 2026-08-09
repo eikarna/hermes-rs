@@ -46,6 +46,8 @@ pub struct TuiApp {
     run_handle: Option<JoinHandle<hermes_core::Result<Message>>>,
     mcp_manager: McpManager,
     skill_manager: SkillManager,
+    /// Pre-run repository snapshot enabling the `/undo` command.
+    last_snapshot: Option<hermes_core::githarness::RepoSnapshot>,
 }
 
 impl TuiApp {
@@ -91,6 +93,7 @@ impl TuiApp {
             run_handle: None,
             mcp_manager: McpManager::new(),
             skill_manager: SkillManager::new(config.skills.root_dir.clone()),
+            last_snapshot: None,
         };
         if let Err(error) = app.refresh_skills() {
             app.record_app_event(
@@ -427,6 +430,32 @@ impl TuiApp {
             return;
         }
 
+        if query == "/undo" {
+            self.state.reduce(Action::ClearPrompt);
+            match &self.last_snapshot {
+                None => {
+                    self.state
+                        .set_footer_notice("nothing to undo: no snapshot recorded", Tone::Warning);
+                }
+                Some(snapshot) => {
+                    match hermes_core::githarness::GitHarness::open(std::path::Path::new("."))
+                        .and_then(|harness| harness.undo(snapshot))
+                    {
+                        Ok(()) => {
+                            self.last_snapshot = None;
+                            self.state
+                                .set_footer_notice("undid last run's file changes", Tone::Success);
+                        }
+                        Err(error) => {
+                            self.state
+                                .set_footer_notice(format!("undo failed: {}", error), Tone::Error);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         if let Some(command) = parse_shell_input(&query) {
             if self.state.ui.pending_shell_command.as_deref() != Some(command.as_str()) {
                 self.state.ui.pending_shell_command = Some(command);
@@ -473,6 +502,13 @@ impl TuiApp {
             );
             return;
         };
+        // Transactional snapshot: capture pre-run git state so `/undo` can
+        // roll back whatever this run changes. Best-effort; outside a repo
+        // the snapshot is simply skipped.
+        self.last_snapshot = hermes_core::githarness::GitHarness::open(std::path::Path::new("."))
+            .ok()
+            .and_then(|harness| harness.snapshot(true).ok());
+
         self.state.reduce(Action::StartRun(query.clone()));
         self.state.reduce(Action::ClearPrompt);
         self.run_handle = Some(tokio::spawn(async move { agent.run(query).await }));

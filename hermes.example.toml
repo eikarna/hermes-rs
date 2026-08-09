@@ -25,6 +25,7 @@ stream = true
 context_window = 128000
 max_healing_attempts = 3
 show_reasoning = true
+# repo_map_tokens = 1024 # token budget for <repo_map> context; 0 disables it
 # system_prompt = "You are Hermes."
 
 [autonomous]

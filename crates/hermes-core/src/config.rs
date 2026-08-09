@@ -170,6 +170,9 @@ pub struct BehaviorSettings {
     pub context_window: usize,
     pub max_healing_attempts: usize,
     pub show_reasoning: bool,
+    /// Token budget for the `<repo_map>` context block. `0` disables
+    /// repository mapping entirely.
+    pub repo_map_tokens: usize,
 }
 
 impl Default for BehaviorSettings {
@@ -184,6 +187,7 @@ impl Default for BehaviorSettings {
             context_window: 128_000,
             max_healing_attempts: 3,
             show_reasoning: true,
+            repo_map_tokens: 0,
         }
     }
 }

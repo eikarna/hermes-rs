@@ -43,6 +43,8 @@ pub struct AgentConfig {
     pub context_window: usize,
     /// Max self-healing attempts on tool errors
     pub max_healing_attempts: usize,
+    /// Token budget for `<repo_map>` injection; `0` disables it.
+    pub repo_map_tokens: usize,
 }
 
 impl Default for AgentConfig {
@@ -62,6 +64,7 @@ impl From<&BehaviorSettings> for AgentConfig {
             stream: settings.stream,
             context_window: settings.context_window,
             max_healing_attempts: settings.max_healing_attempts,
+            repo_map_tokens: settings.repo_map_tokens,
         }
     }
 }
@@ -110,6 +113,9 @@ pub struct HermesAgent {
     conversation: Arc<RwLock<Vec<Message>>>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
     memory_manager: Option<MemoryManager>,
+    /// Lazily-rendered `<repo_map>` block; parsed once per agent so per-turn
+    /// message rebuilds stay cheap.
+    repo_map_cache: Arc<tokio::sync::OnceCell<String>>,
 }
 
 impl HermesAgent {
@@ -131,6 +137,7 @@ impl HermesAgent {
             conversation: Arc::new(RwLock::new(Vec::new())),
             event_tx: None,
             memory_manager: None,
+            repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -158,6 +165,7 @@ impl HermesAgent {
             conversation: Arc::new(RwLock::new(Vec::new())),
             event_tx: Some(event_tx),
             memory_manager: None,
+            repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -362,6 +370,29 @@ impl HermesAgent {
             system_prompt.push_str("\n\n<workspace_context>\n");
             system_prompt.push_str(context_files.trim());
             system_prompt.push_str("\n</workspace_context>");
+        }
+
+        if self.config.repo_map_tokens > 0 {
+            let budget = self.config.repo_map_tokens;
+            let rendered = self
+                .repo_map_cache
+                .get_or_init(|| async {
+                    let root =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    // Tree-sitter parsing is blocking; move it off the async worker.
+                    tokio::task::spawn_blocking(move || {
+                        let map = crate::repomap::rank_and_render(&root, &[]);
+                        crate::repomap::RepoMapRenderer::new(budget).render(&map)
+                    })
+                    .await
+                    .unwrap_or_default()
+                })
+                .await;
+            if rendered.trim() != "<repo_map>\n</repo_map>" && !rendered.trim().is_empty() {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(rendered.trim_end());
+                system_prompt.push('\n');
+            }
         }
 
         match self.client.capabilities(&self.config.model).edit_format {
@@ -1468,6 +1499,42 @@ mod tests {
             .map(|m| m.content.as_str())
             .unwrap_or_default();
         assert!(!system.contains("<edit_format>"));
+    }
+
+    #[tokio::test]
+    async fn build_messages_injects_repo_map_when_enabled() {
+        // Enabled: current dir is the hermes-rs repo itself, so tags exist.
+        let config = AgentConfig {
+            repo_map_tokens: 2048,
+            ..AgentConfig::default()
+        };
+        let agent = HermesAgent::new(
+            config,
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+        assert!(system.contains("<repo_map>"));
+        assert!(system.contains("</repo_map>"));
+    }
+
+    #[tokio::test]
+    async fn build_messages_skips_repo_map_when_disabled() {
+        let agent = HermesAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+        assert!(!system.contains("<repo_map>"));
     }
 
     #[tokio::test]

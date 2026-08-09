@@ -30,3 +30,6 @@ hermes-agent
 autonomous-status.toml
 MEMORY.md
 USER.md
+
+# Serena MCP local index/cache
+.serena/

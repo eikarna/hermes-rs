@@ -13,6 +13,9 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 - **Ratatui TUI**: Prompt-first landing view, responsive workspace panes, constrained-terminal fallback, blockquote-style reasoning, block-style tool activity, MCP/Skills/Behavior management
 - **Autonomous Coding Mode**: 24/7 workspace-driven loop that reads `TODO.md`, validates with local tests, and only pushes after success
 - **Structured Logging**: Comprehensive observability via the `tracing` crate
+- **Repo Map Context**: Tree-sitter symbol extraction + personalized PageRank render a token-budgeted `<repo_map>` into the system prompt (`[agent] repo_map_tokens`)
+- **Token-Efficient Edits**: `edit_block` tool applies ordered search/replace pairs atomically; model capability routing hints the right edit format per provider/model
+- **Transactional Git Harness**: Pre-run snapshots with dirty-tree protection, Conventional Commit derivation, and a TUI `/undo` command to roll back a run's file changes
 
 ## Architecture
 
