@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Model-agnostic provider routing with the `LLMProvider` trait, capability metadata, `[client].provider` selection, and native adapters for OpenAI, Anthropic, Ollama, and OpenRouter
+- Native Anthropic Messages API adapter with `x-api-key` / `anthropic-version` headers, `/messages` endpoint routing, native tool schemas, and SSE streaming normalization
+- Provider-specific endpoint overrides under `[client.anthropic]`, `[client.ollama]`, `[client.openrouter]`, and `[client.openai]`; environment overrides via `HERMES_PROVIDER` plus per-provider `*_API_KEY` vars
+- Provider-aware session distillation and sub-agent delegation so background work follows the configured provider
 - Autonomous coding mode through `hermes autonomous` and the `hermes run --autonomous` compatibility alias
 - Shared `[autonomous]` runtime configuration for autonomous polling interval, TODO path, status report path, validation command, git target, commit message, command timeout, and repeated-failure pause threshold
 - Repo-root `TODO.md` task ledger with `Implemented` and `Pending` sections for autonomous workspace planning

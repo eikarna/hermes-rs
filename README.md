@@ -104,10 +104,16 @@ Configuration is TOML, not YAML. Example:
 
 ```toml
 [client]
+provider = "openai" # openai | anthropic | ollama | openrouter
 base_url = "https://api.openai.com/v1"
 timeout_secs = 60
 # api_key = "set me or use OPENAI_API_KEY"
 # auth_ref = "openai-default"
+
+# Provider endpoint overrides and env credentials:
+# [client.anthropic]  # uses ANTHROPIC_API_KEY when api_key is omitted
+# [client.openrouter] # uses OPENROUTER_API_KEY when api_key is omitted
+# [client.ollama]     # defaults to http://localhost:11434/v1
 
 [agent]
 model = "gpt-4"
@@ -142,6 +148,7 @@ output_cost_per_million = 0.0
 Or use environment variables:
 
 ```bash
+export HERMES_PROVIDER=openai # anthropic | ollama | openrouter
 export OPENAI_API_KEY=your_api_key_here
 export OPENAI_BASE_URL=https://api.openai.com/v1
 export HERMES_MODEL=gpt-4
@@ -172,11 +179,11 @@ Provider reality check:
 - **OpenAI**: Hermes supports API-key profiles today. OpenAI also documents ChatGPT/Codex browser login, device/headless login, and access-token/cache workflows for Codex, but Hermes has not wired those OAuth credentials into runtime requests yet.
 - **Google**: Gemini supports API keys and OAuth/ADC. Direct desktop OAuth requires a Google OAuth client ID; using `gcloud auth application-default login` keeps token management outside Hermes.
 - **GitHub Copilot**: Copilot CLI supports OAuth device flow, supported GitHub tokens via `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, OS keychain storage, and GitHub CLI fallback. Hermes can reference external tokens today; it does not run Copilot login itself yet.
-- **Anthropic**: Claude access can come from Claude.ai / Claude Code accounts, Anthropic Console API keys, Team/Enterprise accounts, and cloud-provider routes such as Vertex AI, Amazon Bedrock, and Microsoft Foundry. Hermes supports API-key metadata today; cloud-provider and Claude-account flows need provider-specific clients before runtime use.
+- **Anthropic**: Hermes supports the native Messages API with `x-api-key` headers, tool calls, and SSE streaming through `[client].provider = "anthropic"` and `ANTHROPIC_API_KEY`. Claude-account OAuth and cloud-provider routes such as Vertex/Bedrock are not wired yet.
 
-Hermes continues to support API keys and custom base URLs through `[client].api_key`, `[client].base_url`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `--api-key`, and `--base-url`. Non-OpenAI auth profiles require `--base-url` because the current runtime client is OpenAI-compatible and credentials must be bound to the intended endpoint. When `auth_ref` is active, credentials are bound to the endpoint stored in the auth profile to prevent repo-local config from redirecting secrets.
+Hermes routes runtime requests by `[client].provider`. OpenAI, Ollama, and OpenRouter use OpenAI-compatible chat-completions endpoints; Anthropic uses the native Messages API. API keys continue to flow through `auth_ref` profiles when configured. When `auth_ref` is active, credentials are bound to the endpoint stored in the auth profile to prevent repo-local config from redirecting secrets.
 
-When `auth_ref` is active, Hermes binds the credential to the profile endpoint. Use `hermes auth set-api-key <provider> --base-url <url>` for non-default OpenAI-compatible endpoints instead of setting a repo-local `[client].base_url` that could redirect credentials.
+When `auth_ref` is active, Hermes binds the credential to the profile endpoint, including provider-specific endpoints. Use `hermes auth set-api-key <provider> --base-url <url>` for non-default endpoints instead of setting a repo-local `[client].base_url` that could redirect credentials.
 
 OAuth browser/device login is intentionally not enabled until provider-specific secure token storage and documented OAuth flows are implemented. See [OAUTH_DESIGN.md](OAUTH_DESIGN.md) for the phased plan.
 

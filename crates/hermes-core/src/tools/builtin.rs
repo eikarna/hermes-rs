@@ -3,9 +3,10 @@
 //! This module aggregates all built-in tools and provides a convenient
 //! function to register them all with a ToolRegistry.
 
-use crate::client::OpenAIClient;
+use crate::client::{LLMProvider, OpenAIClient};
 use crate::error::Result;
 use crate::tools::ToolRegistry;
+use std::sync::Arc;
 
 pub use super::clarify_tool::ClarifyTool;
 pub use super::code_execution::CodeExecutionTool;
@@ -48,9 +49,19 @@ pub async fn register_builtin_tools_with_sub_agent(
     parent_client: &OpenAIClient,
     model: impl Into<String>,
 ) -> Result<()> {
+    register_builtin_tools_with_provider_sub_agent(registry, Arc::new(parent_client.clone()), model)
+        .await
+}
+
+/// Register all built-in tools plus delegation through the configured provider.
+pub async fn register_builtin_tools_with_provider_sub_agent(
+    registry: &ToolRegistry,
+    parent_client: Arc<dyn LLMProvider>,
+    model: impl Into<String>,
+) -> Result<()> {
     register_builtin_tools(registry).await?;
     registry
-        .register(SubAgentTool::new(parent_client, model.into()))
+        .register(SubAgentTool::with_provider(parent_client, model.into()))
         .await?;
     Ok(())
 }

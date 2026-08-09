@@ -6,13 +6,13 @@
 use std::error::Error as StdError;
 
 use async_trait::async_trait;
-use reqwest::Client;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::agent::{AgentConfig, HermesAgent};
-use crate::client::{ClientConfig, OpenAIClient};
+use crate::client::{LLMProvider, OpenAIClient};
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolRegistry, ToolResult};
 
@@ -34,16 +34,19 @@ struct SubAgentArgs {
 
 /// Tool that delegates a focused task to an isolated child HermesAgent.
 pub struct SubAgentTool {
-    client_config: ClientConfig,
-    http_client: Client,
+    client: Arc<dyn LLMProvider>,
     model: String,
 }
 
 impl SubAgentTool {
     pub fn new(parent_client: &OpenAIClient, model: impl Into<String>) -> Self {
+        Self::with_provider(Arc::new(parent_client.clone()), model)
+    }
+
+    /// Create a delegation tool that shares the parent's configured provider.
+    pub fn with_provider(parent_client: Arc<dyn LLMProvider>, model: impl Into<String>) -> Self {
         Self {
-            client_config: parent_client.config_clone(),
-            http_client: parent_client.http_client_clone(),
+            client: parent_client,
             model: model.into(),
         }
     }
@@ -61,10 +64,6 @@ impl SubAgentTool {
             return Err("Sub-agent task must not be empty".into());
         }
 
-        let client = OpenAIClient::from_shared_http_client(
-            self.client_config.clone(),
-            self.http_client.clone(),
-        );
         let config = AgentConfig {
             model: self.model.clone(),
             stream: false,
@@ -73,7 +72,7 @@ impl SubAgentTool {
         };
 
         let registry = ToolRegistry::new(config.tool_timeout);
-        let agent = HermesAgent::new(config, client, registry);
+        let agent = HermesAgent::new_with_provider(config, self.client.clone(), registry);
         let message = agent
             .run(task.to_string())
             .await

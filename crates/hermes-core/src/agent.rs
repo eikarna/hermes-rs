@@ -11,12 +11,11 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::client::{
-    ChatResponse, ChatStreamEvent, ChatStreamResponse, Message, OpenAIClient, ToolCall,
+    ChatResponse, ChatStreamEvent, ChatStreamResponse, LLMProvider, Message, OpenAIClient, ToolCall,
 };
 use crate::config::{runtime_config, BehaviorSettings};
 use crate::context::{estimate_message_tokens, estimate_tokens};
 use crate::context_files::{load_default_context_files, load_workspace_context};
-use crate::distillation::distill_session_to_memory;
 use crate::error::{Error, Result};
 use crate::memory::MemoryManager;
 use crate::parser::{ToolCallParser, ToolCallStreamParser};
@@ -104,7 +103,7 @@ pub struct AgentTelemetry {
 /// Hermes Agent for tool orchestration
 pub struct HermesAgent {
     config: AgentConfig,
-    client: OpenAIClient,
+    client: Arc<dyn LLMProvider>,
     registry: ToolRegistry,
     conversation: Arc<RwLock<Vec<Message>>>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
@@ -114,6 +113,15 @@ pub struct HermesAgent {
 impl HermesAgent {
     /// Create a new Hermes agent
     pub fn new(config: AgentConfig, client: OpenAIClient, registry: ToolRegistry) -> Self {
+        Self::new_with_provider(config, Arc::new(client), registry)
+    }
+
+    /// Create a new Hermes agent with any configured LLM provider.
+    pub fn new_with_provider(
+        config: AgentConfig,
+        client: Arc<dyn LLMProvider>,
+        registry: ToolRegistry,
+    ) -> Self {
         Self {
             config,
             client,
@@ -128,6 +136,16 @@ impl HermesAgent {
     pub fn with_events(
         config: AgentConfig,
         client: OpenAIClient,
+        registry: ToolRegistry,
+        event_tx: mpsc::Sender<AgentEvent>,
+    ) -> Self {
+        Self::with_provider_events(config, Arc::new(client), registry, event_tx)
+    }
+
+    /// Create with an event channel and any configured LLM provider.
+    pub fn with_provider_events(
+        config: AgentConfig,
+        client: Arc<dyn LLMProvider>,
         registry: ToolRegistry,
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> Self {
@@ -463,8 +481,13 @@ impl HermesAgent {
         let client = self.client.clone();
         let model = self.config.model.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                distill_session_to_memory(client, model, memory_manager, history).await
+            if let Err(error) = crate::distillation::distill_session_with_provider(
+                client,
+                model,
+                memory_manager,
+                history,
+            )
+            .await
             {
                 warn!(error = %error, "Session distillation failed");
             }
@@ -1179,7 +1202,7 @@ fn strip_tool_call_markup(content: &str) -> String {
 /// Builder for creating a HermesAgent
 pub struct HermesAgentBuilder {
     config: AgentConfig,
-    client: Option<OpenAIClient>,
+    client: Option<Arc<dyn LLMProvider>>,
     registry: Option<ToolRegistry>,
     memory_manager: Option<MemoryManager>,
 }
@@ -1232,6 +1255,12 @@ impl HermesAgentBuilder {
 
     /// Set the OpenAI client
     pub fn client(mut self, client: OpenAIClient) -> Self {
+        self.client = Some(Arc::new(client));
+        self
+    }
+
+    /// Set any configured LLM provider.
+    pub fn provider(mut self, client: Arc<dyn LLMProvider>) -> Self {
         self.client = Some(client);
         self
     }
@@ -1252,14 +1281,14 @@ impl HermesAgentBuilder {
     pub fn build(self) -> Result<HermesAgent> {
         let client = match self.client {
             Some(client) => client,
-            None => OpenAIClient::from_env()?,
+            None => crate::client::build_provider_client(&runtime_config().client)?,
         };
 
         let registry = self
             .registry
             .unwrap_or_else(|| ToolRegistry::new(self.config.tool_timeout));
 
-        let mut agent = HermesAgent::new(self.config, client, registry);
+        let mut agent = HermesAgent::new_with_provider(self.config, client, registry);
         if let Some(memory_manager) = self.memory_manager {
             agent = agent.with_memory_manager(memory_manager);
         }

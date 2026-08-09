@@ -63,7 +63,12 @@ pub use auth::{
     generate_oauth_state, generate_pkce_challenge, parse_loopback_authorization_code, AuthMethod,
     AuthProfile, AuthStore, LoopbackOAuthReceiver, OAuthTokenResponse, PkceChallenge,
 };
-pub use client::{Message, OpenAIClient};
+pub use client::{
+    build_provider_client, build_provider_for_kind, chat_streaming_with_provider,
+    chat_with_provider, resolve_provider_settings, AnthropicClient, ClientConfig, EditFormat,
+    LLMProvider, Message, OpenAIClient, ProviderCapabilities, ProviderClient, ProviderConfig,
+    ProviderKind, ProviderSettings,
+};
 pub use config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
     BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings,
@@ -74,7 +79,7 @@ pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use context_files::{
     load_context_dir, load_default_context_files, load_workspace_context, scan_context_content,
 };
-pub use distillation::distill_session_to_memory;
+pub use distillation::{distill_session_to_memory, distill_session_with_provider};
 pub use error::{Error, Result};
 pub use gateway::{Gateway, GatewayConfig, PlatformAdapter};
 pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};
@@ -83,7 +88,7 @@ pub use parser::ToolCallParser;
 pub use platform::PlatformInfo;
 pub use skills::{Skill, SkillManager};
 pub use tools::{
-    register_builtin_tools, register_builtin_tools_with_sub_agent, HermesTool, ToolRegistry,
-    ToolResult,
+    register_builtin_tools, register_builtin_tools_with_provider_sub_agent,
+    register_builtin_tools_with_sub_agent, HermesTool, ToolRegistry, ToolResult,
 };
 pub use trajectory::{Trajectory, TrajectoryBuilder, TrajectoryExporter};

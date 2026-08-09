@@ -50,6 +50,21 @@ pub struct ClientSettings {
     pub auth_ref: Option<String>,
     pub timeout_secs: u64,
     pub max_context_length: usize,
+    /// LLM provider backend: "openai" (default), "anthropic", "ollama", "openrouter"
+    pub provider: String,
+    /// Optional per-provider connection overrides.
+    pub openai: ProviderEndpointSettings,
+    pub anthropic: ProviderEndpointSettings,
+    pub ollama: ProviderEndpointSettings,
+    pub openrouter: ProviderEndpointSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderEndpointSettings {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub timeout_secs: Option<u64>,
 }
 
 impl Default for ClientSettings {
@@ -60,8 +75,87 @@ impl Default for ClientSettings {
             auth_ref: None,
             timeout_secs: 60,
             max_context_length: 128_000,
+            provider: "openai".to_string(),
+            openai: ProviderEndpointSettings::default(),
+            anthropic: ProviderEndpointSettings::default(),
+            ollama: ProviderEndpointSettings::default(),
+            openrouter: ProviderEndpointSettings::default(),
         }
     }
+}
+
+impl ClientSettings {
+    fn endpoint_settings(
+        &self,
+        kind: crate::client::ProviderKind,
+    ) -> Option<&ProviderEndpointSettings> {
+        match kind {
+            crate::client::ProviderKind::Openai => Some(&self.openai),
+            crate::client::ProviderKind::Ollama => Some(&self.ollama),
+            crate::client::ProviderKind::Openrouter => Some(&self.openrouter),
+            crate::client::ProviderKind::Anthropic => Some(&self.anthropic),
+        }
+    }
+
+    pub(crate) fn resolved_base_url_for(
+        &self,
+        kind: crate::client::ProviderKind,
+    ) -> Option<String> {
+        let configured = self
+            .endpoint_settings(kind)
+            .and_then(|settings| settings.base_url.clone());
+        let value = configured.or(match kind {
+            crate::client::ProviderKind::Openai => Some(self.base_url.clone()),
+            crate::client::ProviderKind::Ollama => non_empty_env("OLLAMA_BASE_URL"),
+            crate::client::ProviderKind::Openrouter => non_empty_env("OPENROUTER_BASE_URL"),
+            crate::client::ProviderKind::Anthropic => non_empty_env("ANTHROPIC_BASE_URL"),
+        });
+        value.filter(|v| !v.trim().is_empty())
+    }
+
+    pub(crate) fn resolved_api_key_for(&self, kind: crate::client::ProviderKind) -> Option<String> {
+        let configured = self
+            .endpoint_settings(kind)
+            .and_then(|settings| settings.api_key.clone());
+        configured
+            .or(match kind {
+                crate::client::ProviderKind::Openai => self
+                    .api_key
+                    .clone()
+                    .or_else(|| non_empty_env("OPENAI_API_KEY")),
+                crate::client::ProviderKind::Ollama => non_empty_env("OLLAMA_API_KEY"),
+                crate::client::ProviderKind::Openrouter => non_empty_env("OPENROUTER_API_KEY"),
+                crate::client::ProviderKind::Anthropic => non_empty_env("ANTHROPIC_API_KEY"),
+            })
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    pub(crate) fn resolved_timeout_secs_for(
+        &self,
+        kind: crate::client::ProviderKind,
+    ) -> Option<u64> {
+        let configured = self
+            .endpoint_settings(kind)
+            .and_then(|settings| settings.timeout_secs);
+        configured.or(match kind {
+            crate::client::ProviderKind::Openai => Some(self.timeout_secs),
+            crate::client::ProviderKind::Ollama => {
+                non_empty_env("OLLAMA_TIMEOUT_SECS").and_then(|value| value.parse().ok())
+            }
+            crate::client::ProviderKind::Openrouter => {
+                non_empty_env("OPENROUTER_TIMEOUT_SECS").and_then(|value| value.parse().ok())
+            }
+            crate::client::ProviderKind::Anthropic => {
+                non_empty_env("ANTHROPIC_TIMEOUT_SECS").and_then(|value| value.parse().ok())
+            }
+        })
+    }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +571,7 @@ pub fn parse_config_str(raw: &str, source: &Path) -> Result<AppConfig> {
 
 impl AppConfig {
     pub fn apply_env_overrides(&mut self) -> Result<()> {
+        apply_string_value_override("HERMES_PROVIDER", &mut self.client.provider);
         apply_string_option_override("OPENAI_API_KEY", &mut self.client.api_key)?;
         apply_string_value_override("OPENAI_BASE_URL", &mut self.client.base_url);
         apply_string_option_override("HERMES_AUTH_REF", &mut self.client.auth_ref)?;
@@ -654,6 +749,7 @@ mod tests {
             .join("hermes.example.toml");
         let raw = std::fs::read_to_string(&root).unwrap();
         let config = parse_config_str(&raw, &root).unwrap();
+        assert_eq!(config.client.provider, "openai");
         assert_eq!(config.agent.model, "gpt-4");
         assert!(config.tui.rich_output);
         assert_eq!(config.autonomous.git_branch, "agent-dev");
@@ -693,6 +789,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_provider_endpoint_overrides() {
+        let config = parse_config_str(
+            r##"
+            [client]
+            provider = "anthropic"
+
+            [client.anthropic]
+            base_url = "https://anthropic.local/v1"
+            api_key = "anthropic-key"
+            timeout_secs = 33
+            "##,
+            Path::new("providers.toml"),
+        )
+        .unwrap();
+
+        assert_eq!(config.client.provider, "anthropic");
+        assert_eq!(
+            config.client.anthropic.base_url.as_deref(),
+            Some("https://anthropic.local/v1")
+        );
+        assert_eq!(
+            config
+                .client
+                .resolved_api_key_for(crate::client::ProviderKind::Anthropic)
+                .as_deref(),
+            Some("anthropic-key")
+        );
+    }
+
+    #[test]
     fn invalid_toml_returns_field_aware_error() {
         let path = PathBuf::from("broken.toml");
         let error = parse_config_str("[agent]\nmax_iterations = \"many\"\n", &path).unwrap_err();
@@ -705,6 +831,7 @@ mod tests {
     fn env_overrides_apply_after_file_values() {
         let _guard = env_lock().lock().unwrap();
         let previous_model = set_env("HERMES_MODEL", "gpt-4.1");
+        let previous_provider = set_env("HERMES_PROVIDER", "ollama");
         let previous_stream = set_env("HERMES_STREAM", "false");
         let previous_interval = set_env("HERMES_AUTONOMOUS_INTERVAL", "120");
         let previous_status = set_env("HERMES_AUTONOMOUS_STATUS", "runtime/autonomous-status.toml");
@@ -717,6 +844,7 @@ mod tests {
         config.apply_env_overrides().unwrap();
 
         assert_eq!(config.agent.model, "gpt-4.1");
+        assert_eq!(config.client.provider, "ollama");
         assert!(!config.agent.stream);
         assert_eq!(config.autonomous.interval_secs, 120);
         assert_eq!(
@@ -725,6 +853,7 @@ mod tests {
         );
 
         restore_env("HERMES_MODEL", previous_model);
+        restore_env("HERMES_PROVIDER", previous_provider);
         restore_env("HERMES_STREAM", previous_stream);
         restore_env("HERMES_AUTONOMOUS_INTERVAL", previous_interval);
         restore_env("HERMES_AUTONOMOUS_STATUS", previous_status);

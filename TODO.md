@@ -17,4 +17,12 @@
 - Workspace context-file auto-loading with prompt-injection scanning for agent guidance files
 - Sub-agent delegation as an opt-in built-in tool through `delegate_to_sub_agent`
 
+- Model-agnostic provider routing with an internal `LLMProvider` trait, provider capability metadata, `[client].provider` selection, and native adapters for OpenAI, Anthropic, Ollama, and OpenRouter
+
 ## Pending
+
+- Phase 1 follow-up: per-model capability tables and richer provider-specific metadata
+- [Aider Phase 2] Implement tree-sitter AST symbol extraction and Personalized PageRank repository mapping (`<repo_map>`)
+- [Aider Phase 3] Implement SEARCH/REPLACE edit block parser, exact/fuzzy diff applier, and model capability routing
+- [Aider Phase 4] Implement transactional git harness (dirty tree protection, Conventional Commit generation, `/undo` command)
+- [Aider Phase 5] Port skill & memory lifecycle management (curator background task, skill distillation, auto-archiving)

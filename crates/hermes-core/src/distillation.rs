@@ -2,11 +2,12 @@
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::debug;
 
-use crate::client::{Message, OpenAIClient, Role};
+use crate::client::{LLMProvider, Message, OpenAIClient, Role};
 use crate::error::{Error, Result};
 use crate::memory::{MemoryBlock, MemoryManager};
 
@@ -15,6 +16,16 @@ const DISTILLATION_SYSTEM_DIRECTIVE: &str = "Analyze the conversation history. E
 /// Distill durable facts from a completed session and persist them to long-term memory.
 pub async fn distill_session_to_memory(
     client: OpenAIClient,
+    model: String,
+    memory_manager: MemoryManager,
+    history: Vec<Message>,
+) -> Result<usize> {
+    distill_session_with_provider(Arc::new(client), model, memory_manager, history).await
+}
+
+/// Distill durable facts using any configured LLM provider.
+pub async fn distill_session_with_provider(
+    client: Arc<dyn LLMProvider>,
     model: String,
     memory_manager: MemoryManager,
     history: Vec<Message>,

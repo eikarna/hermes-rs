@@ -6,14 +6,14 @@ mod tui;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use hermes_core::agent::{AgentConfig, AgentEvent, HermesAgent};
 use hermes_core::auth::{default_auth_store_path, AuthMethod, AuthStore};
-use hermes_core::client::{ClientConfig, OpenAIClient};
+use hermes_core::client::{build_provider_for_kind, ClientConfig, LLMProvider, ProviderKind};
 use hermes_core::config::{
     install_runtime_config, load_app_config, AppConfig, BehaviorSettings, LoggingSettings,
     McpServerConfig, McpTransportKind,
@@ -268,13 +268,45 @@ fn apply_cli_overrides(cli: &Cli, config: &mut AppConfig) {
     }
 }
 
-fn client_config(config: &AppConfig) -> Result<ClientConfig> {
-    let client = ClientConfig::from(&config.client);
+fn client_config(config: &AppConfig) -> Result<(ProviderKind, ClientConfig)> {
+    let kind = ProviderKind::from_name(&config.client.provider).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unsupported client provider '{}'. Expected one of: openai, anthropic, ollama, openrouter.",
+            config.client.provider
+        )
+    })?;
+    let resolved = hermes_core::client::resolve_provider_settings(&config.client)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let client = ClientConfig {
+        base_url: resolved.config.base_url,
+        api_key: resolved.config.api_key,
+        timeout: resolved.config.timeout,
+        max_context_length: resolved.max_context_length,
+    };
     if let Some(auth_ref) = config.client.auth_ref.as_deref() {
         let store = AuthStore::load_default()?;
-        return apply_auth_profile_to_client(client, &store, auth_ref);
+        let client = apply_auth_profile_to_client(client, &store, auth_ref)?;
+        return Ok((infer_provider_from_base_url(&client.base_url), client));
     }
-    Ok(client)
+    Ok((kind, client))
+}
+
+fn infer_provider_from_base_url(base_url: &str) -> ProviderKind {
+    let normalized = base_url.trim_end_matches('/').to_ascii_lowercase();
+    if normalized.contains(".anthropic.com") {
+        ProviderKind::Anthropic
+    } else if normalized.contains("openrouter.ai") {
+        ProviderKind::Openrouter
+    } else if normalized.contains("localhost:11434") || normalized.contains("127.0.0.1:11434") {
+        ProviderKind::Ollama
+    } else {
+        ProviderKind::Openai
+    }
+}
+
+fn runtime_client(config: &AppConfig) -> Result<Arc<dyn LLMProvider>> {
+    let (kind, client) = client_config(config)?;
+    build_provider_for_kind(kind, client).map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 fn apply_auth_profile_to_client(
@@ -336,11 +368,16 @@ fn agent_config(
 pub(crate) async fn build_registry(
     config: &AppConfig,
     mcp_manager: &mut McpManager,
-    client: &OpenAIClient,
+    client: &Arc<dyn LLMProvider>,
     model: &str,
 ) -> Result<ToolRegistry> {
     let registry = ToolRegistry::new(Duration::from_secs(config.tools.registry_timeout_secs));
-    hermes_core::tools::register_builtin_tools_with_sub_agent(&registry, client, model).await?;
+    hermes_core::tools::register_builtin_tools_with_provider_sub_agent(
+        &registry,
+        client.clone(),
+        model,
+    )
+    .await?;
     registry.register(EchoTool::new()).await?;
     registry.register(CalculatorTool::new()).await?;
 
@@ -395,12 +432,12 @@ pub(crate) async fn create_runtime_agent(
     event_tx: mpsc::Sender<AgentEvent>,
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
-    let client = OpenAIClient::new(client_config(config)?);
+    let client = runtime_client(config)?;
     let registry = build_registry(config, mcp_manager, &client, &behavior.model).await?;
     let agent_config = agent_config(config, behavior, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
     Ok(
-        HermesAgent::with_events(agent_config, client, registry, event_tx)
+        HermesAgent::with_provider_events(agent_config, client, registry, event_tx)
             .with_memory_manager(memory_manager),
     )
 }
@@ -410,11 +447,14 @@ async fn create_agent_without_events(
     system_prompt: Option<&str>,
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
-    let client = OpenAIClient::new(client_config(config)?);
+    let client = runtime_client(config)?;
     let registry = build_registry(config, mcp_manager, &client, &config.agent.model).await?;
     let agent_config = agent_config(config, &config.agent, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
-    Ok(HermesAgent::new(agent_config, client, registry).with_memory_manager(memory_manager))
+    Ok(
+        HermesAgent::new_with_provider(agent_config, client, registry)
+            .with_memory_manager(memory_manager),
+    )
 }
 
 async fn load_repo_memory_manager() -> Result<MemoryManager> {
@@ -473,7 +513,7 @@ async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result
 
 async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let client = OpenAIClient::new(client_config(config)?);
+    let client = runtime_client(config)?;
     let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let tools = registry.get_schemas().await;
 
@@ -489,7 +529,7 @@ async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
 
 async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let client = OpenAIClient::new(client_config(config)?);
+    let client = runtime_client(config)?;
     let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let parsed_args: Value = if let Some(args) = args {
         serde_json::from_str(args).context("Failed to parse tool arguments as JSON")?
@@ -984,6 +1024,26 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use hermes_core::auth::AuthProfile;
+
+    #[test]
+    fn infers_provider_wire_format_from_auth_profile_endpoint() {
+        assert_eq!(
+            infer_provider_from_base_url("https://api.anthropic.com/v1"),
+            ProviderKind::Anthropic
+        );
+        assert_eq!(
+            infer_provider_from_base_url("https://openrouter.ai/api/v1"),
+            ProviderKind::Openrouter
+        );
+        assert_eq!(
+            infer_provider_from_base_url("http://localhost:11434/v1"),
+            ProviderKind::Ollama
+        );
+        assert_eq!(
+            infer_provider_from_base_url("https://example.invalid/v1"),
+            ProviderKind::Openai
+        );
+    }
 
     #[test]
     fn rich_tui_without_log_file_uses_sink() {

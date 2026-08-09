@@ -4,6 +4,14 @@
 //! Supports Server-Sent Events for streaming responses.
 //! Supports reasoning_content for extended-thinking models.
 
+pub mod provider;
+pub use provider::{
+    build_provider_client, build_provider_for_kind, resolve_provider_settings, EditFormat,
+    LLMProvider, ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind,
+    ProviderSettings,
+};
+
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::env;
 use std::pin::Pin;
@@ -76,20 +84,9 @@ impl OpenAIClient {
         }
     }
 
-    /// Create a client from an existing HTTP client handle.
-    pub(crate) fn from_shared_http_client(config: ClientConfig, http_client: Client) -> Self {
-        Self {
-            config,
-            http_client,
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn config_clone(&self) -> ClientConfig {
         self.config.clone()
-    }
-
-    pub(crate) fn http_client_clone(&self) -> Client {
-        self.http_client.clone()
     }
 
     /// Create from environment variables
@@ -281,6 +278,401 @@ impl OpenAIClient {
 
         Ok(request)
     }
+}
+
+/// Anthropic Messages API adapter. Translates the OpenAI-shaped internal
+/// types used by the agent loop into Anthropic's `/messages` format.
+///
+/// Phase 1 slice: native Messages endpoint (`{base_url}/messages`),
+/// `x-api-key` + `anthropic-version: 2023-06-01` headers, OpenAI-equivalent
+/// tool schema mapping, and response normalization. Cache-control and
+/// extended-thinking settings are out of scope.
+#[derive(Debug, Clone)]
+pub struct AnthropicClient {
+    config: ClientConfig,
+    http_client: Client,
+}
+
+impl AnthropicClient {
+    /// Create an Anthropic adapter from a generic client config. The
+    /// `base_url` should end at the API prefix (e.g. `https://api.anthropic.com/v1`);
+    /// `/messages` is appended when routing requests.
+    pub fn new(config: ClientConfig) -> Result<Self> {
+        let http_client = Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .map_err(|e| Error::Config(format!("Failed to create HTTP client: {}", e)))?;
+        Ok(Self {
+            config,
+            http_client,
+        })
+    }
+
+    fn build_headers(&self) -> Result<HeaderMap> {
+        let api_key = self.config.api_key.as_deref().ok_or_else(|| {
+            Error::Config(
+                "Anthropic provider requires ANTHROPIC_API_KEY or [client.anthropic].api_key"
+                    .to_string(),
+            )
+        })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-api-key"),
+            HeaderValue::from_str(api_key)
+                .map_err(|_| Error::Config("Invalid Anthropic API key format".to_string()))?,
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+        Ok(headers)
+    }
+
+    fn messages_url(&self) -> Result<reqwest::Url> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = format!("{}/messages", base);
+        reqwest::Url::parse(&url).map_err(|e| Error::InvalidUrl(e.to_string()))
+    }
+
+    /// Convert the internal OpenAI-shaped message list into Anthropic's
+    /// `messages` + `system` shape. System messages are extracted into the
+    /// `system` parameter; tool results become `tool_result` content blocks.
+    fn build_request(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut anthropic_messages: Vec<Value> = Vec::new();
+
+        for m in messages {
+            match m.role {
+                Role::System => system_parts.push(m.content.trim()),
+                Role::User => {
+                    anthropic_messages.push(json!({
+                        "role": "user",
+                        "content": [{ "type": "text", "text": m.content }],
+                    }));
+                }
+                Role::Assistant => {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    if let Some(text) = Self::non_empty(&m.content) {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                    if let Some(calls) = m.tool_calls.as_deref() {
+                        for call in calls {
+                            blocks.push(json!({
+                                "type": "tool_use",
+                                "id": call.id,
+                                "name": call.function.name,
+                                "input": serde_json::from_str::<Value>(&call.function.arguments)
+                                   .unwrap_or_else(|_| json!({})),
+                            }));
+                        }
+                    }
+                    anthropic_messages.push(json!({ "role": "assistant", "content": blocks }));
+                }
+                Role::Tool => {
+                    anthropic_messages.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                            "content": [{ "type": "text", "text": m.content }],
+                        }],
+                    }));
+                }
+            }
+        }
+
+        let mut request = json!({
+            "model": model,
+            "max_tokens": 16_384,
+            "stream": stream,
+            "messages": anthropic_messages,
+        });
+        if !system_parts.is_empty() {
+            request["system"] = json!(system_parts.join("\n\n"));
+        }
+        if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+            request["tools"] = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.parameters,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into();
+        }
+        Ok(request)
+    }
+
+    fn non_empty(s: &str) -> Option<&str> {
+        if s.trim().is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    /// Run a non-streaming chat completion.
+    pub async fn chat(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<ChatResponse> {
+        let request = self.build_request(model, messages, tools, false)?;
+        let response = self
+            .http_client
+            .post(self.messages_url()?)
+            .headers(self.build_headers()?)
+            .json(&request)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(Error::Agent(format!(
+                "Anthropic request failed ({}): {}",
+                status, body
+            )));
+        }
+        Self::parse_anthropic_response(&body, model)
+    }
+
+    /// Run Anthropic's streaming `/messages` API and expose the same SSE
+    /// pipeline used for OpenAI-compatible responses.
+    pub async fn chat_streaming(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<ChatStreamResponse> {
+        let request = self.build_request(model, messages, tools, true)?;
+        let response = self
+            .http_client
+            .post(self.messages_url()?)
+            .headers(self.build_headers()?)
+            .json(&request)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            return Err(Error::Agent(format!(
+                "Anthropic streaming request failed ({}): {}",
+                status, body
+            )));
+        }
+        Ok(ChatStreamResponse::new(response.bytes_stream()))
+    }
+
+    /// Convert Anthropic's response JSON into the shared `ChatResponse` type
+    /// used throughout the agent loop. Only text and tool_use content blocks
+    /// are mapped; citations/thinking blocks are dropped for Phase 1.
+    fn parse_anthropic_response(body: &str, model: &str) -> Result<ChatResponse> {
+        let value: Value = serde_json::from_str(body)
+            .map_err(|e| Error::ParseResponse(format!("Invalid Anthropic response: {}", e)))?;
+
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let stop_reason = value
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .map(Self::normalize_stop_reason);
+
+        let usage = value
+            .get("usage")
+            .map(|u| Usage {
+                prompt_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                completion_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
+                    as u32,
+                total_tokens: (u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0)
+                    + u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0))
+                    as u32,
+            })
+            .unwrap_or(Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            });
+
+        let content_blocks = value
+            .get("content")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut text = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        for block in content_blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(Value::as_str) {
+                        text.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    if let (Some(id), Some(name)) = (
+                        block.get("id").and_then(Value::as_str),
+                        block.get("name").and_then(Value::as_str),
+                    ) {
+                        let arguments = match block.get("input") {
+                            Some(input) => serde_json::to_string(input).unwrap_or_default(),
+                            None => "{}".to_string(),
+                        };
+                        tool_calls.push(ToolCall {
+                            id: id.to_string(),
+                            function: ToolCallFunction {
+                                name: name.to_string(),
+                                arguments,
+                            },
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let message = MessageDelta {
+            role: Some(Role::Assistant),
+            content: if text.is_empty() { None } else { Some(text) },
+            reasoning_content: None,
+            tool_calls: None,
+        };
+
+        // Serialize tool calls separately through `with_tool_calls` so the
+        // parsing logic stays identical to the OpenAI path.
+        let mut message = message;
+        if !tool_calls.is_empty() {
+            let tool_calls_value: Vec<crate::client::ToolCallDelta> = tool_calls
+                .into_iter()
+                .map(|tc| crate::client::ToolCallDelta {
+                    index: 0,
+                    id: Some(tc.id),
+                    call_type: Some("function".to_string()),
+                    function: Some(tc.function),
+                })
+                .collect();
+            message.tool_calls = Some(tool_calls_value);
+        }
+
+        Ok(ChatResponse {
+            id,
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: model.to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message,
+                finish_reason: stop_reason,
+            }],
+            usage,
+        })
+    }
+
+    fn normalize_stop_reason(reason: &str) -> String {
+        match reason {
+            "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" => "stop".to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for AnthropicClient {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<ChatResponse> {
+        self.chat(model, messages, tools).await
+    }
+
+    async fn chat_streaming(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<ChatStreamResponse> {
+        self.chat_streaming(model, messages, tools).await
+    }
+
+    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+        ProviderCapabilities {
+            max_input_tokens: self.config.max_context_length,
+            max_output_tokens: 8_192,
+            edit_format: EditFormat::SearchReplace,
+            supports_streaming: true,
+            supports_reasoning: true,
+        }
+    }
+}
+
+/// Concrete per-model negotiation lands with the provider registry.
+#[async_trait]
+impl LLMProvider for OpenAIClient {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<ChatResponse> {
+        self.chat(model, messages, tools).await
+    }
+
+    async fn chat_streaming(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<ChatStreamResponse> {
+        self.chat_streaming(model, messages, tools).await
+    }
+
+    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+        ProviderCapabilities {
+            max_input_tokens: self.config.max_context_length,
+            max_output_tokens: 16_384,
+            edit_format: EditFormat::FullFile,
+            supports_streaming: true,
+            supports_reasoning: false,
+        }
+    }
+}
+
+/// Run a chat completion through any [`LLMProvider`] with a single call.
+/// Note: `chat` is the non-streaming path; prefer [`crate::client::chat_streaming`]
+/// for streaming-first usage in the agent loop.
+pub async fn chat_with_provider(
+    provider: &dyn LLMProvider,
+    model: &str,
+    messages: &[Message],
+    tools: Option<&[ToolSchema]>,
+) -> Result<ChatResponse> {
+    provider.chat(model, messages, tools).await
+}
+
+/// Run a streaming chat completion through any [`LLMProvider`].
+pub async fn chat_streaming_with_provider(
+    provider: &dyn LLMProvider,
+    model: &str,
+    messages: &[Message],
+    tools: Option<&[ToolSchema]>,
+) -> Result<ChatStreamResponse> {
+    provider.chat_streaming(model, messages, tools).await
 }
 
 /// Chat message
@@ -1271,6 +1663,100 @@ mod tests {
         restore_env("GOOGLE_API_KEY", old_google_api_key);
         restore_env("OPENAI_API_KEY", old_openai_api_key);
         cleanup_auth_store_path(&auth_store_path);
+    }
+
+    #[test]
+    fn anthropic_request_maps_system_tools_and_tool_results() {
+        let client = AnthropicClient::new(ClientConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key: Some("test-key".to_string()),
+            timeout: Duration::from_secs(5),
+            max_context_length: 200_000,
+        })
+        .unwrap();
+        let tools = vec![crate::schema::ToolSchema {
+            name: "file_read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let messages = vec![
+            Message::system("Be precise."),
+            Message::user("Read TODO.md"),
+            Message::assistant("").with_tool_calls(vec![ToolCall {
+                id: "call_1".to_string(),
+                function: ToolCallFunction {
+                    name: "file_read".to_string(),
+                    arguments: r#"{"path":"TODO.md"}"#.to_string(),
+                },
+            }]),
+            Message::tool("call_1", "contents"),
+        ];
+
+        let request = client
+            .build_request("claude-sonnet", &messages, Some(&tools), true)
+            .unwrap();
+
+        assert_eq!(request["system"], "Be precise.");
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["messages"][0]["role"], "user");
+        assert_eq!(request["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(request["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(request["tools"][0]["name"], "file_read");
+        assert!(request["tools"][0]["input_schema"].is_object());
+        assert_eq!(
+            client.messages_url().unwrap().as_str(),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn anthropic_response_maps_text_tool_calls_and_usage() {
+        let response = AnthropicClient::parse_anthropic_response(
+            r#"{
+                "id":"msg_1",
+                "model":"claude-sonnet",
+                "stop_reason":"tool_use",
+                "usage":{"input_tokens":3,"output_tokens":4},
+                "content":[
+                    {"type":"text","text":"Reading file."},
+                    {"type":"tool_use","id":"toolu_1","name":"file_read","input":{"path":"TODO.md"}}
+                ]
+            }"#,
+            "claude-sonnet",
+        )
+        .unwrap();
+
+        assert_eq!(response.usage.prompt_tokens, 3);
+        assert_eq!(response.usage.completion_tokens, 4);
+        assert_eq!(response.usage.total_tokens, 7);
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("Reading file.")
+        );
+        let tool_calls = response.choices[0]
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should be mapped");
+        assert_eq!(tool_calls[0].id.as_deref(), Some("toolu_1"));
+        assert_eq!(
+            tool_calls[0].function.as_ref().expect("function").arguments,
+            "{\"path\":\"TODO.md\"}"
+        );
+    }
+
+    #[test]
+    fn anthropic_headers_require_api_key() {
+        let client = AnthropicClient::new(ClientConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key: None,
+            timeout: Duration::from_secs(5),
+            max_context_length: 200_000,
+        })
+        .unwrap();
+
+        let error = client.build_headers().unwrap_err();
+        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
     }
 
     fn restore_env(key: &str, value: Option<String>) {
