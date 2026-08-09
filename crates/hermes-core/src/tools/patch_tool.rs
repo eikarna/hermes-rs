@@ -31,7 +31,7 @@ pub struct PatchTool;
 
 /// Normalize a string for fuzzy matching: trim each line, collapse
 /// runs of whitespace, and normalize line endings to \n.
-fn normalize_whitespace(s: &str) -> String {
+pub(crate) fn normalize_whitespace(s: &str) -> String {
     s.replace("\r\n", "\n")
         .lines()
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -42,7 +42,7 @@ fn normalize_whitespace(s: &str) -> String {
 /// Attempt a fuzzy replacement. Normalizes both the file content and
 /// the `find` string, locates the match in the normalized content,
 /// then maps back to the original content using a line-based approach.
-fn fuzzy_replace(content: &str, find: &str, replace: &str) -> Option<(String, usize)> {
+pub(crate) fn fuzzy_replace(content: &str, find: &str, replace: &str) -> Option<(String, usize)> {
     let normalized_content = normalize_whitespace(content);
     let normalized_find = normalize_whitespace(find);
 

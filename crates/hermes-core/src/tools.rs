@@ -9,6 +9,7 @@ pub mod builtin;
 pub mod clarify_tool;
 pub mod code_execution;
 pub mod datetime_tool;
+pub mod edit_block_tool;
 pub mod file_tools;
 pub mod http_tool;
 pub mod memory_tools;
@@ -26,6 +27,7 @@ pub use builtin::{
     MemorySearchTool, MemoryStoreTool, PatchTool, SubAgentTool, TerminalTool, TimestampTool,
     TodoTool, WebFetchTool, WebSearchTool,
 };
+pub use edit_block_tool::{parse_edit_blocks, EditBlock, EditBlockTool};
 
 use std::collections::HashMap;
 use std::sync::Arc;

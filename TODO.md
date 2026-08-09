@@ -19,11 +19,11 @@
 
 - Model-agnostic provider routing with an internal `LLMProvider` trait, provider capability metadata, `[client].provider` selection, and native adapters for OpenAI, Anthropic, Ollama, and OpenRouter
 - Tree-sitter AST symbol extraction (C, Python, Rust, TypeScript) with personalized PageRank repository mapping and token-budgeted `<repo_map>` rendering
+- Aider-style SEARCH/REPLACE edit block parser (`parse_edit_blocks`), atomic multi-edit `edit_block` tool with exact + fuzzy matching, and capability-driven routing that injects an `<edit_format>` hint when the provider advertises `EditFormat::SearchReplace`
 
 ## Pending
 
 - Phase 1 follow-up: per-model capability tables and richer provider-specific metadata
 - Wire repo map into agent context injection (currently exposed for consumers but not auto-attached to sessions)
-- [Aider Phase 3] Implement SEARCH/REPLACE edit block parser, exact/fuzzy diff applier, and model capability routing
 - [Aider Phase 4] Implement transactional git harness (dirty tree protection, Conventional Commit generation, `/undo` command)
 - [Aider Phase 5] Port skill & memory lifecycle management (curator background task, skill distillation, auto-archiving)

@@ -10,6 +10,8 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, instrument, warn};
 
+#[cfg(test)]
+use crate::client::AnthropicClient;
 use crate::client::{
     ChatResponse, ChatStreamEvent, ChatStreamResponse, LLMProvider, Message, OpenAIClient, ToolCall,
 };
@@ -360,6 +362,19 @@ impl HermesAgent {
             system_prompt.push_str("\n\n<workspace_context>\n");
             system_prompt.push_str(context_files.trim());
             system_prompt.push_str("\n</workspace_context>");
+        }
+
+        if matches!(
+            self.client.capabilities(&self.config.model).edit_format,
+            crate::client::EditFormat::SearchReplace
+        ) {
+            system_prompt.push_str(
+                "\n\n<edit_format>\n\
+                This model supports token-efficient search/replace edits. Prefer the \
+                `edit_block` tool (ordered search/replace pairs, applied atomically) over \
+                rewriting whole files with `file_write`.\n\
+                </edit_format>",
+            );
         }
 
         // Add system prompt
@@ -1417,6 +1432,37 @@ mod tests {
         assert!(system.contains("<long_term_memory>"));
         assert!(system.contains("[fact] User prefers concise answers"));
         assert!(system.contains("</long_term_memory>"));
+    }
+
+    #[tokio::test]
+    async fn build_messages_routes_search_replace_capability() {
+        // Anthropic advertises EditFormat::SearchReplace; the hint must appear.
+        let anthropic = AnthropicClient::new(crate::client::ClientConfig::default()).unwrap();
+        let agent = HermesAgent::new_with_provider(
+            AgentConfig::default(),
+            Arc::new(anthropic),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+        assert!(system.contains("<edit_format>"));
+        assert!(system.contains("edit_block"));
+
+        // OpenAI advertises EditFormat::FullFile; no hint.
+        let agent = HermesAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+        assert!(!system.contains("<edit_format>"));
     }
 
     #[test]

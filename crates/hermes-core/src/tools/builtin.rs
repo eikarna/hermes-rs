@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub use super::clarify_tool::ClarifyTool;
 pub use super::code_execution::CodeExecutionTool;
 pub use super::datetime_tool::{DateTimeTool, TimestampTool};
+pub use super::edit_block_tool::EditBlockTool;
 pub use super::file_tools::{FileListTool, FileReadTool, FileSearchTool, FileWriteTool};
 pub use super::http_tool::HttpRequestTool;
 pub use super::memory_tools::{MemoryRecallTool, MemorySearchTool, MemoryStoreTool};
@@ -39,6 +40,7 @@ pub async fn register_builtin_tools(registry: &ToolRegistry) -> Result<()> {
     registry.register(TodoTool).await?;
     registry.register(ClarifyTool).await?;
     registry.register(PatchTool).await?;
+    registry.register(EditBlockTool).await?;
 
     Ok(())
 }
@@ -86,6 +88,7 @@ pub fn builtin_tool_names() -> Vec<&'static str> {
         "todo",
         "clarify",
         "patch",
+        "edit_block",
         "delegate_to_sub_agent",
     ]
 }
