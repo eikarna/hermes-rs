@@ -84,6 +84,15 @@ enabled = false
 [mcp.servers.env]
 # EXAMPLE_ROOT = "C:/workspace"
 
+[curator]
+# Background lifecycle curation for long-term memory, sessions, and skills.
+memory_decay_days = 14      # days idle before importance decays (0 disables)
+memory_min_importance = 10  # drop memories at or below this after decay
+session_archive_days = 30   # idle days before a session archives (0 disables)
+skill_stale_days = 90       # days since SKILL.md edit before auto-archive (0 disables)
+dedup_threshold_pct = 80    # word-overlap % treated as near-duplicate memory
+skill_distill_min_facts = 3 # facts sharing a tag that promote into a draft skill
+
 [skills]
 root_dir = "C:/Users/Administrator/.config/hermes/skills"
 autoload = true

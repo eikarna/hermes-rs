@@ -608,6 +608,21 @@ impl MemoryManager {
             .collect()
     }
 
+    /// Remove a memory block by ID. Returns true when something was removed.
+    pub async fn remove(&self, id: &str) -> bool {
+        self.long_term.write().await.remove(id).is_some()
+    }
+
+    /// Replace a memory block in place (same ID).
+    pub async fn update(&self, block: MemoryBlock) {
+        self.long_term.write().await.insert(block.id.clone(), block);
+    }
+
+    /// List all long-term memory blocks (no filtering).
+    pub async fn all(&self) -> Vec<MemoryBlock> {
+        self.long_term.read().await.values().cloned().collect()
+    }
+
     /// Store or update a user profile.
     /// When `storage_dir` is set, automatically persists to USER.md on disk.
     pub async fn save_profile(&self, profile: UserProfile) {

@@ -15,8 +15,8 @@ use hermes_core::agent::{AgentConfig, AgentEvent, HermesAgent};
 use hermes_core::auth::{default_auth_store_path, AuthMethod, AuthStore};
 use hermes_core::client::{build_provider_for_kind, ClientConfig, LLMProvider, ProviderKind};
 use hermes_core::config::{
-    install_runtime_config, load_app_config, AppConfig, BehaviorSettings, LoggingSettings,
-    McpServerConfig, McpTransportKind,
+    install_runtime_config, load_app_config, runtime_config, AppConfig, BehaviorSettings,
+    LoggingSettings, McpServerConfig, McpTransportKind,
 };
 use hermes_core::mcp::McpManager;
 use hermes_core::memory::MemoryManager;
@@ -459,7 +459,25 @@ async fn create_agent_without_events(
 
 async fn load_repo_memory_manager() -> Result<MemoryManager> {
     let storage_dir = std::env::current_dir().context("Failed to determine current directory")?;
-    load_memory_manager(storage_dir).await
+    let memory_manager = load_memory_manager(storage_dir).await?;
+    // Curator pass runs in the background: decay/prune/distill without
+    // blocking startup. Failures are logged and non-fatal.
+    let config = runtime_config();
+    let policy = config.curator.clone();
+    let skills_dir = config.skills.root_dir.clone();
+    let curated = memory_manager.clone();
+    tokio::spawn(async move {
+        match hermes_core::curator::curate(&curated, &skills_dir, &policy).await {
+            Ok(report) if !report.is_empty() => {
+                tracing::info!(?report, "Curator pass complete");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "Curator pass failed");
+            }
+        }
+    });
+    Ok(memory_manager)
 }
 
 async fn load_memory_manager(storage_dir: PathBuf) -> Result<MemoryManager> {

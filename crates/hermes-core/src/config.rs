@@ -20,6 +20,7 @@ pub struct AppConfig {
     pub skills: SkillsSettings,
     pub gateway: GatewaySettings,
     pub tools: ToolSettings,
+    pub curator: crate::curator::CurationPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -761,6 +762,8 @@ mod tests {
             config.autonomous.status_path,
             PathBuf::from("autonomous-status.toml")
         );
+        assert_eq!(config.curator.memory_decay_days, 14);
+        assert_eq!(config.curator.skill_distill_min_facts, 3);
     }
 
     #[test]

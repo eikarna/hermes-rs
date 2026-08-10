@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-model capability tables with longest-prefix lookup (`client::lookup_capabilities`), richer `ProviderCapabilities` metadata (`supports_vision`, `supports_tool_calls`), and `<edit_format>` prompt hints steering models toward `edit_block` or `patch` based on advertised capabilities
 - Transactional git harness (`hermes_core::githarness`) with pre-run snapshots, dirty-tree protection, Conventional Commit message derivation, `commit_transaction`, and `undo`
 - TUI `/undo` command restoring the workspace to the snapshot taken before the last agent run
+- Lifecycle curator (`hermes_core::curator`) running non-blockingly at agent startup and on every autonomous tick: memory importance decay with near-duplicate pruning, session auto-archiving, stale skill archiving into `<skills>/_archive/`, and tag-clustered distillation of distilled facts into draft `distilled-<tag>` skills
+- `[curator]` runtime config (`memory_decay_days`, `memory_min_importance`, `session_archive_days`, `skill_stale_days`, `dedup_threshold_pct`, `skill_distill_min_facts`)
 
 ### Changed
 

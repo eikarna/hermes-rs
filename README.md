@@ -16,6 +16,7 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 - **Repo Map Context**: Tree-sitter symbol extraction + personalized PageRank render a token-budgeted `<repo_map>` into the system prompt (`[agent] repo_map_tokens`)
 - **Token-Efficient Edits**: `edit_block` tool applies ordered search/replace pairs atomically; model capability routing hints the right edit format per provider/model
 - **Transactional Git Harness**: Pre-run snapshots with dirty-tree protection, Conventional Commit derivation, and a TUI `/undo` command to roll back a run's file changes
+- **Lifecycle Curator**: Background pass keeping memory and skills healthy — importance decay, near-duplicate pruning, session archiving, stale skill auto-archiving, and distillation of recurring facts into draft skills
 
 ## Architecture
 

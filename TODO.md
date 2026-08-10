@@ -23,6 +23,7 @@
 - Per-model capability tables with longest-prefix matching (`lookup_capabilities`) covering Claude, GPT, and o-series models, richer metadata (`supports_vision`, `supports_tool_calls`), and a `patch`-tool hint for models advertising `EditFormat::Patch`
 - Repo-map context injection: `[agent] repo_map_tokens` budget renders a `<repo_map>` block into the system prompt (parsed once per agent, off the async worker)
 - Transactional git harness (`hermes_core::githarness`): pre-run snapshots with dirty-tree protection, Conventional Commit message derivation from staged diffs, `commit_transaction`, `undo`, and a TUI `/undo` command that rolls back the last run's file changes
+- Skill & memory lifecycle management: background curator pass (`hermes_core::curator`) with memory importance decay and near-duplicate pruning, session auto-archiving, stale skill archiving into `_archive/`, and tag-clustered distillation of long-term facts into draft skills; runs non-blockingly on every agent startup and autonomous tick
 
 ## Pending
-- [Aider Phase 5] Port skill & memory lifecycle management (curator background task, skill distillation, auto-archiving)
+

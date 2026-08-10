@@ -8,6 +8,9 @@ use crate::error::{Error, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Directory name (inside the skills root) holding archived skills.
+pub const ARCHIVE_DIR_NAME: &str = "_archive";
+
 /// A loaded skill with parsed metadata and content.
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -71,6 +74,10 @@ impl SkillManager {
 
             let path = entry.path();
             if !path.is_dir() {
+                continue;
+            }
+            // Archived skills live under `_archive/` and are never auto-loaded.
+            if entry.file_name() == ARCHIVE_DIR_NAME {
                 continue;
             }
 
@@ -169,6 +176,44 @@ impl SkillManager {
         }
 
         Ok(())
+    }
+
+    /// Archive a skill by moving its directory under `<skills_dir>/_archive/`.
+    /// Idempotent: archiving an already-archived or missing skill is a no-op
+    /// returning `Ok(false)`/`Ok(true)` respectively.
+    pub fn archive(&mut self, name: &str) -> Result<bool> {
+        let skill_dir = self.skills_dir.join(name);
+        if !skill_dir.exists() {
+            return Ok(false);
+        }
+        let archive_root = self.skills_dir.join(ARCHIVE_DIR_NAME);
+        std::fs::create_dir_all(&archive_root).map_err(|e| {
+            Error::Config(format!(
+                "Failed to create archive dir '{}': {}",
+                archive_root.display(),
+                e
+            ))
+        })?;
+        let target = archive_root.join(name);
+        if target.exists() {
+            std::fs::remove_dir_all(&target).map_err(|e| {
+                Error::Config(format!(
+                    "Failed to replace archived skill '{}': {}",
+                    target.display(),
+                    e
+                ))
+            })?;
+        }
+        std::fs::rename(&skill_dir, &target).map_err(|e| {
+            Error::Config(format!(
+                "Failed to archive skill '{}' -> '{}': {}",
+                skill_dir.display(),
+                target.display(),
+                e
+            ))
+        })?;
+        self.skills.remove(name);
+        Ok(true)
     }
 
     /// Delete a skill by removing its directory.

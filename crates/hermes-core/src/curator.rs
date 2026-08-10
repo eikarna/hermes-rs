@@ -1,0 +1,491 @@
+//! Skill & memory lifecycle curation.
+//!
+//! The curator is a periodic background pass that keeps long-term state
+//! healthy without user intervention:
+//!
+//! - **Memory decay**: importance of unattended memories decays over time;
+//!   memories that fall below a floor are removed.
+//! - **Deduplication**: near-duplicate memories (high word-overlap) are merged,
+//!   keeping the most important instance.
+//! - **Session archiving**: sessions idle longer than a threshold are archived.
+//! - **Skill auto-archiving**: skills untouched for a threshold are moved to
+//!   `<skills>/_archive/` so they stop loading.
+//! - **Skill distillation**: clusters of distilled facts sharing a tag are
+//!   promoted into draft skills under the skills root.
+//!
+//! Everything is incremental and idempotent; a pass is cheap enough to run on
+//! every agent startup plus on the autonomous tick.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
+use crate::memory::{MemoryBlock, MemoryManager};
+use crate::skills::{SkillManager, ARCHIVE_DIR_NAME};
+
+/// Tunables for a curator pass. All thresholds are opt-out: setting
+/// `*_days` to `0` disables that particular rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CurationPolicy {
+    /// Days without access before memory importance decays one step. `0` disables.
+    pub memory_decay_days: u32,
+    /// Importance floor; memories at or below this after decay are removed.
+    pub memory_min_importance: u8,
+    /// Days idle before a session is archived. `0` disables.
+    pub session_archive_days: u32,
+    /// Days since a skill's SKILL.md was modified before it is archived.
+    /// `0` disables.
+    pub skill_stale_days: u32,
+    /// Jaccard word-overlap threshold (0..=100) above which two memories are
+    /// considered near-duplicates.
+    pub dedup_threshold_pct: u8,
+    /// Minimum distilled facts sharing a tag before a draft skill is created.
+    pub skill_distill_min_facts: usize,
+}
+
+impl Default for CurationPolicy {
+    fn default() -> Self {
+        Self {
+            memory_decay_days: 14,
+            memory_min_importance: 10,
+            session_archive_days: 30,
+            skill_stale_days: 90,
+            dedup_threshold_pct: 80,
+            skill_distill_min_facts: 3,
+        }
+    }
+}
+
+/// What a single curation pass changed. Counts are per-pass deltas.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CurationReport {
+    pub memories_decayed: usize,
+    pub memories_pruned: usize,
+    pub memories_deduped: usize,
+    pub sessions_archived: usize,
+    pub skills_archived: Vec<String>,
+    pub skills_distilled: Vec<String>,
+}
+
+impl CurationReport {
+    /// True when the pass changed nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// One full curation pass over memory, sessions, and skills.
+pub async fn curate(
+    memory: &MemoryManager,
+    skills_dir: &Path,
+    policy: &CurationPolicy,
+) -> Result<CurationReport> {
+    let now = unix_now();
+    let mut report = CurationReport::default();
+
+    curate_memories(memory, policy, now, &mut report).await;
+    curate_sessions(memory, policy, now, &mut report).await;
+    archive_stale_skills(skills_dir, policy, now, &mut report)?;
+    distill_skills_from_memory(memory, skills_dir, policy, &mut report).await?;
+
+    memory
+        .save_to_disk()
+        .await
+        .map_err(|e| Error::Agent(format!("Failed to persist curated memory: {}", e)))?;
+    Ok(report)
+}
+
+/// Decay unattended memories, prune below the floor, merge near-duplicates.
+async fn curate_memories(
+    memory: &MemoryManager,
+    policy: &CurationPolicy,
+    now: i64,
+    report: &mut CurationReport,
+) {
+    const DECAY_STEP: u8 = 5;
+    let mut blocks = memory.all().await;
+    if blocks.is_empty() {
+        return;
+    }
+
+    // Decay pass; track which blocks actually changed.
+    let mut decayed_ids = std::collections::HashSet::new();
+    if policy.memory_decay_days > 0 {
+        let decay_after = i64::from(policy.memory_decay_days) * 86_400;
+        for block in &mut blocks {
+            let idle = now.saturating_sub(block.last_accessed);
+            if idle > decay_after {
+                let steps = (idle / decay_after) as u8;
+                let drop = steps.saturating_mul(DECAY_STEP);
+                if drop > 0 {
+                    block.importance = block.importance.saturating_sub(drop);
+                    decayed_ids.insert(block.id.clone());
+                }
+            }
+        }
+        report.memories_decayed = decayed_ids.len();
+    }
+
+    // Dedup pass: sort by importance desc so the strongest representative wins.
+    blocks.sort_by_key(|b| std::cmp::Reverse(b.importance));
+    let mut kept: Vec<&MemoryBlock> = Vec::new();
+    let mut drop_ids: Vec<String> = Vec::new();
+    let threshold = policy.dedup_threshold_pct.min(100);
+    if threshold < 100 {
+        for block in &blocks {
+            let dup = kept
+                .iter()
+                .any(|k| jaccard_pct(&k.content, &block.content) >= threshold);
+            if dup {
+                drop_ids.push(block.id.clone());
+            } else {
+                kept.push(block);
+            }
+        }
+    }
+
+    // Apply: prune below floor, drop duplicates, persist the rest.
+    for block in &blocks {
+        if drop_ids.contains(&block.id) {
+            memory.remove(&block.id).await;
+            report.memories_deduped += 1;
+        } else if block.importance <= policy.memory_min_importance {
+            memory.remove(&block.id).await;
+            report.memories_pruned += 1;
+        } else if decayed_ids.contains(&block.id) {
+            memory.update(block.clone()).await;
+        }
+    }
+}
+
+/// Archive sessions idle beyond the policy threshold.
+async fn curate_sessions(
+    memory: &MemoryManager,
+    policy: &CurationPolicy,
+    now: i64,
+    report: &mut CurationReport,
+) {
+    if policy.session_archive_days == 0 {
+        return;
+    }
+    let idle_limit = i64::from(policy.session_archive_days) * 86_400;
+    for session in memory.list_sessions().await {
+        if now.saturating_sub(session.last_activity) > idle_limit {
+            memory.archive_session(&session.id).await;
+            report.sessions_archived += 1;
+        }
+    }
+}
+
+/// Move skills whose SKILL.md is older than `skill_stale_days` into `_archive/`.
+fn archive_stale_skills(
+    skills_dir: &Path,
+    policy: &CurationPolicy,
+    now: i64,
+    report: &mut CurationReport,
+) -> Result<()> {
+    if policy.skill_stale_days == 0 || !skills_dir.is_dir() {
+        return Ok(());
+    }
+    let stale_after = u64::from(policy.skill_stale_days) * 86_400;
+    let mut manager = SkillManager::new(skills_dir.to_path_buf());
+    if manager.load_all().is_err() {
+        return Ok(()); // unreadable root: nothing to curate
+    }
+
+    let entries = std::fs::read_dir(skills_dir)
+        .map_err(|e| Error::Config(format!("Failed to scan skills dir: {}", e)))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || entry.file_name() == ARCHIVE_DIR_NAME {
+            continue;
+        }
+        let skill_md = path.join("SKILL.md");
+        let modified = std::fs::metadata(&skill_md)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        let Some(modified) = modified else { continue };
+        if now.saturating_sub(modified) as u64 > stale_after {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if manager.archive(&name)? {
+                report.skills_archived.push(name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Promote clusters of same-tag distilled facts into draft skills.
+///
+/// Distilled facts (tagged `distilled`, importance ≥ 70) are grouped by their
+/// remaining tags. Once a tag groups at least `skill_distill_min_facts`
+/// facts, a draft skill named `distilled-<tag>` is created containing the
+/// facts as its body. Existing skills are never overwritten.
+async fn distill_skills_from_memory(
+    memory: &MemoryManager,
+    skills_dir: &Path,
+    policy: &CurationPolicy,
+    report: &mut CurationReport,
+) -> Result<()> {
+    if policy.skill_distill_min_facts == 0 {
+        return Ok(());
+    }
+    let facts: Vec<MemoryBlock> = memory
+        .get_by_type("fact")
+        .await
+        .into_iter()
+        .filter(|b| b.importance >= 70 && b.tags.iter().any(|t| t == "distilled"))
+        .collect();
+    if facts.len() < policy.skill_distill_min_facts {
+        return Ok(());
+    }
+
+    // Group by first non-reserved tag.
+    const RESERVED: [&str; 2] = ["distilled", "long_term"];
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for fact in &facts {
+        if let Some(tag) = fact
+            .tags
+            .iter()
+            .find(|t| !RESERVED.contains(&t.as_str()) && is_valid_skill_name(t))
+        {
+            groups
+                .entry(tag.clone())
+                .or_default()
+                .push(fact.content.clone());
+        }
+    }
+
+    let mut manager = SkillManager::new(skills_dir.to_path_buf());
+    let _ = manager.load_all(); // tolerate missing dir; create() makes dirs
+
+    for (tag, contents) in groups {
+        if contents.len() < policy.skill_distill_min_facts {
+            continue;
+        }
+        let skill_name = format!("distilled-{}", tag);
+        if skills_dir.join(&skill_name).exists() {
+            continue;
+        }
+        let body = contents
+            .iter()
+            .map(|c| format!("- {}", c))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let skill_md = format!(
+            "---\nname: {}\ndescription: Distilled from {} long-term memories\nversion: 0.1.0\n---\n# {}\n\n{}\n",
+            skill_name,
+            contents.len(),
+            skill_name,
+            body
+        );
+        manager.create(&skill_name, &skill_md)?;
+        report.skills_distilled.push(skill_name);
+    }
+    Ok(())
+}
+
+/// Jaccard word-overlap between two texts, 0..=100.
+fn jaccard_pct(a: &str, b: &str) -> u8 {
+    use std::collections::HashSet;
+    let words = |s: &str| -> HashSet<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2)
+            .map(|w| w.to_lowercase())
+            .collect()
+    };
+    let (a, b) = (words(a), words(b));
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let intersection = a.intersection(&b).count();
+    let union = a.union(&b).count();
+    ((intersection * 100) / union.max(1)) as u8
+}
+
+fn is_valid_skill_name(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 40
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryBlock;
+    use std::path::PathBuf;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hermes_curator_{}_{}_{}",
+            name,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn aged_block(id: &str, content: &str, importance: u8, idle_days: i64) -> MemoryBlock {
+        let mut block = MemoryBlock::new(id, "fact", content).importance(importance);
+        block.last_accessed = unix_now() - idle_days * 86_400;
+        block
+    }
+
+    #[test]
+    fn jaccard_recognizes_overlap() {
+        assert_eq!(
+            jaccard_pct("the quick brown fox", "the quick brown fox"),
+            100
+        );
+        assert!(jaccard_pct("the quick brown fox", "completely different words") < 30);
+    }
+
+    #[tokio::test]
+    async fn decays_and_prunes_stale_memories() {
+        let dir = test_dir("decay");
+        let memory = MemoryManager::with_storage_dir(dir.clone());
+        memory
+            .store(aged_block("fresh", "recent fact stays", 90, 1))
+            .await;
+        memory
+            .store(aged_block("stale", "old fact decays hard", 12, 60))
+            .await;
+
+        // Fresh block clawing back to importance 50 default minus decay steps.
+        memory
+            .update(aged_block("mid", "halfway decays but survives", 55, 30))
+            .await;
+
+        let policy = CurationPolicy {
+            memory_decay_days: 14,
+            memory_min_importance: 10,
+            ..CurationPolicy::default()
+        };
+        let skills = test_dir("decay_skills");
+        let report = curate(&memory, &skills, &policy).await.unwrap();
+
+        assert!(report.memories_decayed >= 2);
+        assert!(report.memories_pruned >= 1); // stale decays to 0ish
+        assert!(memory.get("fresh").await.is_some());
+        assert!(memory.get("stale").await.is_none());
+        assert!(memory.get("mid").await.is_some());
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(skills);
+    }
+
+    #[tokio::test]
+    async fn dedups_near_identical_memories() {
+        let dir = test_dir("dedup");
+        let memory = MemoryManager::with_storage_dir(dir.clone());
+        memory
+            .store(MemoryBlock::new("a", "fact", "User prefers concise answers").importance(90))
+            .await;
+        memory
+            .store(
+                MemoryBlock::new("b", "fact", "User prefers concise answers always").importance(50),
+            )
+            .await;
+        memory
+            .store(
+                MemoryBlock::new("c", "fact", "Entirely unrelated fact goes here").importance(60),
+            )
+            .await;
+
+        let policy = CurationPolicy {
+            memory_decay_days: 0,
+            dedup_threshold_pct: 70,
+            ..CurationPolicy::default()
+        };
+        let skills = test_dir("dedup_skills");
+        let report = curate(&memory, &skills, &policy).await.unwrap();
+
+        assert_eq!(report.memories_deduped, 1);
+        // The higher-importance representative survives.
+        assert!(memory.get("a").await.is_some());
+        assert!(memory.get("b").await.is_none());
+        assert!(memory.get("c").await.is_some());
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(skills);
+    }
+
+    #[tokio::test]
+    async fn distills_tagged_facts_into_skill() {
+        let dir = test_dir("distill_mem");
+        let skills = test_dir("distill_skills");
+        let memory = MemoryManager::with_storage_dir(dir.clone());
+        for (i, fact) in [
+            "Always run cargo fmt before committing",
+            "Every rust change must pass clippy",
+            "Never hand-edit Cargo.lock content",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let block = MemoryBlock::new(format!("f{}", i), "fact", *fact)
+                .importance(80)
+                .tags(vec![
+                    "distilled".to_string(),
+                    "long_term".to_string(),
+                    "rust".to_string(),
+                ]);
+            memory.store(block).await;
+        }
+
+        let policy = CurationPolicy {
+            memory_decay_days: 0,
+            skill_distill_min_facts: 3,
+            ..CurationPolicy::default()
+        };
+        let report = curate(&memory, &skills, &policy).await.unwrap();
+
+        assert_eq!(report.skills_distilled, vec!["distilled-rust".to_string()]);
+        let skill_path = skills.join("distilled-rust").join("SKILL.md");
+        let content = std::fs::read_to_string(skill_path).unwrap();
+        assert!(content.contains("cargo fmt"));
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(skills);
+    }
+
+    #[tokio::test]
+    async fn archives_skills_into_archive_dir_and_skips_it() {
+        let skills = test_dir("archive_skills");
+        let fresh = skills.join("fresh-skill");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join("SKILL.md"), "# fresh\n").unwrap();
+
+        let mut manager = SkillManager::new(skills.clone());
+        manager.load_all().unwrap();
+        assert!(manager.archive("fresh-skill").unwrap());
+        assert!(skills.join("_archive").join("fresh-skill").exists());
+
+        // Reload skips archived dirs.
+        let mut manager = SkillManager::new(skills.clone());
+        let loaded = manager.load_all().unwrap();
+        assert_eq!(loaded.len(), 0);
+
+        let _ = std::fs::remove_dir_all(skills);
+    }
+}
