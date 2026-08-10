@@ -174,6 +174,9 @@ pub struct BehaviorSettings {
     /// Token budget for the `<repo_map>` context block. `0` disables
     /// repository mapping entirely.
     pub repo_map_tokens: usize,
+    /// Maximum files discovered for repo map scoring (cap huge repos).
+    /// Defaults to 500; increase only if needed for very small repos.
+    pub repo_map_max_files: usize,
 }
 
 impl Default for BehaviorSettings {
@@ -189,6 +192,7 @@ impl Default for BehaviorSettings {
             max_healing_attempts: 3,
             show_reasoning: true,
             repo_map_tokens: 0,
+            repo_map_max_files: 500,
         }
     }
 }

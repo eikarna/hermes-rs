@@ -12,4 +12,4 @@ pub mod scorer;
 
 pub use budgeter::RepoMapRenderer;
 pub use extractor::{discover_source_files, extract_file_tags, Language, RepoTag, TagKind};
-pub use scorer::{rank_and_render, MinimalRepoMap};
+pub use scorer::{rank_and_render, rank_and_render_with_limit, MinimalRepoMap};

@@ -45,6 +45,8 @@ pub struct AgentConfig {
     pub max_healing_attempts: usize,
     /// Token budget for `<repo_map>` injection; `0` disables it.
     pub repo_map_tokens: usize,
+    /// Maximum files discovered for repo map scoring (cap huge repos).
+    pub repo_map_max_files: usize,
 }
 
 impl Default for AgentConfig {
@@ -65,6 +67,7 @@ impl From<&BehaviorSettings> for AgentConfig {
             context_window: settings.context_window,
             max_healing_attempts: settings.max_healing_attempts,
             repo_map_tokens: settings.repo_map_tokens,
+            repo_map_max_files: settings.repo_map_max_files,
         }
     }
 }
@@ -374,6 +377,7 @@ impl HermesAgent {
 
         if self.config.repo_map_tokens > 0 {
             let budget = self.config.repo_map_tokens;
+            let max_files = self.config.repo_map_max_files;
             let rendered = self
                 .repo_map_cache
                 .get_or_init(|| async {
@@ -381,7 +385,7 @@ impl HermesAgent {
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                     // Tree-sitter parsing is blocking; move it off the async worker.
                     tokio::task::spawn_blocking(move || {
-                        let map = crate::repomap::rank_and_render(&root, &[]);
+                        let map = crate::repomap::rank_and_render_with_limit(&root, &[], max_files);
                         crate::repomap::RepoMapRenderer::new(budget).render(&map)
                     })
                     .await

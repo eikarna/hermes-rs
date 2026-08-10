@@ -26,6 +26,8 @@ context_window = 128000
 max_healing_attempts = 3
 show_reasoning = true
 # repo_map_tokens = 1024 # token budget for <repo_map> context; 0 disables it
+
+repo_map_max_files = 500    # max files discovered for repo map scoring; cap huge repos
 # system_prompt = "You are Hermes."
 
 [autonomous]

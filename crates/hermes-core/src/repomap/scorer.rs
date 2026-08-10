@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::extractor::{discover_source_files, extract_file_tags, RepoTag, TagKind};
+use super::extractor::{discover_source_files_with_limit, extract_file_tags, RepoTag, TagKind};
 
 const DAMPING: f32 = 0.85;
 const ITERATIONS: usize = 20;
@@ -42,18 +42,22 @@ impl MinimalRepoMap {
     }
 }
 
-/// Build a repo map for `root`.
-///
-/// `chat_files` (relative paths) seed personalization — files the user is
-/// actively editing receive higher rank so their neighbors promote.
-/// Tolerant: unreadable or unparseable files are skipped.
+/// Build a repo map for `root`. Uses default 500-file limit.
 pub fn rank_and_render(root: &Path, chat_files: &[PathBuf]) -> MinimalRepoMap {
-    let files = discover_source_files(root);
+    rank_and_render_with_limit(root, chat_files, 500)
+}
+
+/// Variant with explicit file limit (useful for tuning huge repos).
+pub fn rank_and_render_with_limit(
+    root: &Path,
+    chat_files: &[PathBuf],
+    max_files: usize,
+) -> MinimalRepoMap {
+    let files = discover_source_files_with_limit(root, max_files);
     build_map(root, &files, chat_files)
 }
 
-/// Build a repo map from an explicit file list (useful in tests and for
-/// incremental updates).
+/// Build a repo map from an explicit file list (useful in tests and for incremental updates).
 pub fn build_map(root: &Path, files: &[PathBuf], chat_files: &[PathBuf]) -> MinimalRepoMap {
     let mut tags = Vec::new();
     for f in files {

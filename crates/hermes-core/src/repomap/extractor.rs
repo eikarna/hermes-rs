@@ -73,7 +73,7 @@ pub struct RepoTag {
 
 /// Recursively collect source files under `root`, skipping build/dependency directories.
 pub fn discover_source_files(root: &Path) -> Vec<PathBuf> {
-    discover_source_files_with_limit(root, 10_000)
+    discover_source_files_with_limit(root, 500)
 }
 
 /// Bounded variant of [`discover_source_files`]; stops after `max_files` to keep

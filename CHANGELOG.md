@@ -20,6 +20,8 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 - Workspace context-file auto-loading `AGENTS.md`, `CLAUDE.md`, `.hermes.md`, `HERMES.md`, prompt-injection scanning child-agent ReAct Hermes-supported provider-specific TUI context-token auto-compaction Prompt-prefixed TUI Claude/Anthropic-style SSE tool-use OpenAI-compatible streaming chunks
 - Tree-sitter repo map AST-based file ranking personalized PageRank token-efficient codebase context (`[agent].repo_map_tokens`)
 - Aider-style SEARCH/REPLACE blocks lean code generation (vs. full-file rewrites) via `edit_block` tool; model routing hints `EditFormat::SearchReplace/Patch` from capabilities table
+- Repo-map file capping via `[agent].repo_map_max_files` (defaults to 500 files) prevents ranking stalls on very large repositories
+
 - Git harness pre-run snapshots dirty-tree protection Conventional Commit derivation from staged diffs `commit_transaction`, `/undo` rollback command
 - Lifecycle curator `hermes_core::curator` background pass memory importance decay near-duplicate pruning session auto-archiving stale skill archiving into `_archive/` tag-clustered distillation long-term facts draft skills; runs non-blockingly every agent startup and autonomous tick
 - Memory pinning `pinned: true` flag `MemoryManager::set_pinned` MEMORY.md roundtrip curator exemption from decay/prune/dedup; pinned skills exempt archival
