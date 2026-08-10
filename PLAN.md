@@ -1,8 +1,24 @@
 # Integration Plan: Aider + Hermes-RS
 
-**Status:** PLANNING PHASE (READ-ONLY REFERENCE)
+**Status:** SHIPPED (Phases 1-5 complete as of 0.1.3 main; deltas vs. spec below)
 
 **Created:** 2026-08-07
+
+---
+
+## Shipped Deltas vs. Plan
+
+Phase-by-phase reality check against the original scope:
+
+- **Phase 1 (provider routing):** shipped, plus per-model capability tables with longest-prefix matching (`lookup_capabilities`), `supports_vision` / `supports_tool_calls` fields, and `<edit_format>` prompt hints routed from advertised capabilities.
+- **Phase 2 (repo map):** shipped (tree-sitter C/Python/Rust/TypeScript, personalized PageRank, token-budgeted renderer). Format follows Aider's outline style; incremental file-watcher ranking not ported. Follow-up: bound discovery on huge trees (see TODO).
+- **Phase 3 (edit blocks):** shipped (`edit_block` tool, atomic multi-edit, exact+fuzzy sharing `patch` matching, parsed via `parse_edit_blocks`; model-level routing via `EditFormat::SearchReplace`/`Patch`).
+- **Phase 4 (git harness):** shipped (`hermes_core::githarness` with snapshot/guard/commit/undo; TUI `/undo`). `commit_transaction` is not yet invoked by edit tools automatically (TODO).
+- **Phase 5 (skill & memory lifecycle):** shipped as `[curator]` policy + non-blocking pass on startup/tick; option `[curator].interval_secs` enables periodic mid-session passes. Memory pinning (`pinned: true`) exempts from decay/prune/dedup and is a serialized MEMORY.md header field. Skill staleness keyed off SKILL.md mtime, not usage telemetry. Skill distillation creates tag-clustered `distilled-<tag>` drafts; `[curator].skill_distill_llm_summary = true` rewrites the body via the active LLM (falls back to bullet list on error). Session archiving is idle-time-only.
+
+**Not shipped:** skill metadata (`created_by`, `pinned`) beyond SKILL.md front-matter name/description — auto-archived skills are simply moved under `_archive/`, and all skills count equally for review; provenance-based curator rules from the original spec are therefore rests.
+
+---
 
 ---
 

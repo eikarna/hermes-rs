@@ -34,7 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transactional git harness (`hermes_core::githarness`) with pre-run snapshots, dirty-tree protection, Conventional Commit message derivation, `commit_transaction`, and `undo`
 - TUI `/undo` command restoring the workspace to the snapshot taken before the last agent run
 - Lifecycle curator (`hermes_core::curator`) running non-blockingly at agent startup and on every autonomous tick: memory importance decay with near-duplicate pruning, session auto-archiving, stale skill archiving into `<skills>/_archive/`, and tag-clustered distillation of distilled facts into draft `distilled-<tag>` skills
-- `[curator]` runtime config (`memory_decay_days`, `memory_min_importance`, `session_archive_days`, `skill_stale_days`, `dedup_threshold_pct`, `skill_distill_min_facts`)
+- `[curator]` runtime config (`memory_decay_days`, `memory_min_importance`, `session_archive_days`, `skill_stale_days`, `dedup_threshold_pct`, `skill_distill_min_facts`, `skill_distill_llm_summary`, `interval_secs`)
+- Memory pinning: `pinned: true` flag on `MemoryBlock`, `MemoryManager::set_pinned`, MEMORY.md roundtrip, and curator exemption from decay/prune/dedup
+- Optional LLM-assisted skill summarization: `curate_with_llm` rewrites distilled draft skill bodies as prose when `skill_distill_llm_summary` is enabled, falling back to bullet lists on error
+- Periodic mid-session curator passes via `interval_secs` in long-lived runtimes (spawned once per process; first tick delayed so startup/tick passes don't double up)
 
 ### Changed
 

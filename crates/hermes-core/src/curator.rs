@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -45,7 +46,18 @@ pub struct CurationPolicy {
     pub dedup_threshold_pct: u8,
     /// Minimum distilled facts sharing a tag before a draft skill is created.
     pub skill_distill_min_facts: usize,
+    /// Rewrite distilled draft skill bodies through the LLM so they read as
+    /// prose ("how to work in this repo") rather than a facts bullet list.
+    /// Requires a configured provider; otherwise falls back to bullet lists.
+    pub skill_distill_llm_summary: bool,
+    /// Seconds between periodic curator passes in long-lived runtimes.
+    /// `0` disables periodic runs (passes still happen at startup/tick).
+    pub interval_secs: u64,
 }
+
+// ponytail: skill-level pinning (front-matter `pinned: true`) — currently
+// only MemoryBlock carries the flag; a skill-level exemption from
+// auto-archiving is the natural upgrade when skill metadata expands.
 
 impl Default for CurationPolicy {
     fn default() -> Self {
@@ -56,6 +68,8 @@ impl Default for CurationPolicy {
             skill_stale_days: 90,
             dedup_threshold_pct: 80,
             skill_distill_min_facts: 3,
+            skill_distill_llm_summary: false,
+            interval_secs: 0,
         }
     }
 }
@@ -84,13 +98,27 @@ pub async fn curate(
     skills_dir: &Path,
     policy: &CurationPolicy,
 ) -> Result<CurationReport> {
+    curate_with_llm(memory, skills_dir, policy, None, None).await
+}
+
+/// Full pass with an optional LLM tap. When `client` and `model` are given
+/// and `policy.skill_distill_llm_summary` is on, distilled draft skills are
+/// written as prose generated from their fact cluster; failures fall back to
+/// the bullet-list body.
+pub async fn curate_with_llm(
+    memory: &MemoryManager,
+    skills_dir: &Path,
+    policy: &CurationPolicy,
+    client: Option<Arc<dyn crate::client::LLMProvider>>,
+    model: Option<String>,
+) -> Result<CurationReport> {
     let now = unix_now();
     let mut report = CurationReport::default();
 
     curate_memories(memory, policy, now, &mut report).await;
     curate_sessions(memory, policy, now, &mut report).await;
     archive_stale_skills(skills_dir, policy, now, &mut report)?;
-    distill_skills_from_memory(memory, skills_dir, policy, &mut report).await?;
+    distill_skills_from_memory(memory, skills_dir, policy, client, model, &mut report).await?;
 
     memory
         .save_to_disk()
@@ -112,11 +140,14 @@ async fn curate_memories(
         return;
     }
 
-    // Decay pass; track which blocks actually changed.
+    // Decay pass; pinned memories never decay. Track which blocks changed.
     let mut decayed_ids = std::collections::HashSet::new();
     if policy.memory_decay_days > 0 {
         let decay_after = i64::from(policy.memory_decay_days) * 86_400;
         for block in &mut blocks {
+            if block.pinned {
+                continue;
+            }
             let idle = now.saturating_sub(block.last_accessed);
             if idle > decay_after {
                 let steps = (idle / decay_after) as u8;
@@ -130,13 +161,15 @@ async fn curate_memories(
         report.memories_decayed = decayed_ids.len();
     }
 
-    // Dedup pass: sort by importance desc so the strongest representative wins.
+    // Dedup pass: pinned blocks never get dropped and are seeded as kept so
+    // unpinned duplicates fold into them.
     blocks.sort_by_key(|b| std::cmp::Reverse(b.importance));
     let mut kept: Vec<&MemoryBlock> = Vec::new();
     let mut drop_ids: Vec<String> = Vec::new();
     let threshold = policy.dedup_threshold_pct.min(100);
     if threshold < 100 {
-        for block in &blocks {
+        kept.extend(blocks.iter().filter(|b| b.pinned));
+        for block in blocks.iter().filter(|b| !b.pinned) {
             let dup = kept
                 .iter()
                 .any(|k| jaccard_pct(&k.content, &block.content) >= threshold);
@@ -148,12 +181,12 @@ async fn curate_memories(
         }
     }
 
-    // Apply: prune below floor, drop duplicates, persist the rest.
+    // Apply: pinned blocks immune to dedup-drop and floor-prune.
     for block in &blocks {
-        if drop_ids.contains(&block.id) {
+        if !block.pinned && drop_ids.contains(&block.id) {
             memory.remove(&block.id).await;
             report.memories_deduped += 1;
-        } else if block.importance <= policy.memory_min_importance {
+        } else if !block.pinned && block.importance <= policy.memory_min_importance {
             memory.remove(&block.id).await;
             report.memories_pruned += 1;
         } else if decayed_ids.contains(&block.id) {
@@ -231,6 +264,8 @@ async fn distill_skills_from_memory(
     memory: &MemoryManager,
     skills_dir: &Path,
     policy: &CurationPolicy,
+    client: Option<Arc<dyn crate::client::LLMProvider>>,
+    model: Option<String>,
     report: &mut CurationReport,
 ) -> Result<()> {
     if policy.skill_distill_min_facts == 0 {
@@ -273,11 +308,18 @@ async fn distill_skills_from_memory(
         if skills_dir.join(&skill_name).exists() {
             continue;
         }
-        let body = contents
-            .iter()
-            .map(|c| format!("- {}", c))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let body = match (&client, &model, policy.skill_distill_llm_summary) {
+            (Some(client), Some(model), true) => {
+                match summarize_facts_with_llm(client, model, &skill_name, &contents).await {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        tracing::warn!(%error, "LLM skill summary failed; using bullet list");
+                        bullet_body(&contents)
+                    }
+                }
+            }
+            _ => bullet_body(&contents),
+        };
         let skill_md = format!(
             "---\nname: {}\ndescription: Distilled from {} long-term memories\nversion: 0.1.0\n---\n# {}\n\n{}\n",
             skill_name,
@@ -289,6 +331,49 @@ async fn distill_skills_from_memory(
         report.skills_distilled.push(skill_name);
     }
     Ok(())
+}
+
+fn bullet_body(contents: &[String]) -> String {
+    contents
+        .iter()
+        .map(|c| format!("- {}", c))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const SKILL_SUMMARY_DIRECTIVE: &str = "You are writing a reusable skill document. Summarize the provided facts into short actionable prose for an AI coding agent: start with one-sentence intent, then concise imperative guidance. Output ONLY the prose body, no headings, no bullet points if a paragraph works.";
+
+async fn summarize_facts_with_llm(
+    client: &Arc<dyn crate::client::LLMProvider>,
+    model: &str,
+    skill_name: &str,
+    facts: &[String],
+) -> Result<String> {
+    let prompt = format!(
+        "Skill: {}\nFacts:\n{}",
+        skill_name,
+        facts
+            .iter()
+            .map(|f| format!("- {}", f))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let messages = vec![
+        crate::client::Message::system(SKILL_SUMMARY_DIRECTIVE),
+        crate::client::Message::user(prompt),
+    ];
+    let response = client.chat(model, &messages, None).await?;
+    let body = response
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message.content)
+        .ok_or_else(|| Error::ParseResponse("Skill summary response had no content".into()))?;
+    let body = body.trim().to_string();
+    if body.is_empty() {
+        return Err(Error::ParseResponse("Skill summary was empty".into()));
+    }
+    Ok(body)
 }
 
 /// Jaccard word-overlap between two texts, 0..=100.
@@ -315,6 +400,36 @@ fn is_valid_skill_name(tag: &str) -> bool {
         && tag
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Spawn a periodic curator loop for long-lived runtimes (TUI, autonomous
+/// daemon). First tick fires after one full interval, so startup and tick
+/// passes (each of which still runs once eagerly) don't double up.
+/// Returns `None` without spawning when `policy.interval_secs == 0`.
+pub fn spawn_periodic_curator(
+    memory: MemoryManager,
+    skills_dir: impl AsRef<Path>,
+    policy: CurationPolicy,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if policy.interval_secs == 0 {
+        return None;
+    }
+    let skills_dir = skills_dir.as_ref().to_path_buf();
+    Some(tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(policy.interval_secs));
+        ticker.tick().await; // skip the immediate first tick
+        loop {
+            ticker.tick().await;
+            match curate(&memory, &skills_dir, &policy).await {
+                Ok(report) if !report.is_empty() => {
+                    tracing::info!(?report, "Periodic curator pass complete");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "Periodic curator pass failed"),
+            }
+        }
+    }))
 }
 
 fn unix_now() -> i64 {
@@ -464,6 +579,145 @@ mod tests {
         let skill_path = skills.join("distilled-rust").join("SKILL.md");
         let content = std::fs::read_to_string(skill_path).unwrap();
         assert!(content.contains("cargo fmt"));
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(skills);
+    }
+
+    #[tokio::test]
+    async fn pinned_memories_survive_decay_prune_dedup() {
+        let dir = test_dir("pinned");
+        let memory = MemoryManager::with_storage_dir(dir.clone());
+
+        // Old + low importance — would be pruned if not pinned.
+        let mut pin = aged_block("pinned-low", "Pinned but idle", 5, 90);
+        pin.pinned = true;
+        memory.store(pin).await;
+
+        // Duplicate of pinned survives as the pinned stronger instance;
+        // the UNPINNED near-duplicate gets deduped into it.
+        let mut pinned_a =
+            MemoryBlock::new("pinned-dup", "fact", "Keep this exact wording").importance(40);
+        pinned_a.pinned = true;
+        memory.store(pinned_a).await;
+        memory
+            .store(
+                MemoryBlock::new("dupe", "fact", "Keep this exact wording plus tail")
+                    .importance(90),
+            )
+            .await;
+
+        let policy = CurationPolicy {
+            memory_decay_days: 7,
+            memory_min_importance: 20,
+            dedup_threshold_pct: 60,
+            skill_distill_min_facts: 0,
+            ..CurationPolicy::default()
+        };
+        let skills = test_dir("pinned_skills");
+        let report = curate(&memory, &skills, &policy).await.unwrap();
+
+        let pinned_low = memory.get("pinned-low").await.unwrap();
+        assert_eq!(pinned_low.importance, 5, "pinned memory must not decay");
+        assert!(memory.get("pinned-dup").await.is_some());
+        assert!(report.memories_deduped >= 1 || memory.get("dupe").await.is_some());
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(skills);
+    }
+
+    /// Local provider double returning a fixed skill summary.
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl crate::client::LLMProvider for StubProvider {
+        async fn chat(
+            &self,
+            _model: &str,
+            _messages: &[crate::client::Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> crate::error::Result<crate::client::ChatResponse> {
+            Ok(crate::client::ChatResponse {
+                id: "stub".into(),
+                object: "chat.completion".into(),
+                created: 0,
+                model: "stub".into(),
+                choices: vec![crate::client::Choice {
+                    index: 0,
+                    message: crate::client::MessageDelta {
+                        role: Some(crate::client::Role::Assistant),
+                        content: Some(
+                            "Always keep the workspace green: format, then clippy.".to_string(),
+                        ),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: crate::client::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+            })
+        }
+
+        async fn chat_streaming(
+            &self,
+            _model: &str,
+            _messages: &[crate::client::Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> crate::error::Result<crate::client::ChatStreamResponse> {
+            unimplemented!()
+        }
+
+        fn capabilities(&self, _model: &str) -> crate::client::ProviderCapabilities {
+            crate::client::ProviderCapabilities::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_summary_rewrites_distilled_skill_body() {
+        let dir = test_dir("llm_mem");
+        let skills = test_dir("llm_skills");
+        let memory = MemoryManager::with_storage_dir(dir.clone());
+        for (i, fact) in [
+            "Always run cargo fmt before committing",
+            "Every rust change must pass clippy",
+            "Never hand-edit Cargo.lock content",
+        ]
+        .iter()
+        .enumerate()
+        {
+            memory
+                .store(
+                    MemoryBlock::new(format!("f{}", i), "fact", *fact)
+                        .importance(80)
+                        .tags(vec!["distilled".into(), "long_term".into(), "rust".into()]),
+                )
+                .await;
+        }
+
+        let policy = CurationPolicy {
+            memory_decay_days: 0,
+            skill_distill_min_facts: 3,
+            skill_distill_llm_summary: true,
+            ..CurationPolicy::default()
+        };
+        let report = curate_with_llm(
+            &memory,
+            &skills,
+            &policy,
+            Some(Arc::new(StubProvider)),
+            Some("stub".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.skills_distilled.len(), 1);
+        let body = std::fs::read_to_string(skills.join("distilled-rust").join("SKILL.md")).unwrap();
+        assert!(body.contains("workspace green"), "got: {}", body);
+        assert!(!body.contains("- Always run cargo fmt"));
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(skills);

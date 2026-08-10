@@ -27,7 +27,11 @@ pub struct MemoryBlock {
     /// When this memory was last accessed
     pub last_accessed: i64,
     /// Tags for categorization
+    #[serde(default)]
     pub tags: Vec<String>,
+    /// Pinned memories never decay and are exempt from pruning/dedup.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl MemoryBlock {
@@ -50,6 +54,7 @@ impl MemoryBlock {
             created_at: now,
             last_accessed: now,
             tags: Vec::new(),
+            pinned: false,
         }
     }
 
@@ -62,6 +67,12 @@ impl MemoryBlock {
     /// Add tags
     pub fn tags(mut self, tags: Vec<String>) -> Self {
         self.tags = tags;
+        self
+    }
+
+    /// Mark this memory pinned (immune to curator decay/prune/dedup)
+    pub fn pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
         self
     }
 
@@ -197,6 +208,9 @@ impl MemoryStore {
             if !block.tags.is_empty() {
                 out.push_str(&format!(", tags: {}", block.tags.join(",")));
             }
+            if block.pinned {
+                out.push_str(", pinned: true");
+            }
             out.push_str(&format!(
                 ", created_at: {}, last_accessed: {}]\n",
                 block.created_at, block.last_accessed
@@ -237,6 +251,7 @@ impl MemoryStore {
             let mut tags: Vec<String> = Vec::new();
             let mut created_at: i64 = 0;
             let mut last_accessed: i64 = 0;
+            let mut pinned = false;
 
             // Split by ", " (comma-space) to separate fields.
             // Tag values use "," without space, so they stay intact.
@@ -258,6 +273,7 @@ impl MemoryStore {
                         }
                         "created_at" => created_at = value.parse().unwrap_or(0),
                         "last_accessed" => last_accessed = value.parse().unwrap_or(0),
+                        "pinned" => pinned = value == "true" || value == "1",
                         _ => {}
                     }
                 }
@@ -275,6 +291,7 @@ impl MemoryStore {
                 created_at,
                 last_accessed,
                 tags,
+                pinned,
             };
             memories.insert(id, block);
         }
@@ -623,6 +640,25 @@ impl MemoryManager {
         self.long_term.read().await.values().cloned().collect()
     }
 
+    /// Pin or unpin a memory; pinned blocks are immune to curator decay,
+    /// pruning, and dedup. No-op when the id is unknown; returns whether the
+    /// block existed.
+    pub async fn set_pinned(&self, id: &str, pinned: bool) -> bool {
+        let found = {
+            if let Some(block) = self.long_term.write().await.get_mut(id) {
+                block.pinned = pinned;
+                true
+            } else {
+                false
+            }
+        };
+        // Persist outside the write lock: save_to_disk re-acquires a read lock.
+        if found && self.storage_dir.is_some() {
+            let _ = self.save_to_disk().await;
+        }
+        found
+    }
+
     /// Store or update a user profile.
     /// When `storage_dir` is set, automatically persists to USER.md on disk.
     pub async fn save_profile(&self, profile: UserProfile) {
@@ -760,6 +796,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pin_set_persist_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "hermes_memory_pin_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let manager = MemoryManager::with_storage_dir(dir.clone());
+        manager
+            .store(MemoryBlock::new("p1", "fact", "Never forget this"))
+            .await;
+        assert!(manager.set_pinned("p1", true).await);
+        assert!(!manager.set_pinned("missing", true).await);
+
+        let manager = MemoryManager::with_storage_dir(dir.clone());
+        manager.load_from_disk().await.unwrap();
+        let block = manager.get("p1").await.unwrap();
+        assert!(block.pinned, "pin flag must survive disk roundtrip");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_store_and_get() {
         let manager = MemoryManager::new();
         let block = MemoryBlock::new("test1", "fact", "Paris is the capital of France")
@@ -861,6 +925,7 @@ mod tests {
             created_at: 1000,
             last_accessed: 2000,
             tags: vec!["geography".to_string(), "facts".to_string()],
+            pinned: false,
         };
         memories.insert("m1".to_string(), block);
 
@@ -872,6 +937,7 @@ mod tests {
             created_at: 3000,
             last_accessed: 4000,
             tags: Vec::new(),
+            pinned: false,
         };
         memories.insert("m2".to_string(), block2);
 
@@ -912,6 +978,7 @@ mod tests {
             created_at: 0,
             last_accessed: 0,
             tags: Vec::new(),
+            pinned: false,
         };
 
         let profile = UserProfile {
@@ -955,6 +1022,7 @@ mod tests {
                 created_at: 100,
                 last_accessed: 200,
                 tags: vec!["greeting".to_string()],
+                pinned: false,
             },
         );
 
@@ -1002,6 +1070,7 @@ mod tests {
             created_at: 500,
             last_accessed: 600,
             tags: vec!["lang".to_string()],
+            pinned: false,
         };
         manager
             .long_term
@@ -1144,6 +1213,7 @@ mod tests {
                 created_at: 0,
                 last_accessed: 0,
                 tags: vec!["geography".to_string(), "facts".to_string()],
+                pinned: false,
             },
         );
         let output = MemoryStore::serialize_memories(&memories);

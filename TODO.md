@@ -24,6 +24,16 @@
 - Repo-map context injection: `[agent] repo_map_tokens` budget renders a `<repo_map>` block into the system prompt (parsed once per agent, off the async worker)
 - Transactional git harness (`hermes_core::githarness`): pre-run snapshots with dirty-tree protection, Conventional Commit message derivation from staged diffs, `commit_transaction`, `undo`, and a TUI `/undo` command that rolls back the last run's file changes
 - Skill & memory lifecycle management: background curator pass (`hermes_core::curator`) with memory importance decay and near-duplicate pruning, session auto-archiving, stale skill archiving into `_archive/`, and tag-clustered distillation of long-term facts into draft skills; runs non-blockingly on every agent startup and autonomous tick
+- Memory pinning (`pinned` flag) that survives MEMORY.md roundtrip and exempts blocks from curator decay/prune/dedup, with `MemoryManager::set_pinned` persisting outside the write lock
+- Optional LLM-assisted skill summarization (`skill_distill_llm_summary` + `curate_with_llm`) rewriting distilled draft skills as prose, and periodic mid-session curator passes via `[curator].interval_secs`
 
 ## Pending
+
+- [Repo-map hardening] Bound `discover_source_files_with_limit` (or honor gitignore) so running the agent from large repos (e.g. 6k+ files incl. vendored/reference trees) doesn't rank for minutes; cap injection-path discovery at ~500 files before PageRank scoring
+- [Curator] Trajectory compression for long-running sessions (fold old session context into a distilled fact so `MEMORY.md` stays lean without losing chat history)
+- [Skills] Surface distilled draft skills in TUI Skills panel with review/approve flow before they become loadable; today `distilled-<tag>` skills auto-load on next refresh
+- [Git harness] Wire `commit_transaction` into agent file-edit tools so `edit_block`/`patch` produce a Conventional Commit automatically when a transaction completes (currently `/undo` only)
+- [Config] Expose `EditFormat` override in `[agent]` so users can force full-file rewrites for models whose prefix rows guess wrong
+- [Providers] Add Gemini adapter with its own capability rows (currently falls through OpenAI-compatible default and gets table prefixes only if a Gemini alias matches)
+- [Release] Bump to `0.2.0` and tag for the next binary release once Phases 4–5 soak in (repo map + edit blocks + git harness + curator)
 

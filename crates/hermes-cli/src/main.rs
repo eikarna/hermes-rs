@@ -461,13 +461,26 @@ async fn load_repo_memory_manager() -> Result<MemoryManager> {
     let storage_dir = std::env::current_dir().context("Failed to determine current directory")?;
     let memory_manager = load_memory_manager(storage_dir).await?;
     // Curator pass runs in the background: decay/prune/distill without
-    // blocking startup. Failures are logged and non-fatal.
+    // blocking startup. Failures are logged and non-fatal. LLM-assisted skill
+    // prose is enabled only when configured and a client can be built.
     let config = runtime_config();
     let policy = config.curator.clone();
     let skills_dir = config.skills.root_dir.clone();
     let curated = memory_manager.clone();
+    let client_and_model = if policy.skill_distill_llm_summary {
+        runtime_client(&config)
+            .ok()
+            .map(|client| (client, config.agent.model.clone()))
+    } else {
+        None
+    };
     tokio::spawn(async move {
-        match hermes_core::curator::curate(&curated, &skills_dir, &policy).await {
+        let (client, model) = client_and_model
+            .map(|(c, m)| (Some(c), Some(m)))
+            .unwrap_or((None, None));
+        match hermes_core::curator::curate_with_llm(&curated, &skills_dir, &policy, client, model)
+            .await
+        {
             Ok(report) if !report.is_empty() => {
                 tracing::info!(?report, "Curator pass complete");
             }
@@ -477,6 +490,17 @@ async fn load_repo_memory_manager() -> Result<MemoryManager> {
             }
         }
     });
+    // Periodic mid-session passes when an interval is configured. Spawn once
+    // per process: rebuild_agent re-invokes this loader.
+    static PERIODIC_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !PERIODIC_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        hermes_core::curator::spawn_periodic_curator(
+            memory_manager.clone(),
+            config.skills.root_dir.clone(),
+            config.curator.clone(),
+        );
+    }
     Ok(memory_manager)
 }
 
