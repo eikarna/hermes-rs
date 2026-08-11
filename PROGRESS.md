@@ -158,33 +158,8 @@ Based on TODO.md tracking and natural progression after Aider integration, here 
 
 ---
 
-#### 5. Per-Model Edit Format Override (Configuration Flexibility)
-**Why:** Provider capability guessing sometimes wrong (e.g., GPT-3.5 supports full-file rewrites despite prefix matching). Need explicit override.
-
-**What to do:**
-- Expose manual `edit_format_override` in `[agent]` config
-- Allow forcing `SearchReplace`, `Patch`, or `FullFile` regardless of model capability row
-- Document trade-offs in CHANGELOG
-- Validate override value at runtime with clear error message
-
-**Implementation hints:**
-```toml
-[agent]
-model = "gpt-3.5-turbo"
-edit_format_override = "full_file"  # Force full-file over SearchReplace guess
-```
-
-**Files to modify:**
-- `crates/hermes-core/src/config.rs`: Add `edit_format_override: Option<EditFormat>` to BehaviorSettings
-- `crates/hermes-core/src/agent.rs`: Inject override into prompt hint generation (after capability check)
-- `crates/hermes-core/src/client/provider.rs`: Document override fallback behavior
-
-**Tests needed:**
-- Override correctly forces specified format regardless of capability table
-- Invalid override value produces helpful error message
-- No override falls back to capability row logic
-
-**ETA:** ~2-3 hours engineering effort
+#### 5. ~~Per-Model Edit Format Override~~ (SHIPPED)
+`[agent].edit_format_override` (`search_replace` | `patch` | `full_file`) implemented in `config.rs` + applied at prompt-hint generation in `agent.rs`; invalid values rejected by TOML parse error via serde.
 
 ---
 

@@ -6,6 +6,7 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 ## [Unreleased]
 
 ### Added
+- `[agent].edit_format_override` (`search_replace` | `patch` | `full_file`) forces the `<edit_format>` prompt hint regardless of the capability-table guess for the configured model
 - Model-agnostic provider routing `LLMProvider` trait, capability metadata, `[client].provider` selection, native adapters OpenAI, Anthropic, Ollama, OpenRouter
 - Native Anthropic Messages API adapter `x-api-key` / `anthropic-version` headers, `/messages` endpoint routing, native tool schemas, SSE streaming normalization
 - Provider-specific endpoint overrides under `[client.anthropic]`, `[client.ollama]`, `[client.openrouter]`, `[client.openai]`; environment overrides via `HERMES_PROVIDER` plus per-provider `*_API_KEY` vars
