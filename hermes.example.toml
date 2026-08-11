@@ -98,6 +98,7 @@ dedup_threshold_pct = 80    # word-overlap % treated as near-duplicate memory
 skill_distill_min_facts = 3 # facts sharing a tag that promote into a draft skill
 skill_distill_llm_summary = false # true = rewrite distilled skills as prose via the LLM
 interval_secs = 0           # seconds between periodic curator passes (0 = startup/tick only)
+auto_approve_skills = false  # false: distilled drafts wait in `_pending/` for TUI 'a' approve
 
 [skills]
 root_dir = "C:/Users/Administrator/.config/hermes/skills"

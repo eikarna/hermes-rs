@@ -99,33 +99,8 @@ Based on TODO.md tracking and natural progression after Aider integration, here 
 
 ### Medium Priority (Quality/UX)
 
-#### 4. Skill Approval Flow (Developer Control)
-**Why:** Distilled skills are auto-created and loaded immediately without human review, potentially polluting skills directory.
-
-**What to do:**
-- Show new distilled skills in TUI Skills panel before they're loadable
-- Add `review`/`approve`/`discard` actions
-- Persist decisions in `.hermes/skills/.approved` metadata file
-- Only load skills after explicit approval (opt-in behavior)
-
-**Implementation hints:**
-- Add skill review state machine in `SkillManager`
-- Create pending skills subdirectory: `.hermes/skills/pending/<skill_name>`
-- Move approved skills to actual skills dir, discard deletes
-- UI updates in TUI skills panel: show star/flag icons indicating pending status
-
-**Files to modify:**
-- `crates/hermes-core/src/skills.rs`: Add `pending` mode, `approve()`, `discard()` methods
-- `crates/hermes-core/src/tui/skills_panel.rs`: Render pending skills list with action buttons
-- `crates/hermes-core/src/curator.rs`: Change distillation path to write to pending first
-- `crates/hermes-core/src/config.rs`: Add `auto_approve_skills: bool` default false
-
-**Tests needed:**
-- Pending skills don't load until approved
-- Approved skills persist across restarts
-- Discard removes both code and metadata
-
-**ETA:** ~4-5 hours engineering effort
+#### 4. ~~Skill Approval Flow~~ (SHIPPED)
+Distilled drafts default to `<skills>/_pending/` (`[curator].auto_approve_skills = false`), never auto-load, and appear in the TUI Skills panel with a `pending` badge. `a` approves (moves to loadable root, refreshes), `d` discards. Set `auto_approve_skills = true` to restore immediate load.
 
 ---
 

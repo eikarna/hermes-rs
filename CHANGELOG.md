@@ -6,8 +6,8 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 ## [Unreleased]
 
 ### Added
+- **Skill approval flow**: `[curator].auto_approve_skills = false` (default) routes distilled draft skills to `<skills>/_pending/` (never auto-loaded); the TUI Skills panel shows them with a `pending` badge — `a` approves into loadable, `d` discards
 - `[agent].auto_commit` option: when `true` a successful interactive run auto-commits working-tree changes via the git harness's Conventional Commit derivation (default `false`, keeping `/undo`-only behavior)
-- `[agent].auto_commit` auto-commits a successful interactive run's working-tree changes with the git harness's derived Conventional Commit (default `false`; `/undo` still snapshots pre-run state)
 - `[agent].edit_format_override` (`search_replace` | `patch` | `full_file`) forces the `<edit_format>` prompt hint regardless of the capability-table guess for the configured model
 - Model-agnostic provider routing `LLMProvider` trait, capability metadata, `[client].provider` selection, native adapters OpenAI, Anthropic, Ollama, OpenRouter
 - Native Anthropic Messages API adapter `x-api-key` / `anthropic-version` headers, `/messages` endpoint routing, native tool schemas, SSE streaming normalization

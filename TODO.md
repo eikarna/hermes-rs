@@ -27,11 +27,11 @@
 - Skill & memory lifecycle management: background curator pass (`hermes_core::curator`) with memory importance decay and near-duplicate pruning, session auto-archiving, stale skill archiving into `_archive/`, and tag-clustered distillation of long-term facts into draft skills; runs non-blockingly on every agent startup and autonomous tick
 - Memory pinning (`pinned` flag) that survives MEMORY.md roundtrip and exempts blocks from curator decay/prune/dedup, with `MemoryManager::set_pinned` persisting outside the write lock
 - Optional LLM-assisted skill summarization (`skill_distill_llm_summary` + `curate_with_llm`) rewriting distilled draft skills as prose, and periodic mid-session curator passes via `[curator].interval_secs`
+- Skill approval flow: `[curator].auto_approve_skills = false` (default) routes distilled drafts to `<skills>/_pending/` where they stay unloadable until approved (`a` in the TUI Skills panel; `d` discards pending)
 
 ## Pending
 
 - [Curator] Trajectory compression for long-running sessions (fold old session context into a distilled fact so `MEMORY.md` stays lean without losing chat history)
-- [Skills] Surface distilled draft skills in TUI Skills panel with review/approve flow before they become loadable; today `distilled-<tag>` skills auto-load on next refresh
 - [Providers] Add Gemini adapter with its own capability rows (currently falls through OpenAI-compatible default and gets table prefixes only if a Gemini alias matches)
 - [Release] Bump to `0.2.0` and tag for the next binary release once Phases 4–5 soak in (repo map + edit blocks + git harness + curator)
 
