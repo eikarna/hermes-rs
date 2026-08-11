@@ -248,10 +248,8 @@ fn archive_stale_skills(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(now)
         });
-        if now.saturating_sub(last_touch) > stale_after as i64 {
-            if manager.archive(&skill.name)? {
-                report.skills_archived.push(skill.name.clone());
-            }
+        if now.saturating_sub(last_touch) > stale_after as i64 && manager.archive(&skill.name)? {
+            report.skills_archived.push(skill.name.clone());
         }
     }
     Ok(())
