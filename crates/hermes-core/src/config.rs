@@ -181,6 +181,11 @@ pub struct BehaviorSettings {
     /// `full_file`) regardless of what the capability table guesses for the
     /// configured model. `None` keeps capability-table behavior.
     pub edit_format_override: Option<crate::client::EditFormat>,
+    /// After each successful interactive run, auto-commit working-tree
+    /// changes with a Conventional Commit derived from the staged diff.
+    /// Default `false`: keep `/undo`-only behavior. Agent-authored edits
+    /// inside a transaction are only committed when the run succeeds.
+    pub auto_commit: bool,
 }
 
 impl Default for BehaviorSettings {
@@ -198,6 +203,7 @@ impl Default for BehaviorSettings {
             repo_map_tokens: 0,
             repo_map_max_files: 500,
             edit_format_override: None,
+            auto_commit: false,
         }
     }
 }
@@ -787,6 +793,16 @@ mod tests {
 
         let settings: BehaviorSettings = toml::from_str("model = \"gpt-4\"\n").unwrap();
         assert_eq!(settings.edit_format_override, None);
+    }
+
+    #[test]
+    fn agent_auto_commit_defaults_off_and_parses() {
+        let settings: BehaviorSettings = toml::from_str("model = \"gpt-4\"\n").unwrap();
+        assert!(!settings.auto_commit);
+
+        let settings: BehaviorSettings =
+            toml::from_str("model = \"gpt-4\"\nauto_commit = true\n").unwrap();
+        assert!(settings.auto_commit);
     }
 
     #[test]

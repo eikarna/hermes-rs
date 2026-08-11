@@ -194,10 +194,40 @@ impl TuiApp {
                         Action::ApplyRunResult(Some(format!("Agent task join failed: {}", error)))
                     }
                 };
+                if matches!(action, Action::ApplyRunResult(None)) {
+                    self.auto_commit_if_enabled();
+                }
                 self.state.reduce(action);
             }
         }
         Ok(())
+    }
+
+    /// Commit the run's working-tree changes when `[agent].auto_commit` is on.
+    /// Best-effort: committing consumes the `/undo` snapshot, so a successful
+    /// commit clears rollback state. Failures are surfaced as footer notices.
+    fn auto_commit_if_enabled(&mut self) {
+        if !self.state.persistent.config.agent.auto_commit {
+            return;
+        }
+        let Some(_snapshot) = self.last_snapshot.take() else {
+            return;
+        };
+        match hermes_core::githarness::GitHarness::open(std::path::Path::new("."))
+            .and_then(|harness| harness.commit_transaction("apply agent edits"))
+        {
+            Ok(Some(hash)) => {
+                self.state.set_footer_notice(
+                    format!("auto-committed run changes ({})", hash),
+                    Tone::Success,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.state
+                    .set_footer_notice(format!("auto-commit failed: {}", error), Tone::Warning);
+            }
+        }
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
