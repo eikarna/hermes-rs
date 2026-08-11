@@ -210,7 +210,7 @@ const CAPABILITY_TABLE: &[(&str, ProviderCapabilities)] = &[
     ),
 ];
 
-/// Look up per-model capabilities from [`CAPABILITY_TABLE`] by longest
+/// Look up per-model capabilities from the built-in capability table by longest
 /// case-insensitive prefix match. Returns `None` for unknown models so the
 /// caller can fall back to adapter defaults.
 pub fn lookup_capabilities(model: &str) -> Option<ProviderCapabilities> {

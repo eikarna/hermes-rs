@@ -666,7 +666,7 @@ impl LLMProvider for OpenAIClient {
 }
 
 /// Run a chat completion through any [`LLMProvider`] with a single call.
-/// Note: `chat` is the non-streaming path; prefer [`crate::client::chat_streaming`]
+/// Note: `chat` is the non-streaming path; prefer [`chat_streaming_with_provider`]
 /// for streaming-first usage in the agent loop.
 pub async fn chat_with_provider(
     provider: &dyn LLMProvider,
