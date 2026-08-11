@@ -12,6 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Directory name (inside the skills root) holding archived skills.
 pub const ARCHIVE_DIR_NAME: &str = "_archive";
 
+/// Directory name (inside the skills root) holding distilled draft skills
+/// awaiting human approval before they become loadable.
+pub const PENDING_DIR_NAME: &str = "_pending";
+
 /// Provenance of a skill — who authored it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SkillOrigin {
@@ -112,8 +116,9 @@ impl SkillManager {
             if !path.is_dir() {
                 continue;
             }
-            // Archived skills live under `_archive/` and are never auto-loaded.
-            if entry.file_name() == ARCHIVE_DIR_NAME {
+            // Archived (`_archive/`) and pending-approval (`_pending/`) skills
+            // are never auto-loaded.
+            if entry.file_name() == ARCHIVE_DIR_NAME || entry.file_name() == PENDING_DIR_NAME {
                 continue;
             }
 
@@ -265,6 +270,94 @@ impl SkillManager {
 
         self.skills.remove(name);
         Ok(())
+    }
+
+    /// Create a skill under `_pending/` (awaiting approval; not loadable).
+    pub fn create_pending(&mut self, name: &str, content: &str) -> Result<()> {
+        let pending_root = self.skills_dir.join(PENDING_DIR_NAME);
+        std::fs::create_dir_all(&pending_root).map_err(|e| {
+            Error::Config(format!(
+                "Failed to create pending dir '{}': {}",
+                pending_root.display(),
+                e
+            ))
+        })?;
+        let skill_dir = pending_root.join(name);
+        if skill_dir.exists() || self.skills_dir.join(name).exists() {
+            return Ok(()); // already pending or live; don't overwrite
+        }
+        std::fs::create_dir_all(&skill_dir).map_err(|e| {
+            Error::Config(format!(
+                "Failed to create pending skill dir '{}': {}",
+                skill_dir.display(),
+                e
+            ))
+        })?;
+        std::fs::write(skill_dir.join("SKILL.md"), content).map_err(|e| {
+            Error::Config(format!(
+                "Failed to write pending SKILL.md for '{}': {}",
+                name, e
+            ))
+        })
+    }
+
+    /// List skills awaiting approval in `_pending/` (parsed, for display).
+    pub fn pending_skills(&self) -> Vec<Skill> {
+        let pending_root = self.skills_dir.join(PENDING_DIR_NAME);
+        std::fs::read_dir(&pending_root)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.join("SKILL.md").exists())
+                    .filter_map(|p| load_skill(&p).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// List skills awaiting approval in `_pending/`.
+    pub fn list_pending(&self) -> Vec<String> {
+        let pending_root = self.skills_dir.join(PENDING_DIR_NAME);
+        let mut names: Vec<String> = std::fs::read_dir(&pending_root)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().join("SKILL.md").exists())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Move a pending skill into the loadable set. Returns `false` when no
+    /// such pending skill exists (or it is already live).
+    pub fn approve(&mut self, name: &str) -> Result<bool> {
+        let pending_dir = self.skills_dir.join(PENDING_DIR_NAME).join(name);
+        if !pending_dir.exists() || self.skills_dir.join(name).exists() {
+            return Ok(false);
+        }
+        std::fs::rename(&pending_dir, self.skills_dir.join(name))
+            .map_err(|e| Error::Config(format!("Failed to approve skill '{}': {}", name, e)))?;
+        if let Ok(skill) = load_skill(&self.skills_dir.join(name)) {
+            self.skills.insert(skill.name.clone(), skill);
+        }
+        Ok(true)
+    }
+
+    /// Delete a pending skill (pre-approval discard). Returns `false` when no
+    /// such pending skill exists.
+    pub fn discard_pending(&mut self, name: &str) -> Result<bool> {
+        let pending_dir = self.skills_dir.join(PENDING_DIR_NAME).join(name);
+        if !pending_dir.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_dir_all(&pending_dir).map_err(|e| {
+            Error::Config(format!("Failed to discard pending skill '{}': {}", name, e))
+        })?;
+        Ok(true)
     }
 
     /// Record an invocation of this skill: increment use_count, set last_activity_at.
@@ -585,6 +678,53 @@ mod tests {
          # Test Skill\n\
          \n\
          This is the skill content.\n"
+    }
+
+    #[test]
+    fn test_pending_skills_lifecycle() {
+        let dir = make_temp_dir();
+        let mut manager = SkillManager::new(dir.clone());
+
+        // Distill to pending: never visible via load_all.
+        manager
+            .create_pending("distilled-rust", sample_skill_md())
+            .unwrap();
+        assert_eq!(manager.list_pending(), vec!["distilled-rust"]);
+        assert!(manager.load_all().unwrap().is_empty());
+
+        // Approve moves into loadable set.
+        assert!(manager.approve("distilled-rust").unwrap());
+        assert!(manager.list_pending().is_empty());
+        assert_eq!(manager.load_all().unwrap().len(), 1);
+        assert!(manager.get("test-skill").is_some());
+        // Second approve is a no-op.
+        assert!(!manager.approve("distilled-rust").unwrap());
+
+        // Create another and discard it: never loadable, pending emptied.
+        manager
+            .create_pending("distilled-python", sample_skill_md())
+            .unwrap();
+        assert!(manager.discard_pending("distilled-python").unwrap());
+        assert!(manager.list_pending().is_empty());
+        assert_eq!(manager.load_all().unwrap().len(), 1);
+        assert!(!manager.discard_pending("missing").unwrap());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_load_all_ignores_pending_dir() {
+        let dir = make_temp_dir();
+        let mut manager = SkillManager::new(dir.clone());
+        manager.create("live-skill", sample_skill_md()).unwrap();
+        manager
+            .create_pending("draft-skill", sample_skill_md())
+            .unwrap();
+        let loaded = manager.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "test-skill"); // front-matter name wins
+        assert_eq!(manager.list_pending(), vec!["draft-skill"]);
+        cleanup(&dir);
     }
 
     #[test]

@@ -53,6 +53,11 @@ pub struct CurationPolicy {
     /// Seconds between periodic curator passes in long-lived runtimes.
     /// `0` disables periodic runs (passes still happen at startup/tick).
     pub interval_secs: u64,
+    /// When `false`, distilled draft skills are written under
+    /// `<skills>/_pending/` and stay unloadable until a human approves them
+    /// (TUI `/skill approve <name>`). `true` writes them directly into the
+    /// loadable skills directory (previous behavior).
+    pub auto_approve_skills: bool,
 }
 
 // ponytail: skill-level pinning (front-matter `pinned: true`) — currently
@@ -70,6 +75,7 @@ impl Default for CurationPolicy {
             skill_distill_min_facts: 3,
             skill_distill_llm_summary: false,
             interval_secs: 0,
+            auto_approve_skills: false,
         }
     }
 }
@@ -306,7 +312,15 @@ async fn distill_skills_from_memory(
             continue;
         }
         let skill_name = format!("distilled-{}", tag);
-        if skills_dir.join(&skill_name).exists() {
+        // Backwards compatibility: a live skill with this name already covers
+        // the cluster regardless of approval state. When approval is off,
+        // also skip if a draft already awaits review under `_pending/`.
+        if skills_dir.join(&skill_name).exists()
+            || skills_dir
+                .join(crate::skills::PENDING_DIR_NAME)
+                .join(&skill_name)
+                .exists()
+        {
             continue;
         }
         let body = match (&client, &model, policy.skill_distill_llm_summary) {
@@ -328,7 +342,13 @@ async fn distill_skills_from_memory(
             skill_name,
             body
         );
-        manager.create(&skill_name, &skill_md)?;
+        // A fresh draft honors `auto_approve_skills`. `_pending/` presence was
+        // already excluded above, so re-distillation never fights the queue.
+        if policy.auto_approve_skills {
+            manager.create(&skill_name, &skill_md)?;
+        } else {
+            manager.create_pending(&skill_name, &skill_md)?;
+        }
         report.skills_distilled.push(skill_name);
     }
     Ok(())
@@ -572,6 +592,7 @@ mod tests {
         let policy = CurationPolicy {
             memory_decay_days: 0,
             skill_distill_min_facts: 3,
+            auto_approve_skills: true,
             ..CurationPolicy::default()
         };
         let report = curate(&memory, &skills, &policy).await.unwrap();
@@ -703,6 +724,7 @@ mod tests {
             memory_decay_days: 0,
             skill_distill_min_facts: 3,
             skill_distill_llm_summary: true,
+            auto_approve_skills: true,
             ..CurationPolicy::default()
         };
         let report = curate_with_llm(
@@ -722,6 +744,46 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(skills);
+    }
+
+    #[tokio::test]
+    async fn distillation_routes_to_pending_unless_auto_approved() {
+        use crate::memory::{MemoryBlock, MemoryManager};
+
+        for auto_approve in [false, true] {
+            let dir = test_dir(&format!("pend_mem_{}", auto_approve));
+            let skills = test_dir(&format!("pend_skills_{}", auto_approve));
+            let memory = MemoryManager::with_storage_dir(dir.clone());
+            for (i, fact) in ["fact one", "fact two", "fact three"].iter().enumerate() {
+                memory
+                    .store(
+                        MemoryBlock::new(format!("f{}", i), "fact", *fact)
+                            .importance(80)
+                            .tags(vec!["distilled".into(), "long_term".into(), "rust".into()]),
+                    )
+                    .await;
+            }
+
+            let policy = CurationPolicy {
+                skill_distill_min_facts: 3,
+                auto_approve_skills: auto_approve,
+                ..CurationPolicy::default()
+            };
+            let report = curate(&memory, &skills, &policy).await.unwrap();
+            assert_eq!(report.skills_distilled, vec!["distilled-rust"]);
+
+            let live = skills.join("distilled-rust").join("SKILL.md").exists();
+            let pending = skills
+                .join(crate::skills::PENDING_DIR_NAME)
+                .join("distilled-rust")
+                .join("SKILL.md")
+                .exists();
+            assert_eq!(live, auto_approve);
+            assert_eq!(pending, !auto_approve);
+
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_dir_all(skills);
+        }
     }
 
     #[tokio::test]

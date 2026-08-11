@@ -161,6 +161,8 @@ pub struct SkillItem {
     pub description: String,
     pub version: String,
     pub available: bool,
+    /// Awaiting approval in `_pending/`; never auto-loaded.
+    pub pending: bool,
 }
 
 #[derive(Debug, Clone)]

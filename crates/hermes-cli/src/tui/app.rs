@@ -346,6 +346,11 @@ impl TuiApp {
                     self.handle_runtime_error("MCP remove failed", error);
                 }
             }
+            KeyCode::Char('a') if self.state.ui.active_panel == ActivePanel::Skills => {
+                if let Err(error) = self.approve_selected_skill() {
+                    self.handle_runtime_error("Skill approve failed", error);
+                }
+            }
             KeyCode::Char('d') if self.state.ui.active_panel == ActivePanel::Skills => {
                 if let Err(error) = self.remove_selected_skill() {
                     self.handle_runtime_error("Skill delete failed", error);
@@ -618,15 +623,25 @@ impl TuiApp {
     fn refresh_skills(&mut self) -> Result<()> {
         std::fs::create_dir_all(&self.state.persistent.config.skills.root_dir)?;
         let loaded = self.skill_manager.load_all()?;
-        let items = loaded
+        let mut items = loaded
             .iter()
             .map(|skill| SkillItem {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
                 version: skill.version.clone(),
                 available: self.skill_manager.is_available(skill),
+                pending: false,
             })
             .collect::<Vec<_>>();
+        for skill in self.skill_manager.pending_skills() {
+            items.push(SkillItem {
+                name: skill.name,
+                description: skill.description,
+                version: skill.version,
+                available: false,
+                pending: true,
+            });
+        }
         self.state.reduce(Action::SyncSkills(items));
         Ok(())
     }
@@ -728,6 +743,20 @@ impl TuiApp {
             .get(self.state.ui.selected_skill)
             .cloned()
         {
+            if skill.pending {
+                // Pending skills are discarded (removed from `_pending/`), not
+                // archived — they were never loadable.
+                if self.skill_manager.discard_pending(&skill.name)? {
+                    self.refresh_skills()?;
+                    self.record_app_event(
+                        "Pending skill discarded",
+                        format!("Discarded pending skill '{}'.", skill.name),
+                        Tone::Warning,
+                        "pending skill discarded",
+                    );
+                }
+                return Ok(());
+            }
             self.skill_manager.delete(&skill.name)?;
             self.refresh_skills()?;
             self.record_app_event(
@@ -736,6 +765,34 @@ impl TuiApp {
                 Tone::Warning,
                 "skill deleted",
             );
+        }
+        Ok(())
+    }
+
+    /// Approve the selected pending skill: moves it from `_pending/` into the
+    /// loadable set, then refreshes. No-op for already-live skills.
+    fn approve_selected_skill(&mut self) -> Result<()> {
+        if let Some(skill) = self
+            .state
+            .persistent
+            .skills
+            .get(self.state.ui.selected_skill)
+            .cloned()
+        {
+            if !skill.pending {
+                self.state
+                    .set_footer_notice("skill is already approved", Tone::Info);
+                return Ok(());
+            }
+            if self.skill_manager.approve(&skill.name)? {
+                self.refresh_skills()?;
+                self.record_app_event(
+                    "Skill approved",
+                    format!("Approved distilled skill '{}'.", skill.name),
+                    Tone::Success,
+                    "skill approved",
+                );
+            }
         }
         Ok(())
     }

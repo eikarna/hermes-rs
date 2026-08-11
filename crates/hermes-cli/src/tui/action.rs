@@ -189,6 +189,7 @@ mod tests {
             description: "Build things".to_string(),
             version: "0.1.0".to_string(),
             available: true,
+            pending: false,
         }]));
         state.reduce(Action::SetActivePanel(ActivePanel::Skills));
         state.reduce(Action::SelectNext);

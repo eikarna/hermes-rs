@@ -1057,7 +1057,12 @@ fn skills_widget(skills: &[SkillItem], selected: usize, skills_root: String) -> 
                 "d",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" delete", Style::default().fg(MUTED)),
+            Span::styled(" delete  ", Style::default().fg(MUTED)),
+            Span::styled(
+                "a",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" approve pending", Style::default().fg(MUTED)),
         ]),
         Line::from(vec![
             Span::styled("root ", Style::default().fg(MUTED)),
@@ -1258,8 +1263,20 @@ fn skill_line(skill: &SkillItem, selected: bool) -> Line<'static> {
         Span::styled(skill.version.clone(), Style::default().fg(MUTED)),
         Span::raw(" "),
         Span::styled(
-            if skill.available { "ready" } else { "blocked" },
-            Style::default().fg(if skill.available { SUCCESS } else { WARN }),
+            if skill.pending {
+                "pending"
+            } else if skill.available {
+                "ready"
+            } else {
+                "blocked"
+            },
+            Style::default().fg(if skill.pending {
+                WARN
+            } else if skill.available {
+                SUCCESS
+            } else {
+                WARN
+            }),
         ),
     ])
 }
