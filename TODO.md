@@ -29,10 +29,9 @@
 
 ## Pending
 
-- [Repo-map hardening] Bound `discover_source_files_with_limit` (or honor gitignore) so running the agent from large repos (e.g. 6k+ files incl. vendored/reference trees) doesn't rank for minutes; cap injection-path discovery at ~500 files before PageRank scoring
 - [Curator] Trajectory compression for long-running sessions (fold old session context into a distilled fact so `MEMORY.md` stays lean without losing chat history)
 - [Skills] Surface distilled draft skills in TUI Skills panel with review/approve flow before they become loadable; today `distilled-<tag>` skills auto-load on next refresh
-- [Git harness] Wire `commit_transaction` into agent file-edit tools so `edit_block`/`patch` produce a Conventional Commit automatically when a transaction completes (currently `/undo` only)
+- [Git harness] Wire `commit_transaction` into interactive `edit_block`/`patch` tools (`autonomous.rs` already auto-commits each tick; TUI/agent edits still only get `/undo`)
 - [Config] Expose `EditFormat` override in `[agent]` so users can force full-file rewrites for models whose prefix rows guess wrong
 - [Providers] Add Gemini adapter with its own capability rows (currently falls through OpenAI-compatible default and gets table prefixes only if a Gemini alias matches)
 - [Release] Bump to `0.2.0` and tag for the next binary release once Phases 4–5 soak in (repo map + edit blocks + git harness + curator)
