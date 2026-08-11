@@ -61,6 +61,43 @@ impl Default for ProviderCapabilities {
 /// Rows are provider-agnostic defaults — adapters merge these over their own
 /// baseline in [`lookup_capabilities`].
 const CAPABILITY_TABLE: &[(&str, ProviderCapabilities)] = &[
+    // Google Gemini (recent first: longest-prefix lookup means 2.5 beats 2.0/1.5)
+    (
+        "gemini-2.5-pro",
+        ProviderCapabilities {
+            max_input_tokens: 1_048_576,
+            max_output_tokens: 65_536,
+            edit_format: EditFormat::SearchReplace,
+            supports_streaming: true,
+            supports_reasoning: true,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
+    (
+        "gemini-2.5-flash",
+        ProviderCapabilities {
+            max_input_tokens: 1_048_576,
+            max_output_tokens: 65_536,
+            edit_format: EditFormat::SearchReplace,
+            supports_streaming: true,
+            supports_reasoning: true,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
+    (
+        "gemini-",
+        ProviderCapabilities {
+            max_input_tokens: 1_048_576,
+            max_output_tokens: 8_192,
+            edit_format: EditFormat::Patch,
+            supports_streaming: true,
+            supports_reasoning: false,
+            supports_vision: true,
+            supports_tool_calls: true,
+        },
+    ),
     // Anthropic Claude
     (
         "claude-opus-4",
@@ -193,6 +230,7 @@ pub enum ProviderKind {
     Anthropic,
     Ollama,
     Openrouter,
+    Gemini,
 }
 
 impl ProviderKind {
@@ -203,6 +241,7 @@ impl ProviderKind {
             "anthropic" => Some(Self::Anthropic),
             "ollama" => Some(Self::Ollama),
             "openrouter" => Some(Self::Openrouter),
+            "gemini" | "google" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -211,7 +250,7 @@ impl ProviderKind {
     pub fn parse_configured(name: &str) -> Result<Self> {
         Self::from_name(name).ok_or_else(|| {
             crate::error::Error::Config(format!(
-                "Unsupported client provider '{}'. Expected one of: openai, anthropic, ollama, openrouter.",
+                "Unsupported client provider '{}'. Expected one of: openai, anthropic, ollama, openrouter, gemini.",
                 name
             ))
         })
@@ -223,6 +262,7 @@ impl ProviderKind {
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
             Self::Openrouter => "openrouter",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -278,6 +318,7 @@ pub enum ProviderClient {
     Ollama(OpenAIClient),
     Openrouter(OpenAIClient),
     Anthropic(AnthropicClient),
+    Gemini(crate::client::gemini::GeminiClient),
 }
 
 #[async_trait]
@@ -293,6 +334,7 @@ impl LLMProvider for ProviderClient {
                 c.chat(model, messages, tools).await
             }
             Self::Anthropic(c) => c.chat(model, messages, tools).await,
+            Self::Gemini(c) => c.chat(model, messages, tools).await,
         }
     }
 
@@ -307,6 +349,7 @@ impl LLMProvider for ProviderClient {
                 c.chat_streaming(model, messages, tools).await
             }
             Self::Anthropic(c) => c.chat_streaming(model, messages, tools).await,
+            Self::Gemini(c) => c.chat_streaming(model, messages, tools).await,
         }
     }
 
@@ -314,6 +357,7 @@ impl LLMProvider for ProviderClient {
         match self {
             Self::Openai(c) | Self::Ollama(c) | Self::Openrouter(c) => c.capabilities(model),
             Self::Anthropic(c) => c.capabilities(model),
+            Self::Gemini(c) => c.capabilities(model),
         }
     }
 }
@@ -330,6 +374,7 @@ pub fn resolve_provider_settings(
         ProviderKind::Ollama => "http://localhost:11434/v1",
         ProviderKind::Openrouter => "https://openrouter.ai/api/v1",
         ProviderKind::Anthropic => "https://api.anthropic.com/v1",
+        ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta",
     };
 
     let base_url = settings
@@ -391,6 +436,7 @@ pub fn build_provider_for_kind(
             Arc::new(ProviderClient::from_openai_compatible(kind, client_config))
         }
         ProviderKind::Anthropic => Arc::new(AnthropicClient::new(client_config)?),
+        ProviderKind::Gemini => Arc::new(crate::client::gemini::GeminiClient::new(client_config)?),
     };
     Ok(client)
 }

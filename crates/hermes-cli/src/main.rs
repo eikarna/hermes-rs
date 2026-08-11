@@ -271,7 +271,7 @@ fn apply_cli_overrides(cli: &Cli, config: &mut AppConfig) {
 fn client_config(config: &AppConfig) -> Result<(ProviderKind, ClientConfig)> {
     let kind = ProviderKind::from_name(&config.client.provider).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unsupported client provider '{}'. Expected one of: openai, anthropic, ollama, openrouter.",
+            "Unsupported client provider '{}'. Expected one of: openai, anthropic, ollama, openrouter, gemini.",
             config.client.provider
         )
     })?;

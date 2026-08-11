@@ -4,7 +4,9 @@
 //! Supports Server-Sent Events for streaming responses.
 //! Supports reasoning_content for extended-thinking models.
 
+pub mod gemini;
 pub mod provider;
+pub use gemini::GeminiClient;
 pub use provider::{
     build_provider_client, build_provider_for_kind, resolve_provider_settings, EditFormat,
     LLMProvider, ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind,

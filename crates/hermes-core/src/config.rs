@@ -51,13 +51,14 @@ pub struct ClientSettings {
     pub auth_ref: Option<String>,
     pub timeout_secs: u64,
     pub max_context_length: usize,
-    /// LLM provider backend: "openai" (default), "anthropic", "ollama", "openrouter"
+    /// LLM provider backend: "openai" (default), "anthropic", "ollama", "openrouter", "gemini"
     pub provider: String,
     /// Optional per-provider connection overrides.
     pub openai: ProviderEndpointSettings,
     pub anthropic: ProviderEndpointSettings,
     pub ollama: ProviderEndpointSettings,
     pub openrouter: ProviderEndpointSettings,
+    pub gemini: ProviderEndpointSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -81,6 +82,7 @@ impl Default for ClientSettings {
             anthropic: ProviderEndpointSettings::default(),
             ollama: ProviderEndpointSettings::default(),
             openrouter: ProviderEndpointSettings::default(),
+            gemini: ProviderEndpointSettings::default(),
         }
     }
 }
@@ -95,6 +97,7 @@ impl ClientSettings {
             crate::client::ProviderKind::Ollama => Some(&self.ollama),
             crate::client::ProviderKind::Openrouter => Some(&self.openrouter),
             crate::client::ProviderKind::Anthropic => Some(&self.anthropic),
+            crate::client::ProviderKind::Gemini => Some(&self.gemini),
         }
     }
 
@@ -110,6 +113,7 @@ impl ClientSettings {
             crate::client::ProviderKind::Ollama => non_empty_env("OLLAMA_BASE_URL"),
             crate::client::ProviderKind::Openrouter => non_empty_env("OPENROUTER_BASE_URL"),
             crate::client::ProviderKind::Anthropic => non_empty_env("ANTHROPIC_BASE_URL"),
+            crate::client::ProviderKind::Gemini => non_empty_env("GEMINI_BASE_URL"),
         });
         value.filter(|v| !v.trim().is_empty())
     }
@@ -127,6 +131,7 @@ impl ClientSettings {
                 crate::client::ProviderKind::Ollama => non_empty_env("OLLAMA_API_KEY"),
                 crate::client::ProviderKind::Openrouter => non_empty_env("OPENROUTER_API_KEY"),
                 crate::client::ProviderKind::Anthropic => non_empty_env("ANTHROPIC_API_KEY"),
+                crate::client::ProviderKind::Gemini => non_empty_env("GEMINI_API_KEY"),
             })
             .filter(|v| !v.trim().is_empty())
     }
@@ -148,6 +153,9 @@ impl ClientSettings {
             }
             crate::client::ProviderKind::Anthropic => {
                 non_empty_env("ANTHROPIC_TIMEOUT_SECS").and_then(|value| value.parse().ok())
+            }
+            crate::client::ProviderKind::Gemini => {
+                non_empty_env("GEMINI_TIMEOUT_SECS").and_then(|value| value.parse().ok())
             }
         })
     }
@@ -793,6 +801,19 @@ mod tests {
 
         let settings: BehaviorSettings = toml::from_str("model = \"gpt-4\"\n").unwrap();
         assert_eq!(settings.edit_format_override, None);
+    }
+
+    #[test]
+    fn client_gemini_provider_resolves() {
+        let settings: ClientSettings =
+            toml::from_str("provider = \"gemini\"\n[gemini]\napi_key = \"k\"\n").unwrap();
+        let resolved = crate::client::resolve_provider_settings(&settings).unwrap();
+        assert_eq!(resolved.kind, crate::client::ProviderKind::Gemini);
+        assert_eq!(resolved.config.api_key.as_deref(), Some("k"));
+        assert_eq!(
+            resolved.config.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
     }
 
     #[test]
