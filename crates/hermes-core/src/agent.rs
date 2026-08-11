@@ -47,6 +47,8 @@ pub struct AgentConfig {
     pub repo_map_tokens: usize,
     /// Maximum files discovered for repo map scoring (cap huge repos).
     pub repo_map_max_files: usize,
+    /// Override the capability-table edit format hint. `None` = table behavior.
+    pub edit_format_override: Option<crate::client::EditFormat>,
 }
 
 impl Default for AgentConfig {
@@ -68,6 +70,7 @@ impl From<&BehaviorSettings> for AgentConfig {
             max_healing_attempts: settings.max_healing_attempts,
             repo_map_tokens: settings.repo_map_tokens,
             repo_map_max_files: settings.repo_map_max_files,
+            edit_format_override: settings.edit_format_override,
         }
     }
 }
@@ -399,7 +402,11 @@ impl HermesAgent {
             }
         }
 
-        match self.client.capabilities(&self.config.model).edit_format {
+        let edit_format = self
+            .config
+            .edit_format_override
+            .unwrap_or_else(|| self.client.capabilities(&self.config.model).edit_format);
+        match edit_format {
             crate::client::EditFormat::SearchReplace => system_prompt.push_str(
                 "\n\n<edit_format>\n\
                 This model supports token-efficient search/replace edits. Prefer the \
@@ -1495,6 +1502,46 @@ mod tests {
         let agent = HermesAgent::new(
             AgentConfig::default(),
             OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+        assert!(!system.contains("<edit_format>"));
+    }
+
+    #[tokio::test]
+    async fn build_messages_edit_format_override_beats_capability_table() {
+        // OpenAI's table says FullFile (no hint) for gpt-4; override forces SearchReplace.
+        let config = AgentConfig {
+            model: "gpt-4".to_string(),
+            edit_format_override: Some(crate::client::EditFormat::SearchReplace),
+            ..AgentConfig::default()
+        };
+        let agent = HermesAgent::new(
+            config,
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+        assert!(system.contains("<edit_format>"));
+        assert!(system.contains("edit_block"));
+
+        // Override back to FullFile suppresses the hint even for Anthropic.
+        let config = AgentConfig {
+            edit_format_override: Some(crate::client::EditFormat::FullFile),
+            ..AgentConfig::default()
+        };
+        let anthropic = AnthropicClient::new(crate::client::ClientConfig::default()).unwrap();
+        let agent = HermesAgent::new_with_provider(
+            config,
+            Arc::new(anthropic),
             ToolRegistry::new(Duration::from_secs(1)),
         );
         let messages = agent.build_messages().await.unwrap();

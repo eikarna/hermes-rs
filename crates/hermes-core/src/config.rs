@@ -177,6 +177,10 @@ pub struct BehaviorSettings {
     /// Maximum files discovered for repo map scoring (cap huge repos).
     /// Defaults to 500; increase only if needed for very small repos.
     pub repo_map_max_files: usize,
+    /// Force the edit-format prompt hint (`search_replace`, `patch`, or
+    /// `full_file`) regardless of what the capability table guesses for the
+    /// configured model. `None` keeps capability-table behavior.
+    pub edit_format_override: Option<crate::client::EditFormat>,
 }
 
 impl Default for BehaviorSettings {
@@ -193,6 +197,7 @@ impl Default for BehaviorSettings {
             show_reasoning: true,
             repo_map_tokens: 0,
             repo_map_max_files: 500,
+            edit_format_override: None,
         }
     }
 }
@@ -768,6 +773,20 @@ mod tests {
         );
         assert_eq!(config.curator.memory_decay_days, 14);
         assert_eq!(config.curator.skill_distill_min_facts, 3);
+    }
+
+    #[test]
+    fn agent_edit_format_override_parses() {
+        let settings: BehaviorSettings =
+            toml::from_str("model = \"gpt-4\"\nedit_format_override = \"search_replace\"\n")
+                .unwrap();
+        assert_eq!(
+            settings.edit_format_override,
+            Some(crate::client::EditFormat::SearchReplace)
+        );
+
+        let settings: BehaviorSettings = toml::from_str("model = \"gpt-4\"\n").unwrap();
+        assert_eq!(settings.edit_format_override, None);
     }
 
     #[test]
