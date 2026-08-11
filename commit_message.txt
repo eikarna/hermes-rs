@@ -1,5 +1,0 @@
-⚡ Refactor FileWriteTool to use tokio::fs
-
-💡 **What:** Migrated all synchronous `std::fs` operations (`try_exists`, `create_dir_all`, `OpenOptions`, `write`, `metadata`) in `FileWriteTool::execute` to their `tokio::fs` asynchronous equivalents.
-🎯 **Why:** To avoid blocking `tokio` executor threads. The previous implementation executed synchronous filesystem operations inside an async function, which is an anti-pattern that can decrease overall application concurrency and performance.
-📊 **Measured Improvement:** Measured with `criterion` across 15k iterations. The `tokio::fs::write` method was slightly faster and more consistent (447.63 µs - 465.15 µs) than the `std::fs::write` in an async block (470.91 µs - 505.66 µs). More significantly, using `tokio::fs` correctly suspends the task on I/O, allowing other async tasks to progress, reducing tail latencies under heavy concurrent loads.
