@@ -99,6 +99,10 @@ skill_distill_min_facts = 3 # facts sharing a tag that promote into a draft skil
 skill_distill_llm_summary = false # true = rewrite distilled skills as prose via the LLM
 interval_secs = 0           # seconds between periodic curator passes (0 = startup/tick only)
 auto_approve_skills = false  # false: distilled drafts wait in `_pending/` for TUI 'a' approve
+# Trajectory compression: fold old low-importance facts into one summary block.
+compression_min_age_days = 60   # idle days before a fact is a compression candidate (0 disables)
+compression_max_importance = 90 # facts at/above this importance are never compressed
+compression_min_count = 5       # need at least this many candidates to create a summary
 
 [skills]
 root_dir = "C:/Users/Administrator/.config/hermes/skills"

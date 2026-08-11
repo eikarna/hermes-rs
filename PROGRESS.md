@@ -32,32 +32,8 @@ Based on TODO.md tracking and natural progression after Aider integration, here 
 
 ### High Priority (User Impact)
 
-#### 1. Trajectory Compression (Memory Management)
-**Why:** MEMORY.md can grow large over long sessions, increasing context cost and slowing retrieval.
-
-**What to do:**
-- Add compression pass that collapses old session messages into distilled facts
-- Preserve semantic meaning while reducing token count by 70-90%
-- Integrate with curator run: `curator.compress_sessions(age_days_threshold)`
-- Output: `<session_summary>` blocks in MEMORY.md with timestamps
-
-**Implementation hints:**
-- Use existing `distill_session_to_memory()` logic but operate backwards from oldest sessions
-- Respect `[agent].context_window` and prioritize recent+important content
-- Write compressed summaries as separate "compressed" type memories
-- Test: ensure no critical info loss in regression testing
-
-**Files to modify:**
-- `crates/hermes-core/src/memory.rs`: Add `compress_sessions(age_days: u64)` method
-- `crates/hermes-core/src/distillation.rs`: Reuse fact extraction logic for compression
-- `crates/hermes-core/src/curator.rs`: Add `memory_compression_days: usize` config option
-
-**Tests needed:**
-- Session compression preserves semantic meaning
-- Old uncompressed entries remain queryable
-- Memory file size reduction metrics
-
-**ETA:** ~4-6 hours engineering effort
+#### 1. ~~Trajectory Compression~~ (SHIPPED, fact-level)
+`[curator].compression_min_age_days` (default 60), `compression_max_importance` (90), `compression_min_count` (5). Deterministic fold of old, low-importance, unpinned `fact` blocks into a single `session_summary` per curator pass — no LLM, no token spend. Distilled (importance 90) and pinned facts are exempt. Inter-session *message* compression was scoped out: `MemoryManager` persists blocks, not transcripts (see `memory.rs` — sessions carry metadata only); lifting that ceiling is future work.
 
 ---
 
