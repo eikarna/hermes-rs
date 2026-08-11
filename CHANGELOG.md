@@ -3,7 +3,7 @@ All notable changes to this project will be documented in this file.
 format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this project adheres 
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-08-11
 
 ### Added
 - **Trajectory compression**: `[curator].compression_min_age_days` (default 60), `compression_max_importance` (90), `compression_min_count` (5) — old, low-importance, unpinned `fact` blocks fold into one deterministic `session_summary` per curator pass, keeping `MEMORY.md` lean without LLM cost
