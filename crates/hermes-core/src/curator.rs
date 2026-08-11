@@ -55,9 +55,18 @@ pub struct CurationPolicy {
     pub interval_secs: u64,
     /// When `false`, distilled draft skills are written under
     /// `<skills>/_pending/` and stay unloadable until a human approves them
-    /// (TUI `/skill approve <name>`). `true` writes them directly into the
-    /// loadable skills directory (previous behavior).
+    /// (TUI `a` key in the Skills panel). `true` writes them directly into
+    /// the loadable skills directory.
     pub auto_approve_skills: bool,
+    /// Days idle before a low-importance fact becomes a compression candidate.
+    /// `0` disables trajectory compression.
+    pub compression_min_age_days: u32,
+    /// Importance ceiling for compression candidates. Facts at or above this
+    /// value are never compressed (protects hand-curated/`importance(90)`
+    /// distilled blocks).
+    pub compression_max_importance: u8,
+    /// Minimum eligible facts needed before a compression block is created.
+    pub compression_min_count: usize,
 }
 
 // ponytail: skill-level pinning (front-matter `pinned: true`) — currently
@@ -76,6 +85,9 @@ impl Default for CurationPolicy {
             skill_distill_llm_summary: false,
             interval_secs: 0,
             auto_approve_skills: false,
+            compression_min_age_days: 60,
+            compression_max_importance: 90,
+            compression_min_count: 5,
         }
     }
 }
@@ -89,6 +101,8 @@ pub struct CurationReport {
     pub sessions_archived: usize,
     pub skills_archived: Vec<String>,
     pub skills_distilled: Vec<String>,
+    /// Facts folded into `session_summary` blocks this pass.
+    pub memories_compressed: usize,
 }
 
 impl CurationReport {
@@ -125,6 +139,7 @@ pub async fn curate_with_llm(
     curate_sessions(memory, policy, now, &mut report).await;
     archive_stale_skills(skills_dir, policy, now, &mut report)?;
     distill_skills_from_memory(memory, skills_dir, policy, client, model, &mut report).await?;
+    compress_old_facts(memory, policy, now, &mut report).await?;
 
     memory
         .save_to_disk()
@@ -199,6 +214,64 @@ async fn curate_memories(
             memory.update(block.clone()).await;
         }
     }
+}
+
+/// Fold many old, low-importance, unpinned facts into `session_summary`
+/// blocks and remove the originals. Runs after decay/dedup/prune so that
+/// pass operates on the surviving (still-valuable) set; distilled
+/// (`importance(90)`) and pinned facts never qualify. Deterministic —
+/// concatenation only, no LLM — so the curator stays offline & reproducible.
+async fn compress_old_facts(
+    memory: &MemoryManager,
+    policy: &CurationPolicy,
+    now: i64,
+    report: &mut CurationReport,
+) -> Result<()> {
+    if policy.compression_min_age_days == 0 || policy.compression_min_count == 0 {
+        return Ok(());
+    }
+    let age_limit = i64::from(policy.compression_min_age_days) * 86_400;
+    let mut candidates: Vec<MemoryBlock> = memory
+        .all()
+        .await
+        .into_iter()
+        .filter(|b| {
+            !b.pinned
+                && b.block_type == "fact"
+                && b.importance < policy.compression_max_importance
+                && now.saturating_sub(b.last_accessed) > age_limit
+        })
+        .collect();
+    if candidates.len() < policy.compression_min_count {
+        return Ok(());
+    }
+    // Oldest first so the summary reads chronologically.
+    candidates.sort_by_key(|b| b.created_at);
+
+    let batch = candidates.len().min(20); // one summary per pass; next pass folds the rest
+    let absorbed: Vec<MemoryBlock> = candidates.drain(..batch).collect();
+    let body = absorbed
+        .iter()
+        .map(|b| format!("- {}", b.content.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let summary_id = format!(
+        "compressed-{}-{}",
+        now,
+        absorbed.first().map(|b| b.created_at).unwrap_or(now)
+    );
+    let mut summary = MemoryBlock::new(summary_id, "session_summary", body)
+        .importance(60)
+        .tags(vec!["compressed".to_string(), "long_term".to_string()]);
+    summary.created_at = absorbed.first().map(|b| b.created_at).unwrap_or(now);
+    summary.last_accessed = now;
+
+    memory.store(summary).await;
+    for block in &absorbed {
+        memory.remove(&block.id).await;
+    }
+    report.memories_compressed += batch;
+    Ok(())
 }
 
 /// Archive sessions idle beyond the policy threshold.
@@ -494,6 +567,73 @@ mod tests {
             100
         );
         assert!(jaccard_pct("the quick brown fox", "completely different words") < 30);
+    }
+
+    #[tokio::test]
+    async fn compresses_old_low_importance_facts_into_summary() {
+        let dir = test_dir("compress");
+        let memory = MemoryManager::with_storage_dir(dir.clone());
+        // 5 old low-facts eligible; one recent + one distilled (importance 90)
+        // and one pinned stay untouched.
+        for i in 0..5 {
+            memory
+                .store(aged_block(
+                    &format!("old-{}", i),
+                    &format!("old fact {}", i),
+                    20,
+                    90,
+                ))
+                .await;
+        }
+        memory.store(aged_block("recent", "recent", 20, 1)).await;
+        memory
+            .store(aged_block("distilled", "distilled high", 90, 200))
+            .await;
+        let mut pinned = aged_block("pinned", "keep me", 10, 300);
+        pinned.pinned = true;
+        memory.store(pinned).await;
+
+        let policy = CurationPolicy {
+            memory_decay_days: 0, // isolate: decay could prune candidates first
+            memory_min_importance: 0,
+            dedup_threshold_pct: 100, // disable: "old fact N" bodies near-duplicate otherwise
+            compression_min_age_days: 60,
+            compression_max_importance: 90,
+            compression_min_count: 5,
+            ..CurationPolicy::default()
+        };
+        let skills = test_dir("compress_skills");
+        let report = curate(&memory, &skills, &policy).await.unwrap();
+        assert_eq!(report.memories_compressed, 5);
+        for i in 0..5 {
+            assert!(memory.get(&format!("old-{}", i)).await.is_none());
+        }
+        assert!(memory.get("recent").await.is_some());
+        assert!(memory.get("distilled").await.is_some());
+        assert!(memory.get("pinned").await.is_some());
+
+        let summaries = memory.get_by_type("session_summary").await;
+        assert_eq!(summaries.len(), 1);
+        let body = &summaries[0].content;
+        for i in 0..5 {
+            assert!(body.contains(&format!("old fact {}", i)), "missing: {}", i);
+        }
+        assert!(summaries[0].tags.iter().any(|t| t == "compressed"));
+
+        // Re-running finds nothing eligible.
+        let report = curate(&memory, &skills, &policy).await.unwrap();
+        assert_eq!(report.memories_compressed, 0);
+
+        // Under the minimum count, nothing compresses.
+        let memory2 = MemoryManager::with_storage_dir(test_dir("compress_min"));
+        memory2.store(aged_block("a", "one", 20, 90)).await;
+        memory2.store(aged_block("b", "two", 20, 90)).await;
+        let report = curate(&memory2, &skills, &policy).await.unwrap();
+        assert_eq!(report.memories_compressed, 0);
+        assert!(memory2.get("a").await.is_some());
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(skills);
     }
 
     #[tokio::test]
