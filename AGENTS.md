@@ -18,6 +18,8 @@
   - `cargo test --workspace`
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 
+- Commit in small staged units (`git add <specific files>` then commit); never bulk `git add -A` of unrelated changes
+
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
