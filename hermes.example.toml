@@ -29,6 +29,7 @@ show_reasoning = true
 
 repo_map_max_files = 500    # max files discovered for repo map scoring; cap huge repos
 # edit_format_override = "search_replace" # force edit hint: search_replace | patch | full_file
+auto_commit = false          # true: auto-commit a successful run's changes (Conventional Commit)
 # system_prompt = "You are Hermes."
 
 [autonomous]

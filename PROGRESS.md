@@ -61,37 +61,8 @@ Based on TODO.md tracking and natural progression after Aider integration, here 
 
 ---
 
-#### 2. Auto-commit Wiring (Git Integration Deepening)
-**Why:** Currently agent must manually run `/undo` or external tools commit changes. Seamless git workflow improves UX dramatically.
-
-**What to do:**
-- Wire `commit_transaction()` call automatically when `edit_block` or `patch` tool succeeds
-- Generate meaningful message based on edits made (reuse existing heuristic)
-- Handle edge cases: conflicts, staged changes, merge commits
-- Optional: configurable policy (always-commit vs confirm vs skip)
-
-**Implementation hints:**
-- In `patch_tool::execute()` / `edit_block_tool::execute()`, after successful writes:
-  ```rust
-  if let Ok(Some(commit_hash)) = harness.commit_transaction(&format!("Edit: {}", summary)) {
-      // Optionally notify user or store hash in state
-  }
-  ```
-- Consider adding `git_auto_commit: bool` to `[agent]` config
-- Track commit hashes in conversation history for audit trail
-
-**Files to modify:**
-- `crates/hermes-core/src/tools/patch_tool.rs`: Call `commit_transaction()` post-success
-- `crates/hermes-core/src/tools/edit_block_tool.rs`: Same, plus summarize edits for message
-- `crates/hermes-core/src/githarness.rs`: Add helper for message generation from edit diffs
-- `crates/hermes-core/src/config.rs`: Add `auto_commit: bool` to BehaviorSettings
-
-**Tests needed:**
-- Automatic commit generates correct conventional message
-- Fallback gracefully when no git repo or uncommitted work
-- Conflicts handled cleanly
-
-**ETA:** ~3-4 hours engineering effort
+#### 2. ~~Auto-commit Wiring~~ (SHIPPED, run-level)
+`[agent].auto_commit = true` auto-commits a successful interactive run's working-tree changes via `GitHarness::commit_transaction` (Conventional Commit derived from staged diff). Wired at TUI run completion (`tui/app.rs` `finish_run_if_ready`) rather than per-tool call: run-level commits respect `/undo` as the intermediate rollback and batch all of a run's edits into one commit. Autonomous mode already committed per tick.
 
 ---
 
