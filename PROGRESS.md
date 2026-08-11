@@ -42,34 +42,8 @@ Based on TODO.md tracking and natural progression after Aider integration, here 
 
 ---
 
-#### 3. Gemini Adapter (Provider Expansion)
-**Why:** Gemini is major competitor with strong performance/money ratio; users expect parity across providers.
-
-**What to do:**
-- Implement `GeminiClient` struct with streaming/non-streaming chat paths
-- Map capabilities table rows for Gemini models (gemini-pro, gemini-advanced, etc.)
-- Handle Gemini's specific API format (REST endpoint differences from OpenAI-compatible)
-- Support function calling equivalent (Gemini uses same JSON schemas)
-- Update docs with examples and cost tables
-
-**Implementation hints:**
-- Base structure on `OpenAIClient` since Gemini has REST-compatible patterns
-- Endpoint: `https://generativelanguage.googleapis.com/v1/models/{model}:generateContent`
-- Key differences: needs API key in header/query param, response wrapper different
-- Tools schema same as OpenAI, so reuse existing `ToolSchema` types
-
-**Files to modify:**
-- `crates/hermes-core/src/client/`: New `gemini.rs` module
-- `crates/hermes-core/src/client.rs`: Add `ProviderKind::Gemini` variant
-- `crates/hermes-core/src/client/provider.rs`: Capability rows for Gemini models
-- `crates/hermes-cli/src/main.rs`: Runtime client factory for Gemini
-
-**Tests needed:**
-- Mock server tests for generateContent endpoint
-- Streaming delta parsing matches Gemini SSE format
-- Capability lookup returns correct values for Gemini model names
-
-**ETA:** ~6-8 hours engineering effort
+#### 3. ~~Gemini Adapter~~ (SHIPPED)
+`crates/hermes-core/src/client/gemini.rs`: `generateContent` + `streamGenerateContent?alt=sse` (one-shot replay through shared SSE parser — true token streaming is next), `systemInstruction`/`contents`/`functionDeclarations` translation, `functionCall`↔`tool_calls` mapping. Capability rows for gemini-2.5-pro/flash + generic `gemini-` fallback in `provider.rs`; `[client.gemini]` section + `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `GEMINI_TIMEOUT_SECS` env overrides in `config.rs`; `ProviderKind::Gemini` plumbed through `resolve_provider_settings`, `build_provider_for_kind`, CLI factory error text. Chose `v1beta` (current stable surface with function calling + streaming).
 
 ---
 

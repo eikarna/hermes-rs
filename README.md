@@ -118,6 +118,7 @@ timeout_secs = 60
 # [client.anthropic]  # uses ANTHROPIC_API_KEY when api_key is omitted
 # [client.openrouter] # uses OPENROUTER_API_KEY when api_key is omitted
 # [client.ollama]     # defaults to http://localhost:11434/v1
+# [client.gemini]     # uses GEMINI_API_KEY; base defaults to generativelanguage.googleapis.com/v1beta
 
 [agent]
 model = "gpt-4"
@@ -152,7 +153,7 @@ output_cost_per_million = 0.0
 Or use environment variables:
 
 ```bash
-export HERMES_PROVIDER=openai # anthropic | ollama | openrouter
+export HERMES_PROVIDER=openai # anthropic | ollama | openrouter | gemini
 export OPENAI_API_KEY=your_api_key_here
 export OPENAI_BASE_URL=https://api.openai.com/v1
 export HERMES_MODEL=gpt-4

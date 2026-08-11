@@ -17,7 +17,7 @@
 - Workspace context-file auto-loading with prompt-injection scanning for agent guidance files
 - Sub-agent delegation as an opt-in built-in tool through `delegate_to_sub_agent`
 
-- Model-agnostic provider routing with an internal `LLMProvider` trait, provider capability metadata, `[client].provider` selection, and native adapters for OpenAI, Anthropic, Ollama, and OpenRouter
+- Model-agnostic provider routing with an internal `LLMProvider` trait, provider capability metadata, `[client].provider` selection, and native adapters for OpenAI, Anthropic, Ollama, OpenRouter, and Gemini
 - Tree-sitter AST symbol extraction (C, Python, Rust, TypeScript) with personalized PageRank repository mapping and token-budgeted `<repo_map>` rendering
 - Aider-style SEARCH/REPLACE edit block parser (`parse_edit_blocks`), atomic multi-edit `edit_block` tool with exact + fuzzy matching, and capability-driven routing that injects an `<edit_format>` hint when the provider advertises `EditFormat::SearchReplace`
 - Per-model capability tables with longest-prefix matching (`lookup_capabilities`) covering Claude, GPT, and o-series models, richer metadata (`supports_vision`, `supports_tool_calls`), and a `patch`-tool hint for models advertising `EditFormat::Patch`
@@ -32,6 +32,5 @@
 
 ## Pending
 
-- [Providers] Add Gemini adapter with its own capability rows (currently falls through OpenAI-compatible default and gets table prefixes only if a Gemini alias matches)
 - [Release] Bump to `0.2.0` and tag for the next binary release once Phases 4–5 soak in (repo map + edit blocks + git harness + curator)
 

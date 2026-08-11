@@ -10,7 +10,7 @@
 
 Phase-by-phase reality check against the original scope:
 
-- **Phase 1 (provider routing):** shipped, plus per-model capability tables with longest-prefix matching (`lookup_capabilities`), `supports_vision` / `supports_tool_calls` fields, and `<edit_format>` prompt hints routed from advertised capabilities.
+- **Phase 1 (provider routing):** shipped with native OpenAI, Anthropic, Ollama, OpenRouter, and Gemini adapters, plus per-model capability tables with longest-prefix matching (`lookup_capabilities`), `supports_vision` / `supports_tool_calls` fields, and `<edit_format>` prompt hints routed from advertised capabilities.
 - **Phase 2 (repo map):** shipped (tree-sitter C/Python/Rust/TypeScript, personalized PageRank, token-budgeted renderer). Discovery is capped at 500 files before ranking (`discover_source_files_with_limit`). Format follows Aider's outline style; incremental file-watcher ranking not ported.
 - **Phase 3 (edit blocks):** shipped (`edit_block` tool, atomic multi-edit, exact+fuzzy sharing `patch` matching, parsed via `parse_edit_blocks`; model-level routing via `EditFormat::SearchReplace`/`Patch`).
 - **Phase 4 (git harness):** shipped (`hermes_core::githarness` with snapshot/guard/commit/undo; TUI `/undo`). `commit_transaction` runs per tick in autonomous mode and post-run in the TUI when `[agent].auto_commit = true`.

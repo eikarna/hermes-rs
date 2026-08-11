@@ -1,7 +1,7 @@
 # Hermes-RS configuration example
 
 [client]
-provider = "openai" # openai | anthropic | ollama | openrouter
+provider = "openai" # openai | anthropic | ollama | openrouter | gemini
 base_url = "https://api.openai.com/v1"
 # api_key = "set me or use OPENAI_API_KEY"
 # auth_ref = "openai-default" # optional profile from `hermes auth set-api-key openai`
@@ -15,6 +15,9 @@ max_context_length = 128000
 # api_key = "or set OPENROUTER_API_KEY"
 # [client.ollama]
 # base_url = "http://localhost:11434/v1" # or OLLAMA_BASE_URL
+# [client.gemini]
+# api_key = "or set GEMINI_API_KEY"
+# base_url = "https://generativelanguage.googleapis.com/v1beta"
 
 [agent]
 model = "gpt-4"
