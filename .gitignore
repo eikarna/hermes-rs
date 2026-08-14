@@ -33,3 +33,6 @@ USER.md
 
 # Serena MCP local index/cache
 .serena/
+
+# Local Hermes runtime config (provider/auth_ref/model — user-specific)
+hermes.toml

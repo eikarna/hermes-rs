@@ -1,12 +1,20 @@
 # Hermes-RS configuration example
 
 [client]
-provider = "openai" # openai | anthropic | ollama | openrouter | gemini
+provider = "openai" # openai | anthropic | ollama | openrouter | gemini | nous
 base_url = "https://api.openai.com/v1"
 # api_key = "set me or use OPENAI_API_KEY"
 # auth_ref = "openai-default" # optional profile from `hermes auth set-api-key openai`
 timeout_secs = 60
 max_context_length = 128000
+
+# Nous Portal (OAuth device-code login):
+#   hermes auth login nous           # opens a browser device-code flow, stores tokens
+#   [client]
+#   provider = "nous"
+#   auth_ref = "nous-default"        # the OAuth profile created above; no api_key needed
+# The stored access token is a short-lived invoke JWT; Hermes refreshes it
+# automatically from the persisted refresh token before each request.
 
 # Optional provider endpoint overrides:
 # [client.anthropic]

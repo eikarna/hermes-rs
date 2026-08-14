@@ -179,6 +179,35 @@ Then point `[client].auth_ref` at the profile name, for example `openai-default`
 
 Current provider names are `Google`, `GitHub Copilot`, `OpenAI`, and `Anthropic`. `hermes auth providers` prints aliases, API-key environment variables, bearer-token defaults, documented auth methods, Hermes-supported environment sources, and implementation notes. `hermes auth login <provider>` prints provider-specific setup guidance and exits without creating credentials until Hermes has secure token storage and provider-specific login flows.
 
+### Nous Portal (OAuth device-code login)
+
+Hermes-RS supports the Nous Portal device-code OAuth flow natively — no API key required:
+
+```bash
+hermes auth login nous
+# opens https://portal.nousresearch.com in your browser; approve the device code
+```
+
+This stores an OAuth profile (`nous-default`) in the auth store. The access token is a short-lived invoke JWT; Hermes refreshes it automatically from the persisted refresh token before each inference request. Then point the client at it:
+
+```toml
+[client]
+provider = "nous"
+auth_ref = "nous-default"
+```
+
+Or with CLI flags:
+
+```bash
+hermes chat --auth-ref nous-default   # provider defaults to "nous" when auth_ref is an OAuth profile
+```
+
+To remove the stored credentials:
+
+```bash
+hermes auth logout nous
+```
+
 Provider reality check:
 
 - **OpenAI**: Hermes supports API-key profiles today. OpenAI also documents ChatGPT/Codex browser login, device/headless login, and access-token/cache workflows for Codex, but Hermes has not wired those OAuth credentials into runtime requests yet.
