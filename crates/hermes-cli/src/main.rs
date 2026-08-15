@@ -271,7 +271,7 @@ fn apply_cli_overrides(cli: &Cli, config: &mut AppConfig) {
 fn client_config(config: &AppConfig) -> Result<(ProviderKind, ClientConfig)> {
     let kind = ProviderKind::from_name(&config.client.provider).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unsupported client provider '{}'. Expected one of: openai, anthropic, ollama, openrouter, gemini.",
+            "Unsupported client provider '{}'. Expected one of: openai, anthropic, ollama, openrouter, gemini, nous.",
             config.client.provider
         )
     })?;
@@ -291,6 +291,37 @@ fn client_config(config: &AppConfig) -> Result<(ProviderKind, ClientConfig)> {
     Ok((kind, client))
 }
 
+/// Resolve the runtime provider, refreshing an OAuth profile's access token
+/// (and persisting the rotated tokens) when needed.
+async fn runtime_client_with_store(
+    config: &AppConfig,
+    mut store: AuthStore,
+) -> Result<(ProviderKind, ClientConfig)> {
+    let auth_ref = config
+        .client
+        .auth_ref
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Missing auth_ref for OAuth profile"))?;
+    let access_token = store.resolve_oauth_token(auth_ref).await?;
+    let profile = store
+        .profiles
+        .get(auth_ref)
+        .ok_or_else(|| anyhow::anyhow!("Auth profile '{}' disappeared", auth_ref))?;
+    let inference_base_url = profile
+        .oauth
+        .as_ref()
+        .map(|t| t.inference_base_url.clone())
+        .or_else(|| profile.base_url.clone())
+        .unwrap_or_else(|| hermes_core::auth::NOUS_INFERENCE_URL.to_string());
+    let client = ClientConfig {
+        base_url: inference_base_url,
+        api_key: Some(access_token),
+        timeout: Duration::from_secs(config.client.timeout_secs.max(1)),
+        max_context_length: config.client.max_context_length,
+    };
+    Ok((ProviderKind::Nous, client))
+}
+
 fn infer_provider_from_base_url(base_url: &str) -> ProviderKind {
     let normalized = base_url.trim_end_matches('/').to_ascii_lowercase();
     if normalized.contains(".anthropic.com") {
@@ -299,12 +330,24 @@ fn infer_provider_from_base_url(base_url: &str) -> ProviderKind {
         ProviderKind::Openrouter
     } else if normalized.contains("localhost:11434") || normalized.contains("127.0.0.1:11434") {
         ProviderKind::Ollama
+    } else if normalized.contains("nousresearch.com") {
+        ProviderKind::Nous
     } else {
         ProviderKind::Openai
     }
 }
 
-fn runtime_client(config: &AppConfig) -> Result<Arc<dyn LLMProvider>> {
+async fn runtime_client(config: &AppConfig) -> Result<Arc<dyn LLMProvider>> {
+    // OAuth profiles need a live token refresh before the client is built.
+    if let Some(auth_ref) = config.client.auth_ref.as_deref() {
+        if let Ok(store) = AuthStore::load_default() {
+            if store.profiles.get(auth_ref).map(|p| p.method) == Some(AuthMethod::Oauth) {
+                let (kind, client) = runtime_client_with_store(config, store).await?;
+                return build_provider_for_kind(kind, client)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()));
+            }
+        }
+    }
     let (kind, client) = client_config(config)?;
     build_provider_for_kind(kind, client).map_err(|error| anyhow::anyhow!(error.to_string()))
 }
@@ -329,6 +372,7 @@ fn apply_auth_profile_to_client(
             }
             AuthMethod::ApiKey => None,
             AuthMethod::BearerToken => None,
+            AuthMethod::Oauth => profile.oauth.as_ref().map(|t| t.inference_base_url.clone()),
         })
         .ok_or_else(|| anyhow::anyhow!("Auth profile '{}' requires a base URL", auth_ref))?;
     let default_base_url = hermes_core::config::ClientSettings::default().base_url;
@@ -346,6 +390,10 @@ fn apply_auth_profile_to_client(
         }
         AuthMethod::BearerToken => {
             client.api_key = Some(store.resolve_auth_token(auth_ref)?);
+        }
+        AuthMethod::Oauth => {
+            // The live access token is minted/refreshed in runtime_client
+            // before the provider is built; nothing to resolve here.
         }
     }
     client.base_url = trusted_base_url;
@@ -432,7 +480,7 @@ pub(crate) async fn create_runtime_agent(
     event_tx: mpsc::Sender<AgentEvent>,
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
-    let client = runtime_client(config)?;
+    let client = runtime_client(config).await?;
     let registry = build_registry(config, mcp_manager, &client, &behavior.model).await?;
     let agent_config = agent_config(config, behavior, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
@@ -447,7 +495,7 @@ async fn create_agent_without_events(
     system_prompt: Option<&str>,
     mcp_manager: &mut McpManager,
 ) -> Result<HermesAgent> {
-    let client = runtime_client(config)?;
+    let client = runtime_client(config).await?;
     let registry = build_registry(config, mcp_manager, &client, &config.agent.model).await?;
     let agent_config = agent_config(config, &config.agent, system_prompt);
     let memory_manager = load_repo_memory_manager().await?;
@@ -469,6 +517,7 @@ async fn load_repo_memory_manager() -> Result<MemoryManager> {
     let curated = memory_manager.clone();
     let client_and_model = if policy.skill_distill_llm_summary {
         runtime_client(&config)
+            .await
             .ok()
             .map(|client| (client, config.agent.model.clone()))
     } else {
@@ -555,7 +604,7 @@ async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result
 
 async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let client = runtime_client(config)?;
+    let client = runtime_client(config).await?;
     let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let tools = registry.get_schemas().await;
 
@@ -571,7 +620,7 @@ async fn list_tools(config: &AppConfig, verbose: bool) -> Result<()> {
 
 async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> Result<()> {
     let mut mcp_manager = McpManager::new();
-    let client = runtime_client(config)?;
+    let client = runtime_client(config).await?;
     let registry = build_registry(config, &mut mcp_manager, &client, &config.agent.model).await?;
     let parsed_args: Value = if let Some(args) = args {
         serde_json::from_str(args).context("Failed to parse tool arguments as JSON")?
@@ -597,11 +646,14 @@ async fn test_tool(config: &AppConfig, tool_name: &str, args: Option<&str>) -> R
     Ok(())
 }
 
-fn handle_auth_command(command: &AuthCommands) -> Result<()> {
+async fn handle_auth_command(command: &AuthCommands) -> Result<()> {
     match command {
         AuthCommands::Providers => print_auth_providers(),
         AuthCommands::Login { provider } => {
             let provider = canonical_provider(provider)?;
+            if provider.slug == "nous" {
+                return login_nous().await;
+            }
             print_auth_login_guidance(provider);
             anyhow::bail!(
                 "Hermes does not run '{}' login flows yet; use the listed external credential source and create an auth profile with set-api-key or set-bearer-token.",
@@ -715,6 +767,62 @@ fn handle_auth_command(command: &AuthCommands) -> Result<()> {
     Ok(())
 }
 
+/// Run the Nous Portal device-code OAuth login and persist the resulting
+/// tokens as an `OAuth` auth profile (`nous-default`).
+async fn login_nous() -> Result<()> {
+    use hermes_core::auth::{
+        oauth_profile_from_token_response, poll_nous_device_token, request_nous_device_code,
+        AuthMethod, AuthStore, NOUS_CLIENT_ID, NOUS_INFERENCE_URL, NOUS_PORTAL_URL, NOUS_SCOPE,
+    };
+
+    println!("Starting Nous Portal device-code login...");
+    let device = request_nous_device_code(NOUS_PORTAL_URL, NOUS_CLIENT_ID, NOUS_SCOPE).await?;
+
+    println!();
+    println!("To complete login, open this URL in your browser and approve the request:");
+    println!("  {}", device.verification_uri_complete);
+    if !device.user_code.is_empty() {
+        println!("  Your code: {}", device.user_code);
+    }
+    println!();
+    println!(
+        "Waiting for approval (expires in {}s)...",
+        device.expires_in
+    );
+
+    let token = poll_nous_device_token(
+        NOUS_PORTAL_URL,
+        NOUS_CLIENT_ID,
+        &device.device_code,
+        device.expires_in,
+        device.interval,
+    )
+    .await?;
+
+    let profile = oauth_profile_from_token_response(
+        "nous-default",
+        "nous",
+        &token,
+        NOUS_PORTAL_URL,
+        NOUS_INFERENCE_URL,
+        NOUS_CLIENT_ID,
+        NOUS_SCOPE,
+    );
+    if profile.method != AuthMethod::Oauth {
+        anyhow::bail!("Internal error: generated a non-OAuth Nous profile");
+    }
+
+    let mut store = AuthStore::load_default()?;
+    store.profiles.insert("nous-default".to_string(), profile);
+    store.save_default()?;
+
+    println!();
+    println!("Saved Nous Portal OAuth profile 'nous-default'.");
+    println!("Auth metadata: {}", default_auth_store_path().display());
+    println!("Next: set `provider = \"nous\"` and `auth_ref = \"nous-default\"` in hermes.toml, then run `hermes chat`.");
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProviderInfo {
     name: &'static str,
@@ -812,6 +920,21 @@ const AUTH_PROVIDERS: &[ProviderInfo] = &[
         login_guidance: &[
             "For current Hermes runtime use, create an Anthropic Console API key and run `hermes auth set-api-key Anthropic --env ANTHROPIC_API_KEY --base-url <anthropic-compatible-endpoint>`.",
             "Claude account login, Team/Enterprise, Vertex AI, Amazon Bedrock, and Microsoft Foundry need provider-specific clients before Hermes can use those credentials directly.",
+        ],
+    },
+    ProviderInfo {
+        name: "Nous Portal",
+        slug: "nous",
+        aliases: &["nous", "nous portal", "nous-portal", "nous research", "nous-research"],
+        api_key_env: "NOUS_API_KEY",
+        api_key_envs: &["NOUS_API_KEY"],
+        bearer_env: None,
+        documented_auth: &["OAuth device-code flow", "subscription proxy token"],
+        hermes_sources: &["hermes auth login nous"],
+        notes: "Hermes runs the device-code OAuth flow; the access token is a short-lived invoke JWT stored in the auth store.",
+        login_guidance: &[
+            "Run `hermes auth login nous`, open the printed URL in a browser, approve the device code, and Hermes stores the OAuth tokens.",
+            "Then set `[client] provider = \"nous\"` and `auth_ref = \"nous-default\"` (or CLI `--auth-ref nous-default`), and run `hermes chat`.",
         ],
     },
 ];
@@ -1055,7 +1178,7 @@ async fn main() -> Result<()> {
             test_tool(&loaded.config, tool_name, args.as_deref()).await?;
         }
         Commands::Auth { command } => {
-            handle_auth_command(command)?;
+            handle_auth_command(command).await?;
         }
     }
 
@@ -1209,11 +1332,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn auth_login_guidance_does_not_create_profile() {
+    #[tokio::test]
+    async fn auth_login_guidance_does_not_create_profile() {
         let result = handle_auth_command(&AuthCommands::Login {
             provider: "OpenAI".to_string(),
-        });
+        })
+        .await;
 
         assert!(result.is_err());
         assert!(result
@@ -1400,6 +1524,7 @@ mod tests {
                 base_url: None,
                 secret_ref: "env:GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
                 disabled: false,
+                oauth: None,
             },
         );
         let client = ClientConfig {
