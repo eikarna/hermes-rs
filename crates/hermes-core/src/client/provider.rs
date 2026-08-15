@@ -231,6 +231,8 @@ pub enum ProviderKind {
     Ollama,
     Openrouter,
     Gemini,
+    /// Nous Portal: OAuth-authenticated, OpenAI-compatible inference API.
+    Nous,
 }
 
 impl ProviderKind {
@@ -242,6 +244,7 @@ impl ProviderKind {
             "ollama" => Some(Self::Ollama),
             "openrouter" => Some(Self::Openrouter),
             "gemini" | "google" => Some(Self::Gemini),
+            "nous" => Some(Self::Nous),
             _ => None,
         }
     }
@@ -250,7 +253,7 @@ impl ProviderKind {
     pub fn parse_configured(name: &str) -> Result<Self> {
         Self::from_name(name).ok_or_else(|| {
             crate::error::Error::Config(format!(
-                "Unsupported client provider '{}'. Expected one of: openai, anthropic, ollama, openrouter, gemini.",
+                "Unsupported client provider '{}'. Expected one of: openai, anthropic, ollama, openrouter, gemini, nous.",
                 name
             ))
         })
@@ -263,6 +266,7 @@ impl ProviderKind {
             Self::Ollama => "ollama",
             Self::Openrouter => "openrouter",
             Self::Gemini => "gemini",
+            Self::Nous => "nous",
         }
     }
 }
@@ -319,6 +323,7 @@ pub enum ProviderClient {
     Openrouter(OpenAIClient),
     Anthropic(AnthropicClient),
     Gemini(crate::client::gemini::GeminiClient),
+    Nous(OpenAIClient),
 }
 
 #[async_trait]
@@ -330,7 +335,7 @@ impl LLMProvider for ProviderClient {
         tools: Option<&[ToolSchema]>,
     ) -> Result<ChatResponse> {
         match self {
-            Self::Openai(c) | Self::Ollama(c) | Self::Openrouter(c) => {
+            Self::Openai(c) | Self::Ollama(c) | Self::Openrouter(c) | Self::Nous(c) => {
                 c.chat(model, messages, tools).await
             }
             Self::Anthropic(c) => c.chat(model, messages, tools).await,
@@ -345,7 +350,7 @@ impl LLMProvider for ProviderClient {
         tools: Option<&[ToolSchema]>,
     ) -> Result<ChatStreamResponse> {
         match self {
-            Self::Openai(c) | Self::Ollama(c) | Self::Openrouter(c) => {
+            Self::Openai(c) | Self::Ollama(c) | Self::Openrouter(c) | Self::Nous(c) => {
                 c.chat_streaming(model, messages, tools).await
             }
             Self::Anthropic(c) => c.chat_streaming(model, messages, tools).await,
@@ -355,7 +360,9 @@ impl LLMProvider for ProviderClient {
 
     fn capabilities(&self, model: &str) -> ProviderCapabilities {
         match self {
-            Self::Openai(c) | Self::Ollama(c) | Self::Openrouter(c) => c.capabilities(model),
+            Self::Openai(c) | Self::Ollama(c) | Self::Openrouter(c) | Self::Nous(c) => {
+                c.capabilities(model)
+            }
             Self::Anthropic(c) => c.capabilities(model),
             Self::Gemini(c) => c.capabilities(model),
         }
@@ -375,6 +382,7 @@ pub fn resolve_provider_settings(
         ProviderKind::Openrouter => "https://openrouter.ai/api/v1",
         ProviderKind::Anthropic => "https://api.anthropic.com/v1",
         ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta",
+        ProviderKind::Nous => crate::auth::NOUS_INFERENCE_URL,
     };
 
     let base_url = settings
@@ -432,7 +440,10 @@ pub fn build_provider_for_kind(
     client_config: crate::client::ClientConfig,
 ) -> Result<Arc<dyn LLMProvider>> {
     let client: Arc<dyn LLMProvider> = match kind {
-        ProviderKind::Openai | ProviderKind::Ollama | ProviderKind::Openrouter => {
+        ProviderKind::Openai
+        | ProviderKind::Ollama
+        | ProviderKind::Openrouter
+        | ProviderKind::Nous => {
             Arc::new(ProviderClient::from_openai_compatible(kind, client_config))
         }
         ProviderKind::Anthropic => Arc::new(AnthropicClient::new(client_config)?),
@@ -450,6 +461,7 @@ impl ProviderClient {
             ProviderKind::Openai => ProviderClient::Openai(OpenAIClient::new(config)),
             ProviderKind::Ollama => ProviderClient::Ollama(OpenAIClient::new(config)),
             ProviderKind::Openrouter => ProviderClient::Openrouter(OpenAIClient::new(config)),
+            ProviderKind::Nous => ProviderClient::Nous(OpenAIClient::new(config)),
             _ => unreachable!("from_openai_compatible only accepts non-Anthropic providers"),
         }
     }

@@ -124,6 +124,9 @@ impl OpenAIClient {
                     }
                     AuthMethod::ApiKey => None,
                     AuthMethod::BearerToken => None,
+                    AuthMethod::Oauth => {
+                        profile.oauth.as_ref().map(|t| t.inference_base_url.clone())
+                    }
                 })
                 .ok_or_else(|| {
                     Error::Config(format!("Auth profile '{}' requires a base URL", auth_ref))
@@ -141,6 +144,10 @@ impl OpenAIClient {
                 }
                 AuthMethod::BearerToken => {
                     config.api_key = Some(store.resolve_auth_token(auth_ref)?);
+                }
+                AuthMethod::Oauth => {
+                    // The live access token is minted/refreshed by the caller
+                    // before constructing the client; nothing to resolve here.
                 }
             }
             config.base_url = trusted_base_url;
@@ -1632,6 +1639,7 @@ mod tests {
                 base_url: None,
                 secret_ref: "env:GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
                 disabled: false,
+                oauth: None,
             },
         );
         store.save_default().unwrap();
