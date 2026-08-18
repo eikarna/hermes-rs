@@ -75,8 +75,13 @@ pub struct OpenAIClient {
 impl OpenAIClient {
     /// Create a new OpenAI client
     pub fn new(config: ClientConfig) -> Self {
+        // connect_timeout: give up fast if the host is unreachable.
+        // read_timeout: per-read deadline, so long streaming responses
+        // (reasoning models) never get cut off mid-stream — the deadline
+        // only fires if the server goes silent.
         let http_client = Client::builder()
-            .timeout(config.timeout)
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(config.timeout)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -308,7 +313,8 @@ impl AnthropicClient {
     /// `/messages` is appended when routing requests.
     pub fn new(config: ClientConfig) -> Result<Self> {
         let http_client = Client::builder()
-            .timeout(config.timeout)
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(config.timeout)
             .build()
             .map_err(|e| Error::Config(format!("Failed to create HTTP client: {}", e)))?;
         Ok(Self {

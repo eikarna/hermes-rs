@@ -56,6 +56,7 @@ pub mod parser;
 pub mod platform;
 pub mod repomap;
 pub mod schema;
+pub mod session_store;
 pub mod skills;
 pub mod tools;
 pub mod trajectory;
@@ -85,7 +86,10 @@ pub use context_files::{
 pub use curator::{curate, CurationPolicy, CurationReport};
 pub use distillation::{distill_session_to_memory, distill_session_with_provider};
 pub use error::{Error, Result};
-pub use gateway::{Gateway, GatewayConfig, PlatformAdapter};
+pub use gateway::{
+    DiscordAdapter, Gateway, GatewayConfig, IncomingMessage, MessageHandler, OutgoingMessage,
+    PlatformAdapter, SlackAdapter, TelegramAdapter,
+};
 pub use githarness::{GitHarness, RepoSnapshot};
 pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};
 pub use memory::{MemoryBlock, MemoryManager, Session, UserProfile};

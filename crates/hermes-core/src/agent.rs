@@ -83,7 +83,12 @@ pub enum AgentEvent {
     /// Model reasoning content
     Reasoning { text: String },
     /// Tool execution started
-    ToolStart { name: String, arguments: String },
+    ToolStart {
+        /// Tool call ID (correlates with ToolComplete's result.tool_call_id)
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
     /// Tool execution completed
     ToolComplete { result: ToolResult },
     /// Tool execution failed
@@ -117,7 +122,13 @@ pub struct HermesAgent {
     client: Arc<dyn LLMProvider>,
     registry: ToolRegistry,
     conversation: Arc<RwLock<Vec<Message>>>,
-    event_tx: Option<mpsc::Sender<AgentEvent>>,
+    /// Event sender. Wrapped in a Mutex so gateway runs can swap the sink
+    /// per-run (one shared agent, many sequential chat turns).
+    event_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<AgentEvent>>>>,
+    /// Cooperative cancellation flag. Set externally (e.g. by the gateway on
+    /// user interrupt); checked between iterations, per stream chunk, and
+    /// before each tool execution.
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     memory_manager: Option<MemoryManager>,
     /// Lazily-rendered `<repo_map>` block; parsed once per agent so per-turn
     /// message rebuilds stay cheap.
@@ -141,7 +152,8 @@ impl HermesAgent {
             client,
             registry,
             conversation: Arc::new(RwLock::new(Vec::new())),
-            event_tx: None,
+            event_tx: Arc::new(std::sync::Mutex::new(None)),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -169,10 +181,37 @@ impl HermesAgent {
             client,
             registry,
             conversation: Arc::new(RwLock::new(Vec::new())),
-            event_tx: Some(event_tx),
+            event_tx: Arc::new(std::sync::Mutex::new(Some(event_tx))),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    /// Swap the event sink for the next run. Lets a long-lived shared agent
+    /// stream events to a fresh per-run consumer (e.g. a gateway turn).
+    pub fn set_event_sender(&self, sender: Option<mpsc::Sender<AgentEvent>>) {
+        if let Ok(mut guard) = self.event_tx.lock() {
+            *guard = sender;
+        }
+    }
+
+    /// Get a handle to the cancellation flag. Setting it to `true` stops the
+    /// current run at the next checkpoint (iteration boundary, stream chunk,
+    /// or tool start).
+    pub fn cancel_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.cancel_flag.clone()
+    }
+
+    /// Request cancellation of the current run.
+    pub fn cancel(&self) {
+        self.cancel_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_flag.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Attach a memory manager for long-term memory injection and session distillation.
@@ -183,7 +222,13 @@ impl HermesAgent {
 
     /// Send an event to the channel
     async fn emit(&self, event: AgentEvent) {
-        if let Some(ref tx) = self.event_tx {
+        let tx = {
+            self.event_tx
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+        };
+        if let Some(tx) = tx {
             let _ = tx.send(event).await;
         }
     }
@@ -213,6 +258,26 @@ impl HermesAgent {
     /// Run the agent with a user query
     #[instrument(skip(self), fields(model = % self.config.model))]
     pub async fn run(&self, user_query: String) -> Result<Message> {
+        // Clear any stale cancellation from a previous run, then run with
+        // the agent's own flag.
+        self.cancel_flag
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.run_with_cancel(user_query, self.cancel_flag()).await
+    }
+
+    /// Run the agent with an external cancellation flag.
+    ///
+    /// The flag is checked at every iteration boundary, per streamed chunk,
+    /// and before each tool execution. When it trips, the run stops and
+    /// returns [`Error::Cancelled`] after repairing the conversation (any
+    /// committed assistant tool_calls message gets tool results — real or
+    /// placeholder — so the next request stays valid).
+    #[instrument(skip(self, cancel), fields(model = % self.config.model))]
+    pub async fn run_with_cancel(
+        &self,
+        user_query: String,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Message> {
         info!("Starting agent run");
 
         // Add user message
@@ -225,6 +290,13 @@ impl HermesAgent {
         loop {
             iteration += 1;
             debug!(iteration, "Agent iteration");
+
+            // Cancellation checkpoint: between iterations.
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                info!("Agent run cancelled at iteration boundary");
+                self.repair_conversation_after_cancel().await;
+                return Err(Error::Cancelled);
+            }
 
             if iteration > self.config.max_iterations {
                 error!(max = self.config.max_iterations, "Max iterations exceeded");
@@ -256,7 +328,10 @@ impl HermesAgent {
                     .client
                     .chat_streaming(&self.config.model, &request_messages, Some(&tools))
                     .await?;
-                match self.process_stream(stream, &preflight_telemetry).await {
+                match self
+                    .process_stream(stream, &preflight_telemetry, &cancel)
+                    .await
+                {
                     Ok((response_text, reasoning_text, tool_calls)) => {
                         self.emit_stream_telemetry(
                             &preflight_telemetry,
@@ -303,7 +378,7 @@ impl HermesAgent {
                     }
 
                     // Execute tools and add results
-                    let tool_results = self.execute_tools(tool_calls).await?;
+                    let tool_results = self.execute_tools(tool_calls, &cancel).await?;
 
                     for result in &tool_results {
                         if result.success {
@@ -561,6 +636,7 @@ impl HermesAgent {
         &self,
         mut stream: ChatStreamResponse,
         preflight: &AgentTelemetry,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(String, String, Vec<ToolCall>)> {
         let mut parser = ToolCallStreamParser::new().on_tool_call(|tc| {
             let tc_id = tc.id.clone();
@@ -574,6 +650,14 @@ impl HermesAgent {
         let mut has_error = false;
 
         while let Some(event_result) = stream.next().await {
+            // Cancellation checkpoint: per streamed chunk. Drop the stream
+            // and bail out; whatever text accumulated is discarded (the run
+            // never commits a partial assistant message).
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                info!("Agent run cancelled mid-stream");
+                drop(stream);
+                return Err(Error::Cancelled);
+            }
             match event_result {
                 Ok(event) => {
                     // Process the event
@@ -740,15 +824,32 @@ impl HermesAgent {
     }
 
     /// Execute tools and handle self-healing
-    async fn execute_tools(&self, tool_calls: Vec<ToolCall>) -> Result<Vec<ToolResult>> {
+    async fn execute_tools(
+        &self,
+        tool_calls: Vec<ToolCall>,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<ToolResult>> {
         let mut results = Vec::new();
 
         for tool_call in tool_calls {
+            // Cancellation checkpoint: before each tool. Remaining tool calls
+            // get placeholder results so the assistant message (already
+            // committed to the conversation) stays paired with tool results.
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                info!(tool = %tool_call.function.name, "Agent run cancelled before tool execution");
+                results.push(ToolResult::error(
+                    &tool_call.id,
+                    "Tool execution cancelled by user".to_string(),
+                ));
+                continue;
+            }
+
             let name = tool_call.function.name.clone();
             let args_str = tool_call.function.arguments.clone();
 
             debug!(tool = %name, args = %args_str, "Executing tool");
             self.emit(AgentEvent::ToolStart {
+                call_id: tool_call.id.clone(),
                 name: name.clone(),
                 arguments: args_str.clone(),
             })
@@ -805,6 +906,42 @@ impl HermesAgent {
         }
 
         Ok(results)
+    }
+
+    /// Repair the conversation after a cancellation so the next request stays
+    /// valid for the provider.
+    ///
+    /// If the last committed message is an assistant message carrying
+    /// `tool_calls`, the provider expects a matching tool result for each call
+    /// before any new turn. A cancel can leave that message dangling (the run
+    /// stopped before tool results were appended). Append a `[cancelled]`
+    /// placeholder result for every outstanding tool call so the history is
+    /// well-formed.
+    async fn repair_conversation_after_cancel(&self) {
+        let mut conv = self.conversation.write().await;
+        let needs_repair = conv
+            .last()
+            .map(|m| m.role == crate::client::Role::Assistant && m.tool_calls.is_some())
+            .unwrap_or(false);
+
+        if !needs_repair {
+            return;
+        }
+
+        let tool_call_ids: Vec<String> = conv
+            .last()
+            .and_then(|m| m.tool_calls.clone())
+            .map(|calls| calls.into_iter().map(|c| c.id).collect())
+            .unwrap_or_default();
+
+        let repaired = tool_call_ids.len();
+        for id in tool_call_ids {
+            conv.push(Message::tool(
+                &id,
+                "[cancelled] Tool execution was interrupted by the user.",
+            ));
+        }
+        debug!(repaired, "Repaired conversation after cancel");
     }
 
     /// Run agent and handle self-healing on tool errors
@@ -1929,7 +2066,11 @@ mod tests {
             billable: false,
         };
 
-        let (content, _, _) = agent.process_stream(stream, &preflight).await.unwrap();
+        let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (content, _, _) = agent
+            .process_stream(stream, &preflight, &no_cancel)
+            .await
+            .unwrap();
 
         assert!(content.contains("Second streamed chunk"));
         let mut telemetry_events = 0;
@@ -1966,7 +2107,11 @@ mod tests {
             billable: false,
         };
 
-        let (_, _, tool_calls) = agent.process_stream(stream, &preflight).await.unwrap();
+        let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_, _, tool_calls) = agent
+            .process_stream(stream, &preflight, &no_cancel)
+            .await
+            .unwrap();
 
         assert_eq!(tool_calls.len(), 1);
         let mut max_completion_tokens = 0;
@@ -2010,8 +2155,11 @@ mod tests {
             billable: false,
         };
 
-        let (content, reasoning, tool_calls) =
-            agent.process_stream(stream, &preflight).await.unwrap();
+        let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (content, reasoning, tool_calls) = agent
+            .process_stream(stream, &preflight, &no_cancel)
+            .await
+            .unwrap();
 
         assert_eq!(content, "Hello from Claude");
         assert_eq!(reasoning, "checking");
@@ -2044,7 +2192,11 @@ mod tests {
             billable: false,
         };
 
-        let (_, _, tool_calls) = agent.process_stream(stream, &preflight).await.unwrap();
+        let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_, _, tool_calls) = agent
+            .process_stream(stream, &preflight, &no_cancel)
+            .await
+            .unwrap();
 
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].function.arguments, "{}");
@@ -2108,14 +2260,18 @@ mod tests {
             registry,
         );
 
+        let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let results = agent
-            .execute_tools(vec![ToolCall {
-                id: "call_from_model".to_string(),
-                function: crate::client::ToolCallFunction {
-                    name: "wrong_id".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            }])
+            .execute_tools(
+                vec![ToolCall {
+                    id: "call_from_model".to_string(),
+                    function: crate::client::ToolCallFunction {
+                        name: "wrong_id".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+                &no_cancel,
+            )
             .await
             .unwrap();
 
@@ -2132,14 +2288,18 @@ mod tests {
             ToolRegistry::new(Duration::from_secs(1)),
         );
 
+        let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let results = agent
-            .execute_tools(vec![ToolCall {
-                id: "bad_json_call".to_string(),
-                function: crate::client::ToolCallFunction {
-                    name: "wrong_id".to_string(),
-                    arguments: "{".to_string(),
-                },
-            }])
+            .execute_tools(
+                vec![ToolCall {
+                    id: "bad_json_call".to_string(),
+                    function: crate::client::ToolCallFunction {
+                        name: "wrong_id".to_string(),
+                        arguments: "{".to_string(),
+                    },
+                }],
+                &no_cancel,
+            )
             .await
             .unwrap();
 

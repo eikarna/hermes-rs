@@ -73,6 +73,9 @@ pub enum Error {
     #[error("Max iterations exceeded: {max}")]
     MaxIterationsExceeded { max: usize },
 
+    #[error("Agent run cancelled by user")]
+    Cancelled,
+
     #[error("Context length exceeded")]
     ContextLengthExceeded,
 

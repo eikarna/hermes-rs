@@ -75,7 +75,9 @@ impl Default for ClientSettings {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: None,
             auth_ref: None,
-            timeout_secs: 60,
+            // Per-read deadline (see client builders): reasoning models can
+            // take minutes before the first token, so keep this generous.
+            timeout_secs: 300,
             max_context_length: 128_000,
             provider: "openai".to_string(),
             openai: ProviderEndpointSettings::default(),
@@ -398,6 +400,9 @@ pub struct GatewaySettings {
     pub webhooks_enabled: bool,
     pub webhooks_addr: Option<String>,
     pub admins: Vec<String>,
+    /// Stream model output live into the chat (message edited as tokens
+    /// arrive) instead of showing a heartbeat until the full reply is ready.
+    pub streaming_replies: bool,
 }
 
 impl Default for GatewaySettings {
@@ -415,6 +420,7 @@ impl Default for GatewaySettings {
             webhooks_enabled: false,
             webhooks_addr: None,
             admins: Vec::new(),
+            streaming_replies: false,
         }
     }
 }

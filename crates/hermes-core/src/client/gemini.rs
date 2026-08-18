@@ -27,7 +27,8 @@ pub struct GeminiClient {
 impl GeminiClient {
     pub fn new(config: ClientConfig) -> Result<Self> {
         let http_client = reqwest::Client::builder()
-            .timeout(config.timeout)
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(config.timeout)
             .build()
             .map_err(|e| Error::Config(format!("Failed to create HTTP client: {}", e)))?;
         Ok(Self {

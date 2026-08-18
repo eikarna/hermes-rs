@@ -307,7 +307,11 @@ impl AppState {
                 self.session.reasoning.push_str(&text);
                 self.session.status = "Streaming reasoning".to_string();
             }
-            AgentEvent::ToolStart { name, arguments } => {
+            AgentEvent::ToolStart {
+                call_id: _,
+                name,
+                arguments,
+            } => {
                 self.push_activity(
                     format!("Tool {}", name),
                     truncate(&arguments, 140),
@@ -999,6 +1003,7 @@ mod tests {
         let mut state = AppState::new(AppConfig::default(), String::new(), false);
         state.begin_run("test".to_string());
         state.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call_1".to_string(),
             name: "calculator".to_string(),
             arguments: "1+1".to_string(),
         });
@@ -1154,6 +1159,7 @@ mod apply_agent_event_tests {
     fn tool_start_updates_status_and_activity() {
         let mut state = AppState::new(AppConfig::default(), String::new(), false);
         state.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call_1".to_string(),
             name: "calculator".to_string(),
             arguments: "1 + 1".to_string(),
         });

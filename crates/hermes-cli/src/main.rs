@@ -3,11 +3,12 @@
 mod autonomous;
 mod tui;
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
@@ -23,7 +24,7 @@ use hermes_core::memory::MemoryManager;
 use hermes_core::tools::{HermesTool, ToolContext, ToolRegistry};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::Level;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -107,6 +108,10 @@ enum Commands {
         verbose: bool,
     },
     Chat {
+        #[arg(short, long)]
+        system: Option<String>,
+    },
+    Serve {
         #[arg(short, long)]
         system: Option<String>,
     },
@@ -599,6 +604,566 @@ async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result
         }
     }
 
+    Ok(())
+}
+
+/// Message handler that routes incoming platform messages to the Hermes agent
+/// and streams live progress (status heartbeats, tool notifications) into the
+/// channel while the run is in flight.
+struct AgentMessageHandler {
+    agent: Arc<HermesAgent>,
+    /// Stream model output live into the chat (SSE deltas → live message
+    /// edits) instead of only showing a heartbeat until the reply is done.
+    streaming_replies: bool,
+    /// Per-channel conversation persistence so the bot survives restarts.
+    session_store: hermes_core::session_store::SessionStore,
+    /// Channel key currently loaded into the shared agent's conversation.
+    /// The agent has one conversation buffer, so switching channels swaps
+    /// the history (clear + reload from the store).
+    current_channel: tokio::sync::Mutex<Option<String>>,
+    /// Serializes agent runs: the shared agent has one conversation buffer,
+    /// so concurrent runs from different channels would corrupt each other.
+    run_lock: tokio::sync::Mutex<()>,
+}
+
+/// Format an elapsed duration as a short human string ("45 sec", "3 min").
+fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{} sec", secs)
+    } else {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        if rem == 0 {
+            format!("{} min", mins)
+        } else {
+            format!("{} min {} sec", mins, rem)
+        }
+    }
+}
+
+/// Final outcome of a run, handed to the progress pump so it can replace
+/// the live status message with the model's actual reply.
+struct RunOutcome {
+    /// The model's final reply, when the run succeeded.
+    reply: Option<hermes_core::gateway::OutgoingMessage>,
+    /// Whether the run was cancelled by the user.
+    cancelled: bool,
+    /// Error text, when the run failed for a non-cancel reason.
+    error: Option<String>,
+}
+
+/// Live progress pump for one agent run.
+///
+/// Consumes [`AgentEvent`]s and reflects them into the channel via the sink:
+/// a single editable status message carries the heartbeat ("⏳ Working — 3 min
+/// — receiving stream response"), and each tool call gets its own message that
+/// is edited in place when the tool completes. When the run finishes, the
+/// status message is REPLACED by the model's actual reply (via `send_final`)
+/// instead of leaving a "✅ Done in X" stub next to a separate answer — only
+/// cancelled/failed runs keep a short indicator, since there is no reply to
+/// show.
+struct RunProgress {
+    sink: Arc<dyn hermes_core::gateway::MessageSink>,
+    channel_id: String,
+    /// ID of the editable status message, once sent.
+    status_msg_id: Option<String>,
+    /// Human label for the current phase.
+    phase: String,
+    /// When the run started.
+    started: Instant,
+    /// Tool-call message IDs keyed by call_id, so ToolComplete can edit them.
+    tool_msgs: HashMap<String, String>,
+    /// Tool names keyed by call_id for the completion label.
+    tool_names: HashMap<String, String>,
+    /// Streaming mode: live-edit the reply into the chat as tokens arrive
+    /// (SSE deltas) instead of only showing a heartbeat.
+    streaming: bool,
+    /// Accumulated text of the current stream segment (since the last tool
+    /// call or run start).
+    stream_buffer: String,
+    /// Live message carrying the current stream segment.
+    stream_msg_id: Option<String>,
+    /// When the live message was last edited (Telegram rate-limit throttle).
+    last_stream_edit: Instant,
+}
+
+/// Minimum interval between live stream edits. Telegram rate-limits edits
+/// per chat (~20 msgs/min); 1.5s keeps us safely under while still feeling
+/// live.
+const STREAM_EDIT_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Telegram's hard message cap is 4096 chars; keep live views under this.
+const LIVE_VIEW_MAX_CHARS: usize = 4000;
+
+/// Build a live-view string: `text` + `suffix`, truncated at the head if it
+/// would exceed the Telegram cap.
+fn live_view(text: &str, suffix: &str) -> String {
+    let suffix_chars = suffix.chars().count();
+    if text.chars().count() + suffix_chars <= LIVE_VIEW_MAX_CHARS {
+        return format!("{}{}", text, suffix);
+    }
+    let keep = LIVE_VIEW_MAX_CHARS.saturating_sub(suffix_chars + 1);
+    let cut: String = text.chars().take(keep).collect();
+    format!("{}…{}", cut, suffix)
+}
+
+impl RunProgress {
+    fn new(
+        sink: Arc<dyn hermes_core::gateway::MessageSink>,
+        channel_id: String,
+        streaming: bool,
+    ) -> Self {
+        Self {
+            sink,
+            channel_id,
+            status_msg_id: None,
+            phase: "thinking".to_string(),
+            started: Instant::now(),
+            tool_msgs: HashMap::new(),
+            tool_names: HashMap::new(),
+            streaming,
+            stream_buffer: String::new(),
+            stream_msg_id: None,
+            last_stream_edit: Instant::now()
+                .checked_sub(STREAM_EDIT_INTERVAL)
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    /// Render the current status line.
+    fn status_text(&self) -> String {
+        format!(
+            "⏳ Working — {} — {}",
+            format_elapsed(self.started.elapsed()),
+            self.phase
+        )
+    }
+
+    /// Send (or edit) the status message with the current heartbeat.
+    async fn refresh_status(&mut self) {
+        // In streaming mode the live message is owned by the stream view;
+        // heartbeats must not clobber it.
+        if self.streaming && self.stream_msg_id.is_some() {
+            return;
+        }
+        let text = self.status_text();
+        let msg = hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text).no_markdown();
+        match &self.status_msg_id {
+            Some(id) => {
+                // Best-effort edit; ignore "message is not modified" races.
+                let _ = self.sink.edit(id, msg).await;
+            }
+            None => {
+                if let Ok(id) = self.sink.send(msg).await {
+                    self.status_msg_id = id;
+                }
+            }
+        }
+    }
+
+    /// Streaming mode: append a content delta and refresh the live view when
+    /// the throttle window allows. The live view is plain text (partial
+    /// markdown would render broken) with a `▌` cursor.
+    async fn on_content_delta(&mut self, text: String) {
+        self.stream_buffer.push_str(&text);
+        let now = Instant::now();
+        if now.duration_since(self.last_stream_edit) < STREAM_EDIT_INTERVAL {
+            return;
+        }
+        self.render_stream_live(" ▌").await;
+        self.last_stream_edit = now;
+    }
+
+    /// Send or edit the live stream message with `stream_buffer` + suffix.
+    /// Reuses the heartbeat status message for the first segment so no extra
+    /// message appears.
+    async fn render_stream_live(&mut self, suffix: &str) {
+        let view = live_view(&self.stream_buffer, suffix);
+        let msg = hermes_core::gateway::OutgoingMessage::new(&self.channel_id, view).no_markdown();
+        match &self.stream_msg_id {
+            Some(id) => {
+                let _ = self.sink.edit(id, msg).await;
+            }
+            None => {
+                // Reuse the heartbeat message when one exists; otherwise send
+                // a fresh live message (already carrying the current view).
+                let id = match self.status_msg_id.take() {
+                    Some(id) => {
+                        let _ = self.sink.edit(&id, msg).await;
+                        id
+                    }
+                    None => match self.sink.send(msg).await {
+                        Ok(Some(id)) => id,
+                        _ => return,
+                    },
+                };
+                self.stream_msg_id = Some(id);
+            }
+        }
+    }
+
+    /// Freeze the current stream segment: drop the cursor and detach the live
+    /// message so the next segment (after a tool call) starts a fresh one.
+    async fn freeze_stream_segment(&mut self) {
+        if self.stream_buffer.trim().is_empty() {
+            self.stream_buffer.clear();
+            return;
+        }
+        self.render_stream_live("").await;
+        self.stream_buffer.clear();
+        self.stream_msg_id = None;
+    }
+
+    /// Finalize the run: replace the live status message with the model's
+    /// actual reply, or — when there is no reply (cancel/error) — with a
+    /// short indicator. Tool-call messages are left as-is; they carry real
+    /// information the user wants to keep.
+    async fn finish(&mut self, outcome: RunOutcome) {
+        // In streaming mode the live message is the stream message; fall back
+        // to the heartbeat status message otherwise.
+        let target_id = if self.streaming {
+            self.stream_msg_id.clone().or_else(|| self.status_msg_id.clone())
+        } else {
+            self.status_msg_id.clone()
+        };
+
+        if let Some(reply) = outcome.reply {
+            // Replace the live message with the final MarkdownV2 reply.
+            if let Err(e) = self
+                .sink
+                .send_final(target_id.as_deref(), reply.clone())
+                .await
+            {
+                // MarkdownV2 is strict; retry without parse_mode, then as a
+                // fresh message, so the reply is never lost.
+                tracing::warn!(error = %e, "send_final failed; retrying without markdown");
+                let plain = reply.no_markdown();
+                if let Err(e2) = self
+                    .sink
+                    .send_final(target_id.as_deref(), plain.clone())
+                    .await
+                {
+                    tracing::warn!(error = %e2, "plain send_final failed; sending as new message");
+                    let _ = self.sink.send(plain).await;
+                }
+            }
+            return;
+        }
+
+        // No reply to show: keep a short terminal indicator in place of the
+        // heartbeat so the user knows what happened to the run.
+        let text = if outcome.cancelled {
+            format!("🛑 Stopped after {}", format_elapsed(self.started.elapsed()))
+        } else if let Some(err) = outcome.error {
+            format!("❌ Error: {}", err)
+        } else {
+            "(no response)".to_string()
+        };
+        let msg = hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text).no_markdown();
+        match &target_id {
+            Some(id) => {
+                let _ = self.sink.edit(id, msg).await;
+            }
+            None => {
+                let _ = self.sink.send(msg).await;
+            }
+        }
+    }
+
+    /// Handle one agent event, updating the live progress display.
+    async fn on_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Thinking { .. } => {
+                self.phase = "thinking".to_string();
+                self.refresh_status().await;
+            }
+            AgentEvent::Reasoning { .. } => {
+                self.phase = "reasoning".to_string();
+            }
+            AgentEvent::Content { text } => {
+                self.phase = "receiving stream response".to_string();
+                if self.streaming {
+                    self.on_content_delta(text).await;
+                }
+            }
+            AgentEvent::ToolStart {
+                call_id,
+                name,
+                arguments,
+            } => {
+                self.phase = format!("running tool: {}", name);
+                self.tool_names.insert(call_id.clone(), name.clone());
+                // Streaming mode: freeze the text segment accumulated so far
+                // into a permanent message before the tool notification.
+                if self.streaming {
+                    self.freeze_stream_segment().await;
+                }
+                let preview = if arguments.len() > 120 {
+                    format!("{}…", &arguments[..120])
+                } else {
+                    arguments
+                };
+                let text = format!("🔧 Running tool: {}\n`{}`", name, preview);
+                let msg =
+                    hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text);
+                if let Ok(Some(id)) = self.sink.send(msg).await {
+                    self.tool_msgs.insert(call_id, id);
+                }
+                self.refresh_status().await;
+            }
+            AgentEvent::ToolComplete { result } => {
+                let label = self
+                    .tool_names
+                    .get(&result.tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| "tool".to_string());
+                let text = if result.success {
+                    format!("✅ {} done", label)
+                } else {
+                    format!("❌ {} failed", label)
+                };
+                let msg =
+                    hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text)
+                        .no_markdown();
+                if let Some(id) = self.tool_msgs.remove(&result.tool_call_id) {
+                    let _ = self.sink.edit(&id, msg).await;
+                }
+                self.phase = "thinking".to_string();
+                self.refresh_status().await;
+            }
+            AgentEvent::ToolError { name, .. } => {
+                self.phase = "thinking".to_string();
+                let text = format!("❌ {} failed", name);
+                let msg =
+                    hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text)
+                        .no_markdown();
+                let _ = self.sink.send(msg).await;
+            }
+            AgentEvent::IterationComplete { .. } => {
+                self.phase = "thinking".to_string();
+            }
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } | AgentEvent::Telemetry { .. } => {
+                // Terminal / metadata events are handled by the run loop.
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
+    async fn handle(
+        &self,
+        message: hermes_core::gateway::IncomingMessage,
+        sink: Arc<dyn hermes_core::gateway::MessageSink>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> hermes_core::error::Result<()> {
+        tracing::info!(
+            platform = %message.platform,
+            user = %message.user_id,
+            "Handling incoming message"
+        );
+
+        let channel_key = format!("{}:{}", message.platform, message.channel_id);
+
+        // /new — wipe this channel's session and start fresh.
+        if message.content.trim().eq_ignore_ascii_case("/new") {
+            // Hold the run lock so an in-flight run can't re-save the
+            // session after we clear it.
+            let _run_guard = self.run_lock.lock().await;
+            self.session_store.clear(&channel_key);
+            let mut current = self.current_channel.lock().await;
+            if current.as_deref() == Some(channel_key.as_str()) {
+                self.agent.clear_history().await;
+                *current = None;
+            }
+            drop(current);
+            drop(_run_guard);
+            let msg = hermes_core::gateway::OutgoingMessage::new(
+                &message.channel_id,
+                "🧹 Session cleared. Starting fresh.",
+            )
+            .no_markdown();
+            let _ = sink.send(msg).await;
+            return Ok(());
+        }
+
+        // Serialize runs: the shared agent has one conversation buffer.
+        let _run_guard = self.run_lock.lock().await;
+
+        // Swap conversation history when the channel changed since the last
+        // run (or after a restart, when nothing is loaded yet).
+        {
+            let mut current = self.current_channel.lock().await;
+            if current.as_deref() != Some(channel_key.as_str()) {
+                self.agent.clear_history().await;
+                for m in self.session_store.load(&channel_key) {
+                    self.agent.add_message(m).await;
+                }
+                *current = Some(channel_key.clone());
+            }
+        }
+
+        // Per-run event channel. The shared agent swaps its sink for this run.
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+        self.agent.set_event_sender(Some(event_tx));
+
+        // Oneshot carrying the final outcome so the pump can replace the
+        // live status message with the model's actual reply.
+        let (outcome_tx, outcome_rx) = oneshot::channel::<RunOutcome>();
+
+        // Spawn the live progress pump. It owns the sink clone and runs until
+        // it receives the final outcome (sent after the agent run completes).
+        let pump_sink = sink.clone();
+        let pump_channel = message.channel_id.clone();
+        let pump_streaming = self.streaming_replies;
+        let pump = tokio::spawn(async move {
+            let mut progress = RunProgress::new(pump_sink, pump_channel, pump_streaming);
+            // Initial status so the user sees activity immediately.
+            progress.refresh_status().await;
+
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await; // consume the immediate first tick
+
+            let mut outcome_rx = Some(outcome_rx);
+            loop {
+                let mut rx = match outcome_rx.take() {
+                    Some(rx) => rx,
+                    None => break,
+                };
+                tokio::select! {
+                    maybe_event = event_rx.recv() => {
+                        match maybe_event {
+                            Some(event) => progress.on_event(event).await,
+                            // Channel closed without an outcome; stop.
+                            None => break,
+                        }
+                        outcome_rx = Some(rx);
+                    }
+                    _ = heartbeat.tick() => {
+                        progress.refresh_status().await;
+                        outcome_rx = Some(rx);
+                    }
+                    // Poll by reference so the receiver survives branches
+                    // that handle events/heartbeats instead.
+                    outcome = &mut rx => {
+                        // Run finished: replace the status message with the
+                        // model's reply (or a short cancel/error indicator).
+                        let outcome = outcome.unwrap_or(RunOutcome {
+                            reply: None,
+                            cancelled: false,
+                            error: Some("internal error: outcome lost".to_string()),
+                        });
+                        progress.finish(outcome).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Run the agent with the gateway's cancellation flag.
+        let run_result = self
+            .agent
+            .run_with_cancel(message.content.clone(), cancel)
+            .await;
+
+        // Detach the event sink so no further events reach the pump.
+        self.agent.set_event_sender(None);
+
+        // Persist the conversation for this channel so it survives restarts.
+        // Save even on cancel/error: partial history is better than losing
+        // the whole session.
+        {
+            let conv = self.agent.conversation().await;
+            if let Err(e) = self.session_store.save(&channel_key, &conv) {
+                tracing::warn!(error = %e, "Failed to persist session");
+            }
+        }
+
+        // Hand the outcome to the pump; it replaces the status message.
+        let outcome = match run_result {
+            Ok(response) => {
+                let reply = if response.content.trim().is_empty() {
+                    None
+                } else {
+                    Some(hermes_core::gateway::OutgoingMessage::new(
+                        &message.channel_id,
+                        response.content,
+                    ))
+                };
+                RunOutcome {
+                    reply,
+                    cancelled: false,
+                    error: None,
+                }
+            }
+            Err(hermes_core::error::Error::Cancelled) => RunOutcome {
+                reply: None,
+                cancelled: true,
+                error: None,
+            },
+            Err(e) => RunOutcome {
+                reply: None,
+                cancelled: false,
+                error: Some(e.to_string()),
+            },
+        };
+        let was_cancelled = outcome.cancelled;
+        let had_error = outcome.error.is_some();
+        let _ = outcome_tx.send(outcome);
+        let _ = pump.await;
+
+        if was_cancelled {
+            // Propagate so the gateway treats this as an expected stop.
+            Err(hermes_core::error::Error::Cancelled)
+        } else if had_error {
+            // The pump already showed the error in place of the status
+            // message; report Ok so the gateway doesn't add a generic
+            // "something went wrong" on top of it.
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Run the multi-platform gateway, routing incoming messages to the agent.
+async fn run_gateway(config: &AppConfig, system_prompt: Option<&str>) -> Result<()> {
+    let mut mcp_manager = McpManager::new();
+    let agent = create_agent_without_events(config, system_prompt, &mut mcp_manager).await?;
+    let gateway_config = hermes_core::gateway::GatewayConfig::default();
+    let handler = Arc::new(AgentMessageHandler {
+        agent: Arc::new(agent),
+        streaming_replies: gateway_config.streaming_replies,
+        session_store: hermes_core::session_store::SessionStore::new(
+            hermes_core::session_store::SessionStore::default_dir(),
+        ),
+        current_channel: tokio::sync::Mutex::new(None),
+        run_lock: tokio::sync::Mutex::new(()),
+    });
+    let mut gateway = hermes_core::gateway::Gateway::new(gateway_config.clone())
+        .with_handler(handler);
+
+    if gateway_config.telegram_enabled {
+        gateway = gateway.with_adapter(Arc::new(hermes_core::gateway::TelegramAdapter::new(
+            gateway_config.telegram_token.clone(),
+        )));
+    }
+    if gateway_config.discord_enabled {
+        gateway = gateway.with_adapter(Arc::new(hermes_core::gateway::DiscordAdapter::new(
+            gateway_config.discord_token.clone(),
+        )));
+    }
+    if gateway_config.slack_enabled {
+        gateway = gateway.with_adapter(Arc::new(hermes_core::gateway::SlackAdapter::new(
+            gateway_config.slack_token.clone(),
+            None,
+        )));
+    }
+
+    println!("Starting Hermes gateway...");
+    gateway.run().await?;
     Ok(())
 }
 
@@ -1167,6 +1732,9 @@ async fn main() -> Result<()> {
             } else {
                 chat_non_tui(&loaded.config, system.as_deref()).await?;
             }
+        }
+        Commands::Serve { system } => {
+            run_gateway(&loaded.config, system.as_deref()).await?;
         }
         Commands::Tools { verbose } => {
             list_tools(&loaded.config, *verbose).await?;

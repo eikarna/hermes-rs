@@ -689,13 +689,18 @@ impl MemoryManager {
         let memories = self.long_term.read().await.clone();
         let profiles = self.profiles.read().await.clone();
 
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             store.write_memories(&memories)?;
             store.write_profiles(&profiles)?;
             Ok::<(), std::io::Error>(())
         })
         .await
-        .unwrap()?;
+        {
+            Ok(inner) => inner?,
+            // Runtime is shutting down and cancelled the blocking task; nothing
+            // left to do. Don't panic on teardown.
+            Err(_) => return Ok(()),
+        }
 
         Ok(())
     }

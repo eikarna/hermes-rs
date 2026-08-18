@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use reqwest::header::HeaderValue;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -34,6 +35,8 @@ pub struct GatewayConfig {
     pub webhooks_addr: Option<String>,
     /// Default admin users (user IDs that can access admin commands)
     pub admins: Vec<String>,
+    /// Stream model output live into the chat (edit message as tokens arrive)
+    pub streaming_replies: bool,
 }
 
 impl Default for GatewayConfig {
@@ -49,6 +52,7 @@ impl Default for GatewayConfig {
             webhooks_enabled: settings.webhooks_enabled,
             webhooks_addr: settings.webhooks_addr,
             admins: settings.admins,
+            streaming_replies: settings.streaming_replies,
         }
     }
 }
@@ -159,11 +163,137 @@ pub trait PlatformAdapter: Send + Sync {
     /// Send a message through the platform
     async fn send_message(&self, message: OutgoingMessage) -> Result<()>;
 
+    /// Send a message and return the platform's message ID when available.
+    ///
+    /// Platforms that expose a message ID on send (Telegram) return it so
+    /// callers can edit the message in place later (status heartbeats,
+    /// tool progress updates). The default implementation falls back to
+    /// [`send_message`] with no ID.
+    async fn send_message_tracked(&self, message: OutgoingMessage) -> Result<Option<String>> {
+        self.send_message(message).await?;
+        Ok(None)
+    }
+
+    /// Edit a previously sent message in place.
+    ///
+    /// Used for live status updates (elapsed-time heartbeats, tool progress)
+    /// without flooding the chat. Platforms without edit support keep the
+    /// default no-op.
+    async fn edit_message(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _message: OutgoingMessage,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Deliver the final reply of a run, replacing the live status message
+    /// (`message_id`) in place when provided.
+    ///
+    /// Default: edit the status message, or send fresh when there is none.
+    /// Platforms with message-size limits (Telegram) override this to chunk
+    /// the reply: first chunk edits the status message, the rest are sent as
+    /// new messages.
+    async fn send_final(
+        &self,
+        channel_id: &str,
+        message_id: Option<&str>,
+        message: OutgoingMessage,
+    ) -> Result<()> {
+        match message_id {
+            Some(id) => self.edit_message(channel_id, id, message).await,
+            None => self.send_message(message).await,
+        }
+    }
+
     /// Handle an incoming update (webhook or poll result)
     async fn handle_update(&self, update: serde_json::Value) -> Result<Option<IncomingMessage>>;
 
+    /// Poll for new updates (long-polling for platforms that support it).
+    ///
+    /// Returns a batch of raw updates. The default implementation returns an
+    /// empty batch for event-based platforms (e.g. Slack) that rely on
+    /// webhooks instead of polling.
+    async fn poll_updates(&self) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
     /// Get the adapter's specific configuration as JSON
     fn config_json(&self) -> serde_json::Value;
+}
+
+/// A sink for sending/replying into one specific channel.
+///
+/// Handed to the message handler so it can emit progress updates (status
+/// heartbeats, tool notifications) mid-run, not just the final reply.
+#[async_trait]
+pub trait MessageSink: Send + Sync {
+    /// Send a message; returns the platform message ID when available.
+    async fn send(&self, message: OutgoingMessage) -> Result<Option<String>>;
+
+    /// Edit a previously sent message in place (best-effort).
+    async fn edit(&self, message_id: &str, message: OutgoingMessage) -> Result<()>;
+
+    /// Deliver the final reply of a run, reusing the live status message
+    /// (`status_msg_id`) when one exists so the "⏳ Working…" placeholder is
+    /// replaced by the actual response instead of leaving a "✅ Done" stub
+    /// plus a separate reply. Falls back to a plain send when there is no
+    /// status message to reuse.
+    async fn send_final(&self, status_msg_id: Option<&str>, message: OutgoingMessage)
+        -> Result<()>;
+}
+
+/// Sink bound to one adapter + channel pair.
+pub struct ChannelSink {
+    adapter: Arc<dyn PlatformAdapter>,
+    channel_id: String,
+}
+
+impl ChannelSink {
+    /// Create a sink targeting one channel on one adapter.
+    pub fn new(adapter: Arc<dyn PlatformAdapter>, channel_id: impl Into<String>) -> Self {
+        Self {
+            adapter,
+            channel_id: channel_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl MessageSink for ChannelSink {
+    async fn send(&self, message: OutgoingMessage) -> Result<Option<String>> {
+        self.adapter.send_message_tracked(message).await
+    }
+
+    async fn edit(&self, message_id: &str, message: OutgoingMessage) -> Result<()> {
+        self.adapter
+            .edit_message(&self.channel_id, message_id, message)
+            .await
+    }
+
+    async fn send_final(
+        &self,
+        status_msg_id: Option<&str>,
+        message: OutgoingMessage,
+    ) -> Result<()> {
+        self.adapter
+            .send_final(&self.channel_id, status_msg_id, message)
+            .await
+    }
+}
+
+/// State of the currently active agent run in one channel.
+///
+/// Tracked by the gateway so an incoming message can interrupt the run
+/// (set `cancel`) and wait for it to wind down (`done`) before the new
+/// message is processed.
+struct ActiveRun {
+    /// Cooperative cancellation flag handed to the handler/agent.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Set to `true` when the run finishes (success, error, or cancelled).
+    /// Watch channel so waiters never race the notification.
+    done: tokio::sync::watch::Sender<bool>,
 }
 
 /// Gateway for routing messages between platforms and the agent
@@ -172,13 +302,32 @@ pub struct Gateway {
     adapters: HashMap<String, Arc<dyn PlatformAdapter>>,
     message_handler: Option<Arc<dyn MessageHandler>>,
     running: Arc<RwLock<bool>>,
+    /// Active agent runs keyed by "platform:channel_id".
+    active_runs: Arc<RwLock<HashMap<String, Arc<ActiveRun>>>>,
 }
 
 /// Handler for incoming messages from any platform
 #[async_trait::async_trait]
 pub trait MessageHandler: Send + Sync {
-    /// Handle an incoming message
-    async fn handle(&self, message: IncomingMessage) -> Result<OutgoingMessage>;
+    /// Handle an incoming message.
+    ///
+    /// `sink` lets the handler emit progress updates (status heartbeats,
+    /// tool notifications) into the originating channel mid-run, and deliver
+    /// the final reply itself via [`MessageSink::send_final`] — reusing the
+    /// live status message so the "⏳ Working…" placeholder is replaced by
+    /// the actual response. `cancel` is the cooperative cancellation flag for
+    /// this run — the gateway sets it when the user interrupts.
+    ///
+    /// Returning `Ok(())` means the reply (or an error notice) was already
+    /// delivered to the channel; the gateway sends nothing further. Returning
+    /// `Err` means nothing reached the user and the gateway may fall back to
+    /// a generic error message.
+    async fn handle(
+        &self,
+        message: IncomingMessage,
+        sink: Arc<dyn MessageSink>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()>;
 }
 
 impl Gateway {
@@ -189,6 +338,7 @@ impl Gateway {
             adapters: HashMap::new(),
             message_handler: None,
             running: Arc::new(RwLock::new(false)),
+            active_runs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -250,37 +400,6 @@ impl Gateway {
         status
     }
 
-    /// Route an incoming message to the handler and send response
-    pub async fn route_message(&self, message: IncomingMessage) -> Result<Option<OutgoingMessage>> {
-        debug!(
-            platform = %message.platform,
-            user = %message.user_id,
-            content = %message.content,
-            "Routing message"
-        );
-
-        // Check if user is admin
-        if !self.config.admins.is_empty() && !self.config.admins.contains(&message.user_id) {
-            debug!(user = %message.user_id, "User not authorized");
-            return Ok(Some(OutgoingMessage::new(
-                &message.channel_id,
-                "You are not authorized to use this bot.",
-            )));
-        }
-
-        let handler = match &self.message_handler {
-            Some(h) => h,
-            None => {
-                warn!("No message handler configured");
-                return Ok(None);
-            }
-        };
-
-        let response = handler.handle(message).await?;
-
-        Ok(Some(response))
-    }
-
     /// Send a message to a specific platform
     pub async fn send_to_platform(&self, platform: &str, message: OutgoingMessage) -> Result<()> {
         let adapter = match self.adapters.get(platform) {
@@ -295,19 +414,231 @@ impl Gateway {
 
         adapter.send_message(message).await
     }
+
+    /// Run the gateway polling loop until stopped.
+    ///
+    /// Starts all enabled adapters, then continuously polls each polling-capable
+    /// adapter for updates. Each incoming message is dispatched to the handler
+    /// on its own task so the polling loop never blocks on a long agent run —
+    /// this is what makes mid-run interrupts possible. Blocks until `stop()`
+    /// is called (e.g. from a signal handler).
+    pub async fn run(&self) -> Result<()> {
+        self.start().await?;
+
+        let enabled: Vec<(String, Arc<dyn PlatformAdapter>)> = self
+            .adapters
+            .iter()
+            .filter(|(_, a)| a.is_enabled())
+            .map(|(name, a)| (name.clone(), a.clone()))
+            .collect();
+
+        if enabled.is_empty() {
+            return Err(crate::error::Error::Agent(
+                "No enabled platform adapters to run".to_string(),
+            ));
+        }
+
+        info!(
+            platforms = ?enabled.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+            "Gateway polling loop started"
+        );
+
+        while self.is_running().await {
+            for (platform, adapter) in &enabled {
+                let updates = match adapter.poll_updates().await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!(platform = %platform, error = %e, "Poll failed; backing off");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                for update in updates {
+                    let incoming = match adapter.handle_update(update).await {
+                        Ok(Some(msg)) => msg,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            warn!(platform = %platform, error = %e, "Failed to parse update");
+                            continue;
+                        }
+                    };
+
+                    // Non-blocking dispatch: spawn the handler so the poll
+                    // loop keeps draining updates (including interrupts).
+                    self.dispatch(platform.clone(), adapter.clone(), incoming)
+                        .await;
+                }
+            }
+
+            // Small yield so an empty poll batch doesn't busy-spin. Long-polling
+            // adapters already block ~30s server-side when idle.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        self.stop().await?;
+        Ok(())
+    }
+
+    /// Dispatch one incoming message to the handler on a background task.
+    ///
+    /// Interrupt semantics (per channel):
+    /// - A message arriving while a run is active cancels that run. The
+    ///   gateway notifies the user, waits (bounded) for the run to wind
+    ///   down, then processes the new message.
+    /// - `/stop` cancels the active run without processing further.
+    /// - `/stop` with no active run is a no-op notification.
+    async fn dispatch(
+        &self,
+        platform: String,
+        adapter: Arc<dyn PlatformAdapter>,
+        incoming: IncomingMessage,
+    ) {
+        // Check if user is admin
+        if !self.config.admins.is_empty() && !self.config.admins.contains(&incoming.user_id) {
+            debug!(user = %incoming.user_id, "User not authorized");
+            let _ = adapter
+                .send_message(OutgoingMessage::new(
+                    &incoming.channel_id,
+                    "You are not authorized to use this bot.",
+                ))
+                .await;
+            return;
+        }
+
+        let handler = match &self.message_handler {
+            Some(h) => h.clone(),
+            None => {
+                warn!("No message handler configured");
+                return;
+            }
+        };
+
+        let run_key = format!("{}:{}", platform, incoming.channel_id);
+        let content = incoming.content.trim().to_string();
+        let is_stop = content.eq_ignore_ascii_case("/stop");
+
+        // Is there an active run in this channel?
+        let active = {
+            let runs = self.active_runs.read().await;
+            runs.get(&run_key).cloned()
+        };
+
+        if let Some(active) = active {
+            // Interrupt: cancel the running generation.
+            active
+                .cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
+            if is_stop {
+                let _ = adapter
+                    .send_message(OutgoingMessage::new(
+                        &incoming.channel_id,
+                        "🛑 Stopping current task...",
+                    ))
+                    .await;
+                return;
+            }
+
+            let _ = adapter
+                .send_message(OutgoingMessage::new(
+                    &incoming.channel_id,
+                    "⚡ Interrupting current task. I'll respond to your message shortly.",
+                ))
+                .await;
+
+            // Wait (bounded) for the old run to wind down so the agent's
+            // conversation state is repaired before the new turn starts.
+            let mut done_rx = active.done.subscribe();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !*done_rx.borrow_and_update() {
+                    if done_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        } else if is_stop {
+            let _ = adapter
+                .send_message(OutgoingMessage::new(
+                    &incoming.channel_id,
+                    "Nothing is running right now.",
+                ))
+                .await;
+            return;
+        }
+
+        // Register the new run.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (done_tx, _) = tokio::sync::watch::channel(false);
+        let run = Arc::new(ActiveRun {
+            cancel: cancel.clone(),
+            done: done_tx,
+        });
+        self.active_runs
+            .write()
+            .await
+            .insert(run_key.clone(), run.clone());
+
+        let sink: Arc<dyn MessageSink> = Arc::new(ChannelSink::new(
+            adapter.clone(),
+            incoming.channel_id.clone(),
+        ));
+        let active_runs = self.active_runs.clone();
+        let channel_id = incoming.channel_id.clone();
+
+        tokio::spawn(async move {
+            let result = handler.handle(incoming, sink, cancel).await;
+
+            // Mark the run done and deregister it.
+            let _ = run.done.send(true);
+            active_runs.write().await.remove(&run_key);
+
+            match result {
+                Ok(()) => {
+                    // The handler delivered the reply itself (via
+                    // send_final, reusing the status message). Nothing
+                    // left for the gateway to do.
+                }
+                Err(crate::error::Error::Cancelled) => {
+                    // Cancelled runs are expected; the handler already
+                    // notified the user. No error fallback.
+                    debug!(platform = %platform, channel = %channel_id, "Run cancelled");
+                }
+                Err(e) => {
+                    error!(platform = %platform, error = %e, "Handler failed");
+                    let fallback = OutgoingMessage::new(
+                        &channel_id,
+                        "Sorry, something went wrong processing your message.",
+                    )
+                    .no_markdown();
+                    let _ = adapter.send_message(fallback).await;
+                }
+            }
+        });
+    }
 }
 
 /// Telegram adapter
 pub struct TelegramAdapter {
     token: Option<String>,
     enabled: bool,
+    /// Long-polling offset: next update_id to fetch (last seen + 1)
+    offset: AtomicI64,
+    /// Shared HTTP client (connection pooling across polls/sends)
+    client: reqwest::Client,
 }
 
 impl TelegramAdapter {
     /// Create a new Telegram adapter
     pub fn new(token: Option<String>) -> Self {
         let enabled = token.is_some();
-        Self { token, enabled }
+        Self {
+            token,
+            enabled,
+            offset: AtomicI64::new(0),
+            client: reqwest::Client::new(),
+        }
     }
 
     fn api_url(&self) -> String {
@@ -317,6 +648,90 @@ impl TelegramAdapter {
             base.trim_end_matches('/'),
             self.token.as_ref().unwrap_or(&String::new())
         )
+    }
+
+    /// Send one already-built sendMessage body, validating Telegram's `ok`
+    /// flag so API-level rejections surface as errors. Returns the platform
+    /// message ID when Telegram provides one (used for in-place edits).
+    async fn send_chunk(&self, body: &serde_json::Value) -> Result<Option<String>> {
+        let response = self
+            .client
+            .post(format!("{}/sendMessage", self.api_url()))
+            .json(body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.unwrap_or_default();
+        if !payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let description = payload
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown Telegram API error");
+            return Err(crate::error::Error::ParseResponse(format!(
+                "Telegram sendMessage failed (HTTP {status}): {description}"
+            )));
+        }
+
+        let message_id = payload
+            .get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|id| id.as_i64())
+            .map(|id| id.to_string());
+
+        Ok(message_id)
+    }
+
+    /// Split an outgoing message into Telegram-ready JSON bodies: chunked at
+    /// line boundaries under the 4096-unit cap, code fences re-balanced per
+    /// chunk, and (when markdown is enabled) converted to MarkdownV2. Returns
+    /// one `sendMessage`-shaped body per chunk. `reply_to` is NOT attached —
+    /// callers set it on the first chunk as needed.
+    fn prepare_chunks(&self, message: &OutgoingMessage) -> Vec<serde_json::Value> {
+        // 3500 leaves headroom for MarkdownV2 escape backslashes.
+        let chunks = split_message(&message.content, 3500);
+        let mut bodies = Vec::with_capacity(chunks.len());
+        let mut in_code_block = false;
+        for chunk in chunks.iter() {
+            let mut text = chunk.clone();
+
+            // Re-open a code fence that was cut by the split.
+            if in_code_block {
+                text = format!("```\n{text}");
+            }
+
+            // Toggle state per fence line in the ORIGINAL chunk (counting
+            // after the prepend above would skew the parity).
+            let fence_count = chunk
+                .lines()
+                .filter(|l| l.trim_start().starts_with("```"))
+                .count();
+            if fence_count % 2 == 1 {
+                in_code_block = !in_code_block;
+            }
+
+            // If this chunk ends inside a fence, close it so Telegram
+            // doesn't swallow the rest into a code entity.
+            if in_code_block {
+                text.push_str("\n```");
+            }
+
+            let mut body = serde_json::json!({
+                "chat_id": message.channel_id,
+                "text": text,
+            });
+
+            if message.parse_markdown {
+                // Agent output is standard markdown; Telegram needs MarkdownV2
+                // with strict escaping. Convert per chunk so entities never
+                // straddle a split boundary.
+                body["text"] = serde_json::json!(markdown_to_markdownv2(&text));
+                body["parse_mode"] = serde_json::json!("MarkdownV2");
+            }
+
+            bodies.push(body);
+        }
+        bodies
     }
 }
 
@@ -358,26 +773,136 @@ impl PlatformAdapter for TelegramAdapter {
     }
 
     async fn send_message(&self, message: OutgoingMessage) -> Result<()> {
-        let client = reqwest::Client::new();
+        // Telegram caps a single message at 4096 UTF-16 units. Split long
+        // replies into chunks at line boundaries and send them in order.
+        let mut bodies = self.prepare_chunks(&message);
 
+        // Only the first chunk replies to the original message.
+        if let Some(first) = bodies.first_mut() {
+            if let Some(ref reply_to) = message.reply_to {
+                first["reply_to_message_id"] = serde_json::json!(reply_to);
+            }
+        }
+
+        for body in &bodies {
+            self.send_chunk(body).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_message_tracked(&self, message: OutgoingMessage) -> Result<Option<String>> {
+        // Same chunking as send_message, but capture the first chunk's ID.
+        let mut bodies = self.prepare_chunks(&message);
+
+        if let Some(first) = bodies.first_mut() {
+            if let Some(ref reply_to) = message.reply_to {
+                first["reply_to_message_id"] = serde_json::json!(reply_to);
+            }
+        }
+
+        let mut first_id: Option<String> = None;
+        for (idx, body) in bodies.iter().enumerate() {
+            let id = self.send_chunk(body).await?;
+            if idx == 0 {
+                first_id = id;
+            }
+        }
+
+        Ok(first_id)
+    }
+
+    async fn edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        message: OutgoingMessage,
+    ) -> Result<()> {
         let mut body = serde_json::json!({
-            "chat_id": message.channel_id,
+            "chat_id": channel_id,
+            "message_id": message_id,
             "text": message.content,
         });
 
         if message.parse_markdown {
+            body["text"] = serde_json::json!(markdown_to_markdownv2(&message.content));
             body["parse_mode"] = serde_json::json!("MarkdownV2");
         }
 
-        if let Some(ref reply_to) = message.reply_to {
-            body["reply_to_message_id"] = serde_json::json!(reply_to);
-        }
-
-        client
-            .post(format!("{}/sendMessage", self.api_url()))
+        let response = self
+            .client
+            .post(format!("{}/editMessageText", self.api_url()))
             .json(&body)
             .send()
             .await?;
+
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.unwrap_or_default();
+        if !payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let description = payload
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown Telegram API error");
+            return Err(crate::error::Error::ParseResponse(format!(
+                "Telegram editMessageText failed (HTTP {status}): {description}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn send_final(
+        &self,
+        channel_id: &str,
+        message_id: Option<&str>,
+        message: OutgoingMessage,
+    ) -> Result<()> {
+        // No status message to reuse → plain chunked send.
+        let Some(status_id) = message_id else {
+            return self.send_message(message).await;
+        };
+
+        let bodies = self.prepare_chunks(&message);
+        for (idx, body) in bodies.iter().enumerate() {
+            if idx == 0 {
+                // Replace the "⏳ Working…" status message with the reply.
+                let mut edit_body = body.clone();
+                edit_body["chat_id"] = serde_json::json!(channel_id);
+                edit_body["message_id"] = serde_json::json!(status_id);
+                // reply_to is meaningless on an edit; drop it if present.
+                if let Some(obj) = edit_body.as_object_mut() {
+                    obj.remove("reply_to_message_id");
+                }
+
+                let response = self
+                    .client
+                    .post(format!("{}/editMessageText", self.api_url()))
+                    .json(&edit_body)
+                    .send()
+                    .await?;
+
+                let payload: serde_json::Value = response.json().await.unwrap_or_default();
+                if !payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let description = payload
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown Telegram API error");
+                    // "message is not modified" is benign (identical text);
+                    // anything else falls back to a fresh send so the reply
+                    // is never lost.
+                    if !description.contains("message is not modified") {
+                        warn!(
+                            error = %description,
+                            "Edit of status message failed; sending reply as new message"
+                        );
+                        self.send_chunk(body).await?;
+                    }
+                }
+            } else {
+                // Overflow chunks go out as new messages.
+                self.send_chunk(body).await?;
+            }
+        }
 
         Ok(())
     }
@@ -424,6 +949,53 @@ impl PlatformAdapter for TelegramAdapter {
             )
             .with_raw(update),
         ))
+    }
+
+    async fn poll_updates(&self) -> Result<Vec<serde_json::Value>> {
+        if !self.is_enabled() {
+            return Ok(Vec::new());
+        }
+
+        let offset = self.offset.load(Ordering::SeqCst);
+        let url = format!(
+            "{}/getUpdates?offset={}&timeout=30&allowed_updates=%5B%22message%22%5D",
+            self.api_url(),
+            offset
+        );
+
+        let response = self.client.get(&url).send().await?;
+        if !response.status().is_success() {
+            return Err(crate::error::Error::Agent(format!(
+                "getUpdates failed with status {}",
+                response.status()
+            )));
+        }
+
+        let body: serde_json::Value = response.json().await?;
+        let ok = body.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+        if !ok {
+            return Err(crate::error::Error::Agent(
+                "getUpdates returned ok=false".to_string(),
+            ));
+        }
+
+        let updates = body
+            .get("result")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // Advance offset past the highest update_id we've seen so the next
+        // poll only returns new updates.
+        if let Some(max_id) = updates
+            .iter()
+            .filter_map(|u| u.get("update_id").and_then(|id| id.as_i64()))
+            .max()
+        {
+            self.offset.store(max_id + 1, Ordering::SeqCst);
+        }
+
+        Ok(updates)
     }
 
     fn config_json(&self) -> serde_json::Value {
@@ -725,9 +1297,548 @@ impl PlatformAdapter for SlackAdapter {
     }
 }
 
+// ========== Message splitting ==========
+
+/// Split a long message into chunks of at most `max_chars` characters,
+/// preferring line boundaries so markdown structure stays intact.
+///
+/// Telegram's limit is 4096 UTF-16 units; callers should pass a value
+/// comfortably below that (e.g. 4000) to leave room for escaping overhead.
+pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
+    if text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+
+    for line in text.split_inclusive('\n') {
+        let line_len = line.chars().count();
+
+        // A single line longer than the cap must be hard-split by chars.
+        if line_len > max_chars {
+            // Flush what we have first.
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                current_len = 0;
+            }
+            let mut piece = String::new();
+            let mut piece_len = 0usize;
+            for ch in line.chars() {
+                if piece_len >= max_chars {
+                    chunks.push(std::mem::take(&mut piece));
+                    piece_len = 0;
+                }
+                piece.push(ch);
+                piece_len += 1;
+            }
+            if !piece.is_empty() {
+                chunks.push(piece);
+            }
+            continue;
+        }
+
+        if current_len + line_len > max_chars {
+            chunks.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        current.push_str(line);
+        current_len += line_len;
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
+}
+
+// ========== Markdown → Telegram MarkdownV2 conversion ==========
+
+/// Characters that must be backslash-escaped in MarkdownV2 outside of
+/// code/link entities.
+const V2_SPECIAL: &[char] = &[
+    '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!',
+];
+
+/// Escape text for use outside any MarkdownV2 entity.
+fn escape_v2_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for ch in s.chars() {
+        if V2_SPECIAL.contains(&ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Escape text inside a code entity: only backslash and backtick matter.
+fn escape_v2_code(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for ch in s.chars() {
+        if ch == '\\' || ch == '`' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Escape a URL inside a link entity: only backslash and `)` matter.
+fn escape_v2_url(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for ch in s.chars() {
+        if ch == '\\' || ch == ')' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Find the index of the next `delim` char at or after `start`, ignoring
+/// backslash-escaped occurrences. Returns None if not found.
+fn find_delim(chars: &[char], start: usize, delim: char) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == delim {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Convert inline markdown (bold, italic, code, links) within a single line
+/// to MarkdownV2, escaping everything else.
+fn convert_inline(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() * 2);
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Inline code: `...`
+        if chars[i] == '`' {
+            if let Some(end) = find_delim(&chars, i + 1, '`') {
+                let code: String = chars[i + 1..end].iter().collect();
+                out.push('`');
+                out.push_str(&escape_v2_code(&code));
+                out.push('`');
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Bold: **...**
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            // Find closing **
+            let mut j = i + 2;
+            let mut close: Option<usize> = None;
+            while j + 1 < chars.len() {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '*' && chars[j + 1] == '*' {
+                    close = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(end) = close {
+                let inner: String = chars[i + 2..end].iter().collect();
+                out.push('*');
+                out.push_str(&escape_v2_text(&inner));
+                out.push('*');
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // Italic: *...* (single)
+        if chars[i] == '*' {
+            if let Some(end) = find_delim(&chars, i + 1, '*') {
+                let inner: String = chars[i + 1..end].iter().collect();
+                out.push('_');
+                out.push_str(&escape_v2_text(&inner));
+                out.push('_');
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Link: [text](url)
+        if chars[i] == '[' {
+            if let Some(text_end) = find_delim(&chars, i + 1, ']') {
+                if text_end + 1 < chars.len() && chars[text_end + 1] == '(' {
+                    if let Some(url_end) = find_delim(&chars, text_end + 2, ')') {
+                        let link_text: String = chars[i + 1..text_end].iter().collect();
+                        let url: String = chars[text_end + 2..url_end].iter().collect();
+                        out.push('[');
+                        out.push_str(&escape_v2_text(&link_text));
+                        out.push_str("](");
+                        out.push_str(&escape_v2_url(&url));
+                        out.push(')');
+                        i = url_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Plain character: escape if special.
+        if V2_SPECIAL.contains(&chars[i]) {
+            out.push('\\');
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+/// Split a markdown table row `| a | b |` into its trimmed cells `["a", "b"]`.
+fn split_table_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    // Strip a single leading/trailing pipe so "| a | b |" -> " a | b ".
+    let inner = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed)
+        .strip_suffix('|')
+        .unwrap_or_else(|| trimmed.strip_prefix('|').unwrap_or(trimmed));
+    inner
+        .split('|')
+        .map(|c| c.trim().to_string())
+        .collect()
+}
+
+/// True if `line` is a table separator row like `|---|:---:|---:|`.
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') && !trimmed.contains('-') {
+        return false;
+    }
+    let cells = split_table_row(trimmed);
+    if cells.is_empty() {
+        return false;
+    }
+    cells.iter().all(|c| {
+        !c.is_empty()
+            && c.chars()
+                .all(|ch| ch == '-' || ch == ':' || ch == ' ')
+            && c.contains('-')
+    })
+}
+
+/// True if `line` looks like the start of a table row (leading pipe).
+fn is_table_row(line: &str) -> bool {
+    line.trim_start().starts_with('|')
+}
+
+/// Convert a parsed table (header + data rows) into a bullet list.
+///
+/// Each data row becomes one bullet of `header: value` pairs joined by ` · `,
+/// which reads cleanly in Telegram without the unsupported table syntax.
+fn table_to_bullets(header: &[String], rows: &[Vec<String>]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        let mut parts: Vec<String> = Vec::new();
+        for (i, cell) in row.iter().enumerate() {
+            let key = header.get(i).map(|h| h.as_str()).unwrap_or("");
+            let val = cell.trim();
+            if val.is_empty() {
+                continue;
+            }
+            let piece = if key.is_empty() {
+                convert_inline(val)
+            } else {
+                format!("{}: {}", convert_inline(key), convert_inline(val))
+            };
+            parts.push(piece);
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        out.push_str("• ");
+        out.push_str(&parts.join(" · "));
+        out.push('\n');
+    }
+    out
+}
+
+/// Convert standard markdown (as produced by an LLM) to Telegram MarkdownV2.
+///
+/// Handles fenced code blocks, headings, list items, tables (rendered as
+/// bullet lists), and inline bold/italic/code/links. Everything else is
+/// escaped so Telegram renders it literally instead of rejecting the message.
+pub fn markdown_to_markdownv2(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    let mut in_code_block = false;
+
+    let lines: Vec<&str> = input.lines().collect();
+    let mut idx = 0;
+
+    while idx < lines.len() {
+        let line = lines[idx];
+        let trimmed = line.trim_start();
+
+        // Fenced code block delimiter.
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                out.push_str("```\n");
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+                // Keep the language tag (```rust) for syntax highlighting.
+                out.push_str(trimmed);
+                out.push('\n');
+            }
+            idx += 1;
+            continue;
+        }
+
+        if in_code_block {
+            out.push_str(&escape_v2_code(line));
+            out.push('\n');
+            idx += 1;
+            continue;
+        }
+
+        // Markdown table: a header row starting with `|` immediately followed
+        // by a separator row. Telegram has no table syntax, so render the rows
+        // as a bullet list of `header: value` pairs.
+        if is_table_row(line) && idx + 1 < lines.len() && is_table_separator(lines[idx + 1]) {
+            let header = split_table_row(line);
+            idx += 2; // consume header + separator
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            while idx < lines.len() && is_table_row(lines[idx]) {
+                rows.push(split_table_row(lines[idx]));
+                idx += 1;
+            }
+            out.push_str(&table_to_bullets(&header, &rows));
+            continue;
+        }
+
+        // Horizontal rule: a lone line of --- / *** / ___ (3+). Telegram has
+        // no <hr>; swap in a unicode rule so the separator still reads.
+        {
+            let t = trimmed.trim();
+            let is_hr = t.len() >= 3
+                && ((t.chars().all(|c| c == '-')
+                    || t.chars().all(|c| c == '*')
+                    || t.chars().all(|c| c == '_')));
+            if is_hr {
+                out.push_str("────────────────\n");
+                idx += 1;
+                continue;
+            }
+        }
+
+        // Heading: # / ## / ### ... → bold line.
+        if trimmed.starts_with('#') {
+            let rest = trimmed.trim_start_matches('#').trim_start();
+            if !rest.is_empty() {
+                out.push('*');
+                out.push_str(&escape_v2_text(rest));
+                out.push_str("*\n");
+                idx += 1;
+                continue;
+            }
+        }
+
+        // Blockquote: "> text" → Telegram MarkdownV2 blockquote (each line
+        // prefixed with ">"). Consecutive "> " lines stay as separate lines.
+        if trimmed.starts_with('>') {
+            let rest = trimmed.strip_prefix('>').unwrap_or("").trim_start();
+            out.push('>');
+            if !rest.is_empty() {
+                out.push(' ');
+                out.push_str(&convert_inline(rest));
+            }
+            out.push('\n');
+            idx += 1;
+            continue;
+        }
+
+        // Unordered list item: "- x" or "* x" → bullet.
+        if (trimmed.starts_with("- ") || trimmed.starts_with("* ")) && trimmed.len() > 2 {
+            let rest = &trimmed[2..];
+            out.push_str("• ");
+            out.push_str(&convert_inline(rest));
+            out.push('\n');
+            idx += 1;
+            continue;
+        }
+
+        out.push_str(&convert_inline(line));
+        out.push('\n');
+        idx += 1;
+    }
+
+    // Drop the trailing newline we added if the input didn't end with one.
+    if !input.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_message_short_stays_single() {
+        let chunks = split_message("hello world", 100);
+        assert_eq!(chunks, vec!["hello world"]);
+    }
+
+    #[test]
+    fn split_message_breaks_at_line_boundary() {
+        let text = "line one\nline two\nline three";
+        let chunks = split_message(text, 18);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].ends_with('\n'));
+        assert_eq!(chunks[0], "line one\nline two\n");
+        assert_eq!(chunks[1], "line three");
+    }
+
+    #[test]
+    fn split_message_hard_splits_giant_line() {
+        let text = "a".repeat(50);
+        let chunks = split_message(&text, 20);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 20);
+        assert_eq!(chunks[2].len(), 10);
+    }
+
+    #[test]
+    fn markdown_v2_escapes_special_chars() {
+        assert_eq!(escape_v2_text("a.b!c"), "a\\.b\\!c");
+        assert_eq!(escape_v2_text("plain"), "plain");
+    }
+
+    #[test]
+    fn markdown_v2_converts_bold_and_heading() {
+        assert_eq!(markdown_to_markdownv2("**bold**"), "*bold*");
+        assert_eq!(markdown_to_markdownv2("## Title"), "*Title*");
+    }
+
+    #[test]
+    fn markdown_v2_converts_list_items() {
+        assert_eq!(markdown_to_markdownv2("- item one"), "• item one");
+        assert_eq!(markdown_to_markdownv2("* item two"), "• item two");
+    }
+
+    #[test]
+    fn markdown_v2_keeps_code_blocks_verbatim() {
+        let input = "```\nlet x = 1_2;\n```";
+        let out = markdown_to_markdownv2(input);
+        // Inside code entities only backslash and backtick need escaping.
+        assert!(out.contains("let x = 1_2;"));
+        assert!(out.starts_with("```"));
+    }
+
+    #[test]
+    fn markdown_v2_converts_links() {
+        let out = markdown_to_markdownv2("[site](https://example.com/a)");
+        assert_eq!(out, "[site](https://example.com/a)");
+    }
+
+    #[test]
+    fn markdown_v2_escapes_dots_in_plain_text() {
+        let out = markdown_to_markdownv2("Hello, world!");
+        assert_eq!(out, "Hello, world\\!");
+    }
+
+    #[test]
+    fn markdown_v2_converts_horizontal_rule() {
+        assert_eq!(markdown_to_markdownv2("---"), "────────────────");
+        assert_eq!(markdown_to_markdownv2("***"), "────────────────");
+        assert_eq!(markdown_to_markdownv2("___"), "────────────────");
+        // But a list item is NOT a rule.
+        assert_eq!(markdown_to_markdownv2("- item"), "• item");
+    }
+
+    #[test]
+    fn markdown_v2_converts_blockquote() {
+        // Single-line blockquote keeps the ">" prefix (Telegram MarkdownV2
+        // blockquote) and escapes inner specials.
+        assert_eq!(
+            markdown_to_markdownv2("> 💡 Tips: hello world."),
+            "> 💡 Tips: hello world\\."
+        );
+        // Consecutive quoted lines stay as separate blockquote lines.
+        assert_eq!(
+            markdown_to_markdownv2("> line one\n> line two"),
+            "> line one\n> line two"
+        );
+        // Inline formatting inside a quote is converted.
+        assert_eq!(
+            markdown_to_markdownv2("> **bold** text"),
+            "> *bold* text"
+        );
+        // A bare ">" with no content still emits a quote line.
+        assert_eq!(markdown_to_markdownv2(">"), ">");
+    }
+
+    #[test]
+    fn split_table_row_parses_cells() {
+        assert_eq!(
+            split_table_row("| a | b | c |"),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(split_table_row("|a|b|"), vec!["a", "b"]);
+        assert_eq!(split_table_row("a | b"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn is_table_separator_detects_alignment_rows() {
+        assert!(is_table_separator("|---|---|"));
+        assert!(is_table_separator("|:---|:---:|---:|"));
+        assert!(is_table_separator("---|---"));
+        assert!(!is_table_separator("| a | b |"));
+        assert!(!is_table_separator("hello"));
+    }
+
+    #[test]
+    fn markdown_v2_converts_table_to_bullets() {
+        let input = "| Name | Age |\n|---|---|\n| Alice | 30 |\n| Bob | 25 |";
+        let out = markdown_to_markdownv2(input);
+        assert!(out.contains("• Name: Alice · Age: 30"));
+        assert!(out.contains("• Name: Bob · Age: 25"));
+        // No raw pipes should survive.
+        assert!(!out.contains('|'));
+    }
+
+    #[test]
+    fn markdown_v2_table_skips_empty_cells() {
+        let input = "| A | B |\n|---|---|\n| x |  |";
+        let out = markdown_to_markdownv2(input);
+        assert!(out.contains("• A: x"));
+        assert!(!out.contains("B:"));
+    }
+
+    #[test]
+    fn markdown_v2_leaves_pipe_without_separator_alone() {
+        // A lone pipe line with no separator row is not a table; escape it.
+        let out = markdown_to_markdownv2("a | b");
+        assert_eq!(out, "a \\| b");
+    }
+
+    #[test]
+    fn markdown_v2_table_inside_code_block_stays_verbatim() {
+        let input = "```\n| a | b |\n|---|---|\n```";
+        let out = markdown_to_markdownv2(input);
+        // Table syntax inside a fence must not be converted.
+        assert!(out.contains("| a | b |"));
+    }
 
     #[test]
     fn test_incoming_message() {
@@ -814,5 +1925,65 @@ mod tests {
             result,
             Err(crate::error::Error::MissingConfig { key }) if key == "slack_token"
         ));
+    }
+
+    #[tokio::test]
+    async fn gateway_run_errors_without_enabled_adapters() {
+        let gateway = Gateway::new(GatewayConfig::default());
+        // No adapters registered at all -> run() must fail fast.
+        let result = gateway.run().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn gateway_run_errors_when_only_disabled_adapters() {
+        let gateway = Gateway::new(GatewayConfig::default())
+            .with_adapter(Arc::new(TelegramAdapter::new(None)));
+        // Adapter registered but disabled (no token) -> still no enabled adapters.
+        let result = gateway.run().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn telegram_poll_updates_disabled_returns_empty() {
+        let adapter = TelegramAdapter::new(None);
+        let updates = adapter.poll_updates().await.unwrap();
+        assert!(updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slack_poll_updates_default_returns_empty() {
+        // Slack relies on webhooks; the default poll_updates impl yields nothing.
+        let adapter = SlackAdapter::new(None, None);
+        let updates = adapter.poll_updates().await.unwrap();
+        assert!(updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn telegram_handle_update_parses_message() {
+        let adapter = TelegramAdapter::new(Some("test-token".to_string()));
+        let update = serde_json::json!({
+            "update_id": 42,
+            "message": {
+                "message_id": 7,
+                "text": "hello bot",
+                "chat": { "id": 999, "type": "private" },
+                "from": { "id": 123, "username": "nix" }
+            }
+        });
+
+        let incoming = adapter.handle_update(update).await.unwrap().unwrap();
+        assert_eq!(incoming.platform, "telegram");
+        assert_eq!(incoming.user_id, "123");
+        assert_eq!(incoming.username, "nix");
+        assert_eq!(incoming.channel_id, "999");
+        assert_eq!(incoming.content, "hello bot");
+    }
+
+    #[tokio::test]
+    async fn telegram_handle_update_ignores_non_message() {
+        let adapter = TelegramAdapter::new(Some("test-token".to_string()));
+        let update = serde_json::json!({ "update_id": 1, "edited_message": {} });
+        assert!(adapter.handle_update(update).await.unwrap().is_none());
     }
 }
