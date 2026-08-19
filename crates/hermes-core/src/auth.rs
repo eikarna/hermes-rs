@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -15,6 +16,31 @@ use crate::platform::{hermes_data_dir, set_file_permissions, set_secure_permissi
 const AUTH_STORE_VERSION: u32 = 1;
 const BASE64_URL_SAFE: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+// ---------------------------------------------------------------------------
+// Nous Portal OAuth (device-code flow)
+// ---------------------------------------------------------------------------
+/// Default Nous Portal base URL for token operations.
+pub const NOUS_PORTAL_URL: &str = "https://portal.nousresearch.com";
+/// Default Nous Portal inference API base URL (OpenAI-compatible).
+pub const NOUS_INFERENCE_URL: &str = "https://inference-api.nousresearch.com/v1";
+/// OAuth client id Nous Portal expects from the Hermes CLI.
+pub const NOUS_CLIENT_ID: &str = "hermes-cli";
+/// Scope granting inference invoke access. The returned access token is itself
+/// a short-lived invoke JWT usable directly as the inference bearer.
+pub const NOUS_SCOPE: &str = "inference:invoke";
+/// Refresh the access token this many seconds before it expires.
+const NOUS_TOKEN_REFRESH_SKEW_SECONDS: u64 = 120;
+
+/// Shared HTTP client for the synchronous-looking Portal OAuth calls. Created
+/// once per process; avoids building a new connection pool on every login or
+/// token refresh. `reqwest::Client` is cheap to clone (internal `Arc`), so we
+/// return an owned copy of the singleton.
+fn http_client() -> reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -40,6 +66,11 @@ pub struct AuthProfile {
     pub base_url: Option<String>,
     pub secret_ref: String,
     pub disabled: bool,
+    /// Persisted OAuth tokens for `AuthMethod::Oauth`. Stored directly in the
+    /// auth store (the only credential on disk) rather than referenced via an
+    /// environment variable, matching the upstream Nous Portal behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthStoredTokens>,
 }
 
 impl Default for AuthProfile {
@@ -50,6 +81,7 @@ impl Default for AuthProfile {
             base_url: None,
             secret_ref: String::new(),
             disabled: false,
+            oauth: None,
         }
     }
 }
@@ -60,6 +92,44 @@ pub enum AuthMethod {
     #[default]
     ApiKey,
     BearerToken,
+    /// OAuth device-code flow (e.g. Nous Portal). Tokens are persisted in
+    /// `AuthProfile::oauth`; `secret_ref` is unused.
+    Oauth,
+}
+
+/// Persisted OAuth token state for a device-code profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthStoredTokens {
+    /// Short-lived access token (an invoke JWT for Nous Portal).
+    pub access_token: String,
+    /// Long-lived refresh token.
+    pub refresh_token: String,
+    pub client_id: String,
+    /// Portal base URL used for token operations.
+    pub portal_base_url: String,
+    /// Inference API base URL the access token is valid against.
+    pub inference_base_url: String,
+    pub token_type: String,
+    /// Unix epoch seconds when `access_token` expires. `0` when unknown.
+    pub expires_at: u64,
+    /// Scope granted (e.g. `inference:invoke`).
+    pub scope: String,
+}
+
+impl Default for OAuthStoredTokens {
+    fn default() -> Self {
+        Self {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            client_id: NOUS_CLIENT_ID.to_string(),
+            portal_base_url: NOUS_PORTAL_URL.to_string(),
+            inference_base_url: NOUS_INFERENCE_URL.to_string(),
+            token_type: "Bearer".to_string(),
+            expires_at: 0,
+            scope: NOUS_SCOPE.to_string(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -231,6 +301,7 @@ impl AuthStore {
                 base_url,
                 secret_ref: format!("env:{}", env_var),
                 disabled: false,
+                oauth: None,
             },
         );
         Ok(())
@@ -258,6 +329,7 @@ impl AuthStore {
                 base_url: Some(base_url),
                 secret_ref: format!("env:{}", env_var),
                 disabled: false,
+                oauth: None,
             },
         );
         Ok(())
@@ -327,6 +399,12 @@ impl AuthProfile {
         }
         match self.method {
             AuthMethod::ApiKey | AuthMethod::BearerToken => {}
+            AuthMethod::Oauth => {
+                return Err(Error::Config(format!(
+                    "Auth profile '{}' is an OAuth profile; use resolve_oauth_token instead",
+                    self.provider
+                )));
+            }
         }
 
         let env_var = self.resolved_env_var().ok_or_else(|| {
@@ -346,17 +424,41 @@ impl AuthProfile {
 
     fn validate(&self) -> Result<()> {
         validate_name("provider", self.provider.clone())?;
-        if self.resolved_env_var().is_none() {
-            return Err(Error::Config(format!(
-                "Auth profile '{}' uses an unsupported secret reference",
-                self.provider
-            )));
-        }
-        if self.method == AuthMethod::BearerToken && self.base_url.is_none() {
-            return Err(Error::Config(format!(
-                "Bearer auth profile '{}' requires a base URL",
-                self.provider
-            )));
+        match self.method {
+            AuthMethod::Oauth => {
+                let tokens = self.oauth.as_ref().ok_or_else(|| {
+                    Error::Config(format!(
+                        "OAuth profile '{}' has no stored tokens",
+                        self.provider
+                    ))
+                })?;
+                if tokens.access_token.is_empty() || tokens.refresh_token.is_empty() {
+                    return Err(Error::Config(format!(
+                        "OAuth profile '{}' is missing access or refresh token",
+                        self.provider
+                    )));
+                }
+                if tokens.portal_base_url.is_empty() || tokens.inference_base_url.is_empty() {
+                    return Err(Error::Config(format!(
+                        "OAuth profile '{}' is missing a Portal or inference base URL",
+                        self.provider
+                    )));
+                }
+            }
+            AuthMethod::ApiKey | AuthMethod::BearerToken => {
+                if self.resolved_env_var().is_none() {
+                    return Err(Error::Config(format!(
+                        "Auth profile '{}' uses an unsupported secret reference",
+                        self.provider
+                    )));
+                }
+                if self.method == AuthMethod::BearerToken && self.base_url.is_none() {
+                    return Err(Error::Config(format!(
+                        "Bearer auth profile '{}' requires a base URL",
+                        self.provider
+                    )));
+                }
+            }
         }
         let _ = validate_base_url(self.base_url.clone())?;
         Ok(())
@@ -460,7 +562,7 @@ pub async fn exchange_oauth_authorization_code(
     code: &str,
     code_verifier: &str,
 ) -> Result<OAuthTokenResponse> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     exchange_oauth_authorization_code_with_client(
         &client,
         token_endpoint,
@@ -520,6 +622,330 @@ async fn exchange_oauth_authorization_code_with_client(
         ));
     }
     Ok(token)
+}
+
+// ---------------------------------------------------------------------------
+// Nous Portal device-code flow
+// ---------------------------------------------------------------------------
+
+/// Result of requesting a device code from the Portal.
+#[derive(Debug, Clone)]
+pub struct NousDeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri_complete: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+/// Request a device code from the Nous Portal. The user opens
+/// `verification_uri_complete` to approve the login.
+pub async fn request_nous_device_code(
+    portal_base_url: &str,
+    client_id: &str,
+    scope: &str,
+) -> Result<NousDeviceCode> {
+    let client = http_client();
+    let response = client
+        .post(format!(
+            "{}/api/oauth/device/code",
+            portal_base_url.trim_end_matches('/')
+        ))
+        .form(&[("client_id", client_id), ("scope", scope)])
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(Error::Config(format!(
+            "Nous Portal device code request failed ({}): {}",
+            status, body
+        )));
+    }
+    let data: serde_json::Value = response.json().await?;
+    let device_code = data
+        .get("device_code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Config("Device code response missing device_code".to_string()))?
+        .to_string();
+    let user_code = data
+        .get("user_code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let verification_uri_complete = data
+        .get("verification_uri_complete")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("verification_uri").and_then(Value::as_str))
+        .ok_or_else(|| Error::Config("Device code response missing verification_uri".to_string()))?
+        .to_string();
+    let expires_in = data
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(600);
+    let interval = data.get("interval").and_then(Value::as_u64).unwrap_or(5);
+    Ok(NousDeviceCode {
+        device_code,
+        user_code,
+        verification_uri_complete,
+        expires_in,
+        interval: interval.max(1),
+    })
+}
+
+/// Poll the token endpoint until the user approves the device code or it
+/// expires. Handles `authorization_pending` and `slow_down` per RFC 8628.
+pub async fn poll_nous_device_token(
+    portal_base_url: &str,
+    client_id: &str,
+    device_code: &str,
+    expires_in: u64,
+    interval: u64,
+) -> Result<OAuthTokenResponse> {
+    let client = http_client();
+    let token_url = format!("{}/api/oauth/token", portal_base_url.trim_end_matches('/'));
+    let deadline = std::time::Instant::now() + Duration::from_secs(expires_in);
+    let mut current_interval = interval.max(1);
+
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Config(
+                "Timed out waiting for device authorization. Sign in at the Portal, then retry."
+                    .to_string(),
+            ));
+        }
+
+        let response = client
+            .post(&token_url)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", client_id),
+                ("device_code", device_code),
+            ])
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let token: OAuthTokenResponse = response.json().await?;
+            if !token.access_token.is_empty() {
+                return Ok(token);
+            }
+            return Err(Error::Config(
+                "Nous Portal token response missing access_token".to_string(),
+            ));
+        }
+
+        let error_payload: serde_json::Value =
+            response.json().await.unwrap_or(serde_json::json!({}));
+        let error_code = error_payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        match error_code {
+            "authorization_pending" => {
+                tokio::time::sleep(Duration::from_secs(current_interval)).await
+            }
+            "slow_down" => {
+                current_interval = (current_interval + 1).min(30);
+                tokio::time::sleep(Duration::from_secs(current_interval)).await
+            }
+            other => {
+                let description = error_payload
+                    .get("error_description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown authentication error");
+                return Err(Error::Config(format!(
+                    "Nous Portal auth error: {}: {}",
+                    other, description
+                )));
+            }
+        }
+    }
+}
+
+/// Exchange a refresh token for a new access token at the Portal token endpoint.
+pub async fn refresh_nous_access_token(
+    portal_base_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<OAuthTokenResponse> {
+    let client = http_client();
+    let response = client
+        .post(format!(
+            "{}/api/oauth/token",
+            portal_base_url.trim_end_matches('/')
+        ))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(Error::Config(format!(
+            "Nous Portal token refresh failed ({}): {}",
+            status, body
+        )));
+    }
+    let token: OAuthTokenResponse = response.json().await?;
+    if token.access_token.is_empty() {
+        return Err(Error::Config(
+            "Nous Portal refresh response missing access_token".to_string(),
+        ));
+    }
+    Ok(token)
+}
+
+/// Decode the `exp` claim (unix seconds) from a JWT without verifying the
+/// signature. Returns `None` when the token is not a parsable JWT or lacks `exp`.
+pub fn jwt_expiry(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    // base64url (no padding) decode using the project's own safe alphabet.
+    let mut bits: u32 = 0;
+    let mut bits_left: u32 = 0;
+    let mut raw = Vec::new();
+    for ch in payload.chars() {
+        let value = BASE64_URL_SAFE.iter().position(|&b| b as char == ch)? as u32;
+        bits = (bits << 6) | value;
+        bits_left += 6;
+        if bits_left >= 8 {
+            bits_left -= 8;
+            raw.push((bits >> bits_left) as u8);
+        }
+    }
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    value.get("exp").and_then(Value::as_u64)
+}
+
+/// Returns true when the stored access token is still usable (has at least
+/// Returns true when the stored access token still has useful life left
+/// (not within `NOUS_TOKEN_REFRESH_SKEW_SECONDS` of expiry). Unknown expiry is
+/// treated as usable so existing tokens are not needlessly refreshed.
+fn oauth_token_is_fresh(tokens: &OAuthStoredTokens) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Prefer the real JWT `exp` claim when the access token carries one.
+    if let Some(exp) = jwt_expiry(&tokens.access_token) {
+        return exp.saturating_sub(now) >= NOUS_TOKEN_REFRESH_SKEW_SECONDS;
+    }
+    if tokens.expires_at == 0 {
+        return true;
+    }
+    tokens.expires_at.saturating_sub(now) >= NOUS_TOKEN_REFRESH_SKEW_SECONDS
+}
+
+/// Upsert a Nous Portal OAuth profile from a freshly obtained token response.
+pub fn oauth_profile_from_token_response(
+    _name: impl Into<String>,
+    provider: impl Into<String>,
+    token: &OAuthTokenResponse,
+    portal_base_url: &str,
+    inference_base_url: &str,
+    client_id: &str,
+    scope: &str,
+) -> AuthProfile {
+    let expires_at = token
+        .expires_in
+        .map(|secs| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() + secs)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    AuthProfile {
+        provider: provider.into(),
+        method: AuthMethod::Oauth,
+        base_url: Some(inference_base_url.to_string()),
+        secret_ref: String::new(),
+        disabled: false,
+        oauth: Some(OAuthStoredTokens {
+            access_token: token.access_token.clone(),
+            refresh_token: token.refresh_token.clone().unwrap_or_default(),
+            client_id: client_id.to_string(),
+            portal_base_url: portal_base_url.to_string(),
+            inference_base_url: inference_base_url.to_string(),
+            token_type: token.token_type.clone(),
+            expires_at,
+            scope: scope.to_string(),
+        }),
+    }
+}
+
+impl AuthStore {
+    /// Resolve the current access token for an OAuth profile, refreshing it
+    /// (and persisting the rotated tokens) when it is near expiry.
+    pub async fn resolve_oauth_token(&mut self, name: &str) -> Result<String> {
+        let profile = self
+            .profiles
+            .get(name)
+            .ok_or_else(|| Error::MissingConfig {
+                key: format!("auth profile '{}'", name),
+            })?;
+        if profile.method != AuthMethod::Oauth {
+            return Err(Error::Config(format!(
+                "Auth profile '{}' is not an OAuth profile",
+                profile.provider
+            )));
+        }
+        let tokens = profile.oauth.clone().ok_or_else(|| {
+            Error::Config(format!(
+                "OAuth profile '{}' has no stored tokens",
+                profile.provider
+            ))
+        })?;
+
+        if oauth_token_is_fresh(&tokens) {
+            return Ok(tokens.access_token);
+        }
+
+        if tokens.refresh_token.is_empty() {
+            return Err(Error::Config(
+                "Nous Portal access token expired and no refresh token is available. Re-authenticate with: hermes auth login <provider>".to_string(),
+            ));
+        }
+
+        let refreshed = refresh_nous_access_token(
+            &tokens.portal_base_url,
+            &tokens.client_id,
+            &tokens.refresh_token,
+        )
+        .await?;
+
+        let new_tokens = OAuthStoredTokens {
+            access_token: refreshed.access_token.clone(),
+            refresh_token: refreshed
+                .refresh_token
+                .clone()
+                .unwrap_or(tokens.refresh_token),
+            client_id: tokens.client_id,
+            portal_base_url: tokens.portal_base_url,
+            inference_base_url: tokens.inference_base_url,
+            token_type: refreshed.token_type.clone(),
+            expires_at: refreshed
+                .expires_in
+                .map(|secs| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() + secs)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(tokens.expires_at),
+            scope: tokens.scope,
+        };
+
+        if let Some(profile) = self.profiles.get_mut(name) {
+            profile.oauth = Some(new_tokens.clone());
+        }
+        self.save_default()?;
+
+        Ok(new_tokens.access_token)
+    }
 }
 
 fn fragment_contains_access_token(fragment: &str) -> bool {
@@ -878,6 +1304,7 @@ mod tests {
             base_url: None,
             secret_ref: "env:GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
             disabled: false,
+            oauth: None,
         };
 
         assert!(profile.resolve_auth_token().is_err());
@@ -1080,7 +1507,7 @@ mod tests {
             )
             .create_async()
             .await;
-        let client = reqwest::Client::new();
+        let client = http_client();
 
         let token = exchange_oauth_authorization_code_with_client(
             &client,
@@ -1127,7 +1554,7 @@ mod tests {
             )
             .create_async()
             .await;
-        let client = reqwest::Client::new();
+        let client = http_client();
 
         let result = exchange_oauth_authorization_code_with_client(
             &client,
@@ -1188,5 +1615,174 @@ mod tests {
 
         assert!(store.remove_profile("openai-default"));
         assert!(!store.remove_profile("openai-default"));
+    }
+
+    #[test]
+    fn jwt_expiry_decodes_exp_claim() {
+        // header.payload.signature with payload {"exp": 1700000000}
+        let payload = base64_url_nopad("{\"exp\":1700000000}");
+        let token = format!("eyJhbGciOiJIUzI1NiJ9.{}.sig", payload);
+        assert_eq!(jwt_expiry(&token), Some(1700000000));
+        assert_eq!(jwt_expiry("not-a-jwt"), None);
+    }
+
+    fn base64_url_nopad(input: &str) -> String {
+        // Manual base64url (no padding) encode using the project's alphabet,
+        // mirroring the decode path used by `jwt_expiry`.
+        let bytes = input.as_bytes();
+        let mut out = String::new();
+        let mut buf = 0u32;
+        let mut nbits = 0u32;
+        for &b in bytes {
+            buf = (buf << 8) | b as u32;
+            nbits += 8;
+            while nbits >= 6 {
+                nbits -= 6;
+                let idx = ((buf >> nbits) & 0x3f) as usize;
+                out.push(BASE64_URL_SAFE[idx] as char);
+            }
+        }
+        if nbits > 0 {
+            let idx = ((buf << (6 - nbits)) & 0x3f) as usize;
+            out.push(BASE64_URL_SAFE[idx] as char);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn request_nous_device_code_posts_expected_body() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/oauth/device/code")
+            .match_body(mockito::Matcher::Regex("client_id=hermes-cli".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"device_code":"dc123","user_code":"ABCD-EFGH","verification_uri_complete":"https://portal.nousresearch.com/device?code=ABCD-EFGH","expires_in":600,"interval":5}"#,
+            )
+            .create_async()
+            .await;
+
+        let device = request_nous_device_code(&server.url(), NOUS_CLIENT_ID, NOUS_SCOPE)
+            .await
+            .unwrap();
+        assert_eq!(device.device_code, "dc123");
+        assert_eq!(device.user_code, "ABCD-EFGH");
+        assert!(device.verification_uri_complete.contains("ABCD-EFGH"));
+        assert_eq!(device.expires_in, 600);
+        assert_eq!(device.interval, 5);
+        _m.assert_async().await;
+        server.reset();
+    }
+
+    #[tokio::test]
+    async fn poll_nous_device_token_handles_pending_then_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/oauth/token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"access_token":"access-abc","token_type":"Bearer","refresh_token":"refresh-xyz","expires_in":3600}"#,
+            )
+            .create_async()
+            .await;
+
+        let token = poll_nous_device_token(
+            &server.url(),
+            NOUS_CLIENT_ID,
+            "dc123",
+            600,
+            0, // no delay between polls in test
+        )
+        .await
+        .unwrap();
+        assert_eq!(token.access_token, "access-abc");
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh-xyz"));
+        _m.assert_async().await;
+        server.reset();
+    }
+
+    #[tokio::test]
+    async fn refresh_nous_access_token_uses_refresh_grant() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/oauth/token")
+            .match_body(mockito::Matcher::Regex("grant_type=refresh_token".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"access_token":"access-new","token_type":"Bearer","refresh_token":"refresh-new","expires_in":3600}"#,
+            )
+            .create_async()
+            .await;
+
+        let token = refresh_nous_access_token(&server.url(), NOUS_CLIENT_ID, "refresh-old")
+            .await
+            .unwrap();
+        assert_eq!(token.access_token, "access-new");
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh-new"));
+        _m.assert_async().await;
+        server.reset();
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth_token_refreshes_when_expired_and_persists() {
+        let dir = std::env::temp_dir().join(format!("hermes-auth-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Isolate the default auth store (used by `save_default`/`load_default`
+        // inside `resolve_oauth_token`) so the test never writes over the
+        // developer's real `~/.hermes/data/auth.json`.
+        std::env::set_var("HERMES_HOME", dir.to_str().unwrap());
+        let path = dir.join("auth.json");
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/oauth/token")
+            .match_body(mockito::Matcher::Regex("grant_type=refresh_token".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"access_token":"access-refreshed","token_type":"Bearer","refresh_token":"refresh-2","expires_in":3600}"#,
+            )
+            .create_async()
+            .await;
+
+        // Build an OAuth profile whose access token is already expired (exp in the past).
+        let expired_payload = base64_url_nopad("{\"exp\":1}");
+        let expired_token = format!("eyJhbGciOiJIUzI1NiJ9.{}.sig", expired_payload);
+        assert_eq!(jwt_expiry(&expired_token), Some(1));
+        let mut profile = oauth_profile_from_token_response(
+            "nous-default",
+            "nous",
+            &OAuthTokenResponse {
+                access_token: expired_token,
+                token_type: "Bearer".to_string(),
+                refresh_token: Some("refresh-old".to_string()),
+                expires_in: Some(3600),
+                scope: None,
+            },
+            &server.url(),
+            NOUS_INFERENCE_URL,
+            NOUS_CLIENT_ID,
+            NOUS_SCOPE,
+        );
+        // Force expiry to the past regardless of clock skew handling.
+        if let Some(oauth) = profile.oauth.as_mut() {
+            oauth.expires_at = 1;
+        }
+        let mut store = AuthStore::default();
+        store.profiles.insert("nous-default".to_string(), profile);
+        store.save_to(&path).unwrap();
+
+        let mut loaded = AuthStore::load_from(&path).unwrap();
+        let access = loaded.resolve_oauth_token("nous-default").await.unwrap();
+        assert_eq!(access, "access-refreshed");
+
+        // The refreshed tokens should be persisted on the in-memory store.
+        let stored = loaded.profiles["nous-default"].oauth.as_ref().unwrap();
+        assert_eq!(stored.access_token, "access-refreshed");
+        assert_eq!(stored.refresh_token, "refresh-2");
+        _m.assert_async().await;
+        server.reset();
     }
 }

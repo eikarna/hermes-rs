@@ -98,6 +98,7 @@ impl ClientSettings {
             crate::client::ProviderKind::Openrouter => Some(&self.openrouter),
             crate::client::ProviderKind::Anthropic => Some(&self.anthropic),
             crate::client::ProviderKind::Gemini => Some(&self.gemini),
+            crate::client::ProviderKind::Nous => None,
         }
     }
 
@@ -114,6 +115,7 @@ impl ClientSettings {
             crate::client::ProviderKind::Openrouter => non_empty_env("OPENROUTER_BASE_URL"),
             crate::client::ProviderKind::Anthropic => non_empty_env("ANTHROPIC_BASE_URL"),
             crate::client::ProviderKind::Gemini => non_empty_env("GEMINI_BASE_URL"),
+            crate::client::ProviderKind::Nous => None,
         });
         value.filter(|v| !v.trim().is_empty())
     }
@@ -132,6 +134,7 @@ impl ClientSettings {
                 crate::client::ProviderKind::Openrouter => non_empty_env("OPENROUTER_API_KEY"),
                 crate::client::ProviderKind::Anthropic => non_empty_env("ANTHROPIC_API_KEY"),
                 crate::client::ProviderKind::Gemini => non_empty_env("GEMINI_API_KEY"),
+                crate::client::ProviderKind::Nous => None,
             })
             .filter(|v| !v.trim().is_empty())
     }
@@ -157,6 +160,7 @@ impl ClientSettings {
             crate::client::ProviderKind::Gemini => {
                 non_empty_env("GEMINI_TIMEOUT_SECS").and_then(|value| value.parse().ok())
             }
+            crate::client::ProviderKind::Nous => None,
         })
     }
 }
