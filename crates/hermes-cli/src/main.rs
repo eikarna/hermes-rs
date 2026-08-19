@@ -825,7 +825,9 @@ impl RunProgress {
         // In streaming mode the live message is the stream message; fall back
         // to the heartbeat status message otherwise.
         let target_id = if self.streaming {
-            self.stream_msg_id.clone().or_else(|| self.status_msg_id.clone())
+            self.stream_msg_id
+                .clone()
+                .or_else(|| self.status_msg_id.clone())
         } else {
             self.status_msg_id.clone()
         };
@@ -856,7 +858,10 @@ impl RunProgress {
         // No reply to show: keep a short terminal indicator in place of the
         // heartbeat so the user knows what happened to the run.
         let text = if outcome.cancelled {
-            format!("🛑 Stopped after {}", format_elapsed(self.started.elapsed()))
+            format!(
+                "🛑 Stopped after {}",
+                format_elapsed(self.started.elapsed())
+            )
         } else if let Some(err) = outcome.error {
             format!("❌ Error: {}", err)
         } else {
@@ -912,8 +917,7 @@ impl RunProgress {
                     arguments
                 };
                 let text = format!("🔧 Running tool: {}\n`{}`", name, preview);
-                let msg =
-                    hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text);
+                let msg = hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text);
                 if let Ok(Some(id)) = self.sink.send(msg).await {
                     self.tool_msgs.insert(call_id, id);
                 }
@@ -930,9 +934,8 @@ impl RunProgress {
                 } else {
                     format!("❌ {} failed", label)
                 };
-                let msg =
-                    hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text)
-                        .no_markdown();
+                let msg = hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text)
+                    .no_markdown();
                 if let Some(id) = self.tool_msgs.remove(&result.tool_call_id) {
                     let _ = self.sink.edit(&id, msg).await;
                 }
@@ -942,9 +945,8 @@ impl RunProgress {
             AgentEvent::ToolError { name, .. } => {
                 self.phase = "thinking".to_string();
                 let text = format!("❌ {} failed", name);
-                let msg =
-                    hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text)
-                        .no_markdown();
+                let msg = hermes_core::gateway::OutgoingMessage::new(&self.channel_id, text)
+                    .no_markdown();
                 let _ = self.sink.send(msg).await;
             }
             AgentEvent::IterationComplete { .. } => {
@@ -1158,8 +1160,8 @@ async fn run_gateway(config: &AppConfig, system_prompt: Option<&str>) -> Result<
         current_channel: tokio::sync::Mutex::new(None),
         run_lock: tokio::sync::Mutex::new(()),
     });
-    let mut gateway = hermes_core::gateway::Gateway::new(gateway_config.clone())
-        .with_handler(handler);
+    let mut gateway =
+        hermes_core::gateway::Gateway::new(gateway_config.clone()).with_handler(handler);
 
     if gateway_config.telegram_enabled {
         gateway = gateway.with_adapter(Arc::new(hermes_core::gateway::TelegramAdapter::new(

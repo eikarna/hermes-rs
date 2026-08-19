@@ -174,7 +174,7 @@ pub trait PlatformAdapter: Send + Sync {
     /// Platforms that expose a message ID on send (Telegram) return it so
     /// callers can edit the message in place later (status heartbeats,
     /// tool progress updates). The default implementation falls back to
-    /// [`send_message`] with no ID.
+    /// [`Self::send_message`] with no ID.
     async fn send_message_tracked(&self, message: OutgoingMessage) -> Result<Option<String>> {
         self.send_message(message).await?;
         Ok(None)
@@ -635,10 +635,7 @@ async fn dispatch_message(
         let _ = run.done.send(true);
         {
             let mut runs = active_runs.write().await;
-            if runs
-                .get(&run_key)
-                .is_some_and(|r| Arc::ptr_eq(r, &run))
-            {
+            if runs.get(&run_key).is_some_and(|r| Arc::ptr_eq(r, &run)) {
                 runs.remove(&run_key);
             }
         }
@@ -1110,11 +1107,7 @@ impl WhatsAppAdapter {
     }
 
     /// POST a JSON body to a bridge endpoint, surfacing bridge-level errors.
-    async fn post_bridge(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    async fn post_bridge(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let response = self
             .client
             .post(format!("{}{}", self.base(), path))
@@ -1197,17 +1190,13 @@ fn markdown_to_whatsapp(content: &str) -> String {
     //    non-space, non-asterisk first char to avoid list bullets ("* item").
     let italic_re = regex::Regex::new(r"\*([^\s*][^*\n]*?)\*").expect("static regex");
     result = italic_re
-        .replace_all(&result, |caps: &regex::Captures| {
-            format!("_{}_", &caps[1])
-        })
+        .replace_all(&result, |caps: &regex::Captures| format!("_{}_", &caps[1]))
         .into_owned();
 
     // 5. Strikethrough: ~~text~~ → ~text~.
     let strike_re = regex::Regex::new(r"~~([\s\S]+?)~~").expect("static regex");
     result = strike_re
-        .replace_all(&result, |caps: &regex::Captures| {
-            format!("~{}~", &caps[1])
-        })
+        .replace_all(&result, |caps: &regex::Captures| format!("~{}~", &caps[1]))
         .into_owned();
 
     // 6. Headers: "# Title" → "*Title*". Strip any *...* wrapping the inner
@@ -1932,10 +1921,7 @@ fn split_table_row(line: &str) -> Vec<String> {
         .unwrap_or(trimmed)
         .strip_suffix('|')
         .unwrap_or_else(|| trimmed.strip_prefix('|').unwrap_or(trimmed));
-    inner
-        .split('|')
-        .map(|c| c.trim().to_string())
-        .collect()
+    inner.split('|').map(|c| c.trim().to_string()).collect()
 }
 
 /// True if `line` is a table separator row like `|---|:---:|---:|`.
@@ -1949,10 +1935,7 @@ fn is_table_separator(line: &str) -> bool {
         return false;
     }
     cells.iter().all(|c| {
-        !c.is_empty()
-            && c.chars()
-                .all(|ch| ch == '-' || ch == ':' || ch == ' ')
-            && c.contains('-')
+        !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ') && c.contains('-')
     })
 }
 
@@ -2050,9 +2033,9 @@ pub fn markdown_to_markdownv2(input: &str) -> String {
         {
             let t = trimmed.trim();
             let is_hr = t.len() >= 3
-                && ((t.chars().all(|c| c == '-')
+                && (t.chars().all(|c| c == '-')
                     || t.chars().all(|c| c == '*')
-                    || t.chars().all(|c| c == '_')));
+                    || t.chars().all(|c| c == '_'));
             if is_hr {
                 out.push_str("────────────────\n");
                 idx += 1;
@@ -2200,20 +2183,14 @@ mod tests {
             "> line one\n> line two"
         );
         // Inline formatting inside a quote is converted.
-        assert_eq!(
-            markdown_to_markdownv2("> **bold** text"),
-            "> *bold* text"
-        );
+        assert_eq!(markdown_to_markdownv2("> **bold** text"), "> *bold* text");
         // A bare ">" with no content still emits a quote line.
         assert_eq!(markdown_to_markdownv2(">"), ">");
     }
 
     #[test]
     fn split_table_row_parses_cells() {
-        assert_eq!(
-            split_table_row("| a | b | c |"),
-            vec!["a", "b", "c"]
-        );
+        assert_eq!(split_table_row("| a | b | c |"), vec!["a", "b", "c"]);
         assert_eq!(split_table_row("|a|b|"), vec!["a", "b"]);
         assert_eq!(split_table_row("a | b"), vec!["a", "b"]);
     }

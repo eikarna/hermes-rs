@@ -34,8 +34,10 @@ impl SessionStore {
 
     /// Map a channel key to a safe file path.
     fn path_for(&self, channel_key: &str) -> PathBuf {
-        self.dir
-            .join(format!("{}.json", crate::persist::sanitize_key(channel_key)))
+        self.dir.join(format!(
+            "{}.json",
+            crate::persist::sanitize_key(channel_key)
+        ))
     }
 
     /// Load history for a channel. Returns an empty vec when no session file
@@ -59,7 +61,7 @@ impl SessionStore {
         }
     }
 
-    /// Save history for a channel, capped to the last [`MAX_SESSION_MESSAGES`].
+    /// Save history for a channel, capped to the last 200 messages.
     ///
     /// Assistant `reasoning` (chain-of-thought) is stripped before persisting:
     /// it is internal, large, and would otherwise be re-sent on every request.
@@ -79,7 +81,11 @@ impl SessionStore {
 
         let path = self.path_for(channel_key);
         crate::persist::write_json(&path, &trimmed).map_err(|e| {
-            Error::Config(format!("Failed to write session file '{}': {}", path.display(), e))
+            Error::Config(format!(
+                "Failed to write session file '{}': {}",
+                path.display(),
+                e
+            ))
         })?;
         Ok(())
     }

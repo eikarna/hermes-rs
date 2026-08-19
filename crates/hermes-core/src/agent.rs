@@ -222,12 +222,7 @@ impl HermesAgent {
 
     /// Send an event to the channel
     async fn emit(&self, event: AgentEvent) {
-        let tx = {
-            self.event_tx
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-        };
+        let tx = { self.event_tx.lock().ok().and_then(|guard| guard.clone()) };
         if let Some(tx) = tx {
             // Non-blocking send: progress events are decorative. If the
             // consumer (progress pump) is dead or wedged, the bounded

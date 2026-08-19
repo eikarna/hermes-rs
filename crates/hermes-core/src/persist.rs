@@ -56,9 +56,9 @@ pub fn write_json<T: Serialize>(path: &std::path::Path, value: &T) -> std::io::R
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
     let mut tmp = path.to_path_buf();
     let mut tmp_name = file_name.to_os_string();
     tmp_name.push(format!(".tmp.{}", std::process::id()));

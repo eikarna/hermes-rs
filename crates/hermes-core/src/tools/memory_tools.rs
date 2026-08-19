@@ -22,10 +22,7 @@ fn memory_file() -> std::path::PathBuf {
 
 /// Load the memory map from disk (empty when missing/corrupt).
 fn load_from_disk() -> HashMap<String, MemoryEntry> {
-    match crate::persist::read_json::<HashMap<String, MemoryEntry>>(&memory_file()) {
-        Some(map) => map,
-        None => HashMap::new(),
-    }
+    crate::persist::read_json::<HashMap<String, MemoryEntry>>(&memory_file()).unwrap_or_default()
 }
 
 /// Persist the memory map to disk. Errors are logged, not fatal.
