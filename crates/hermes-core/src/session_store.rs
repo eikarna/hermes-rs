@@ -63,11 +63,10 @@ impl SessionStore {
     ///
     /// Assistant `reasoning` (chain-of-thought) is stripped before persisting:
     /// it is internal, large, and would otherwise be re-sent on every request.
+    ///
+    /// Uses the atomic `persist::write_json` so a crash mid-write can never
+    /// leave a truncated session file.
     pub fn save(&self, channel_key: &str, messages: &[Message]) -> Result<()> {
-        std::fs::create_dir_all(&self.dir).map_err(|e| {
-            Error::Config(format!("Failed to create session dir '{}': {}", self.dir.display(), e))
-        })?;
-
         let start = messages.len().saturating_sub(MAX_SESSION_MESSAGES);
         let trimmed: Vec<Message> = messages[start..]
             .iter()
@@ -78,10 +77,8 @@ impl SessionStore {
             })
             .collect();
 
-        let json = serde_json::to_string_pretty(&trimmed)
-            .map_err(|e| Error::Config(format!("Failed to serialize session: {}", e)))?;
         let path = self.path_for(channel_key);
-        std::fs::write(&path, json).map_err(|e| {
+        crate::persist::write_json(&path, &trimmed).map_err(|e| {
             Error::Config(format!("Failed to write session file '{}': {}", path.display(), e))
         })?;
         Ok(())

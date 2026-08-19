@@ -1098,10 +1098,31 @@ mod tests {
         tools_call.assert_async().await;
     }
 
+    /// Resolve a Python interpreter for the fake stdio server. Distros
+    /// differ: some ship only `python3`, some only `python`. Returns None
+    /// when neither exists so the test can skip instead of failing.
+    fn python_interpreter() -> Option<String> {
+        for candidate in ["python3", "python"] {
+            if std::process::Command::new(candidate)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                return Some(candidate.to_string());
+            }
+        }
+        None
+    }
+
     #[tokio::test]
     async fn stdio_client_connects_lists_and_calls_tool() {
+        let Some(python) = python_interpreter() else {
+            eprintln!("skipping: no python interpreter found");
+            return;
+        };
         let server_path = fake_stdio_server_path();
-        let client = McpStdioClient::new("python", vec![server_path], HashMap::new());
+        let client = McpStdioClient::new(&python, vec![server_path], HashMap::new());
 
         client.connect().await.unwrap();
 

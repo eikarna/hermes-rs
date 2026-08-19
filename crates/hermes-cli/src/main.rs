@@ -901,8 +901,13 @@ impl RunProgress {
                 if self.streaming {
                     self.freeze_stream_segment().await;
                 }
-                let preview = if arguments.len() > 120 {
-                    format!("{}…", &arguments[..120])
+                // Char-safe truncation: byte slicing (&arguments[..120])
+                // panics when the cut lands inside a multi-byte UTF-8
+                // sequence — tool arguments routinely contain non-ASCII
+                // text, and a panic here kills the progress pump.
+                let preview = if arguments.chars().count() > 120 {
+                    let cut: String = arguments.chars().take(120).collect();
+                    format!("{}...", cut)
                 } else {
                     arguments
                 };

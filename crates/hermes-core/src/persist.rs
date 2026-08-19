@@ -44,13 +44,33 @@ pub fn sanitize_key(key: &str) -> String {
 }
 
 /// Write `value` as pretty JSON to `path`, creating parent dirs.
+///
+/// Atomic: the JSON is written to a sibling temp file first, then renamed
+/// over the target. A crash or kill mid-write leaves either the old file or
+/// the new one — never a truncated half-file that `read_json` would reject
+/// (silently dropping the whole session history).
 pub fn write_json<T: Serialize>(path: &std::path::Path, value: &T) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut tmp = path.to_path_buf();
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    tmp.set_file_name(tmp_name);
+
+    std::fs::write(&tmp, json)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Don't litter temp files on failure.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Read JSON from `path`. Returns `None` when the file is missing or
