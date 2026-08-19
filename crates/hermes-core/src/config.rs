@@ -397,6 +397,9 @@ pub struct GatewaySettings {
     pub slack_enabled: bool,
     pub slack_token: Option<String>,
     pub slack_api_base: String,
+    pub whatsapp_enabled: bool,
+    /// Base URL of the Baileys WhatsApp bridge (e.g. "http://127.0.0.1:3000").
+    pub whatsapp_bridge_url: Option<String>,
     pub webhooks_enabled: bool,
     pub webhooks_addr: Option<String>,
     pub admins: Vec<String>,
@@ -417,6 +420,8 @@ impl Default for GatewaySettings {
             slack_enabled: false,
             slack_token: None,
             slack_api_base: "https://slack.com/api".to_string(),
+            whatsapp_enabled: false,
+            whatsapp_bridge_url: None,
             webhooks_enabled: false,
             webhooks_addr: None,
             admins: Vec::new(),

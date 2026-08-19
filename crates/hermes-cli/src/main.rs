@@ -1010,7 +1010,7 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
 
         // Oneshot carrying the final outcome so the pump can replace the
         // live status message with the model's actual reply.
-        let (outcome_tx, outcome_rx) = oneshot::channel::<RunOutcome>();
+        let (outcome_tx, mut outcome_rx) = oneshot::channel::<RunOutcome>();
 
         // Spawn the live progress pump. It owns the sink clone and runs until
         // it receives the final outcome (sent after the agent run completes).
@@ -1026,28 +1026,30 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             heartbeat.tick().await; // consume the immediate first tick
 
-            let mut outcome_rx = Some(outcome_rx);
+            // The event channel closes when the handler detaches the agent's
+            // event sender. That close must NOT end the pump: the final
+            // outcome may still be in flight, and breaking here would drop
+            // the reply silently. Track the channel state and keep waiting
+            // for the outcome (and heartbeats) until it actually arrives.
+            let mut events_open = true;
             loop {
-                let mut rx = match outcome_rx.take() {
-                    Some(rx) => rx,
-                    None => break,
-                };
                 tokio::select! {
-                    maybe_event = event_rx.recv() => {
+                    maybe_event = event_rx.recv(), if events_open => {
                         match maybe_event {
                             Some(event) => progress.on_event(event).await,
-                            // Channel closed without an outcome; stop.
-                            None => break,
+                            // Channel closed: stop polling events but keep
+                            // waiting for the outcome below.
+                            None => {
+                                events_open = false;
+                            }
                         }
-                        outcome_rx = Some(rx);
                     }
                     _ = heartbeat.tick() => {
                         progress.refresh_status().await;
-                        outcome_rx = Some(rx);
                     }
-                    // Poll by reference so the receiver survives branches
-                    // that handle events/heartbeats instead.
-                    outcome = &mut rx => {
+                    // The receiver is polled by mutable reference so it
+                    // survives branches that handle events/heartbeats.
+                    outcome = &mut outcome_rx => {
                         // Run finished: replace the status message with the
                         // model's reply (or a short cancel/error indicator).
                         let outcome = outcome.unwrap_or(RunOutcome {
@@ -1068,9 +1070,6 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
             .run_with_cancel(message.content.clone(), cancel)
             .await;
 
-        // Detach the event sink so no further events reach the pump.
-        self.agent.set_event_sender(None);
-
         // Persist the conversation for this channel so it survives restarts.
         // Save even on cancel/error: partial history is better than losing
         // the whole session.
@@ -1082,6 +1081,9 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
         }
 
         // Hand the outcome to the pump; it replaces the status message.
+        // Send BEFORE detaching the event sender: the pump's select! may
+        // observe the closed event channel first, and we never want the
+        // outcome to arrive after the pump has stopped listening.
         let outcome = match run_result {
             Ok(response) => {
                 let reply = if response.content.trim().is_empty() {
@@ -1112,7 +1114,14 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
         let was_cancelled = outcome.cancelled;
         let had_error = outcome.error.is_some();
         let _ = outcome_tx.send(outcome);
-        let _ = pump.await;
+        // Now that the outcome is queued, detach the event sink so no
+        // further events reach the pump.
+        self.agent.set_event_sender(None);
+        if let Err(e) = pump.await {
+            // A panicked pump means the final reply may never have been
+            // rendered — surface it instead of dying silently.
+            tracing::error!(error = %e, "progress pump task failed");
+        }
 
         if was_cancelled {
             // Propagate so the gateway treats this as an expected stop.
@@ -1159,6 +1168,11 @@ async fn run_gateway(config: &AppConfig, system_prompt: Option<&str>) -> Result<
         gateway = gateway.with_adapter(Arc::new(hermes_core::gateway::SlackAdapter::new(
             gateway_config.slack_token.clone(),
             None,
+        )));
+    }
+    if gateway_config.whatsapp_enabled {
+        gateway = gateway.with_adapter(Arc::new(hermes_core::gateway::WhatsAppAdapter::new(
+            gateway_config.whatsapp_bridge_url.clone(),
         )));
     }
 

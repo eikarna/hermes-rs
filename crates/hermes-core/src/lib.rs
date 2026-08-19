@@ -53,6 +53,7 @@ pub mod githarness;
 pub mod mcp;
 pub mod memory;
 pub mod parser;
+pub mod persist;
 pub mod platform;
 pub mod repomap;
 pub mod schema;
@@ -88,7 +89,7 @@ pub use distillation::{distill_session_to_memory, distill_session_with_provider}
 pub use error::{Error, Result};
 pub use gateway::{
     DiscordAdapter, Gateway, GatewayConfig, IncomingMessage, MessageHandler, OutgoingMessage,
-    PlatformAdapter, SlackAdapter, TelegramAdapter,
+    PlatformAdapter, SlackAdapter, TelegramAdapter, WhatsAppAdapter,
 };
 pub use githarness::{GitHarness, RepoSnapshot};
 pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};

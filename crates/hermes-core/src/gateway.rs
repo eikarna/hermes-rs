@@ -29,6 +29,10 @@ pub struct GatewayConfig {
     pub slack_enabled: bool,
     /// Slack bot token
     pub slack_token: Option<String>,
+    /// Enable WhatsApp via the Baileys bridge
+    pub whatsapp_enabled: bool,
+    /// Base URL of the Baileys WhatsApp bridge
+    pub whatsapp_bridge_url: Option<String>,
     /// Enable webhooks
     pub webhooks_enabled: bool,
     /// Webhook listen address
@@ -49,6 +53,8 @@ impl Default for GatewayConfig {
             discord_token: settings.discord_token,
             slack_enabled: settings.slack_enabled,
             slack_token: settings.slack_token,
+            whatsapp_enabled: settings.whatsapp_enabled,
+            whatsapp_bridge_url: settings.whatsapp_bridge_url,
             webhooks_enabled: settings.webhooks_enabled,
             webhooks_addr: settings.webhooks_addr,
             admins: settings.admins,
@@ -443,180 +449,210 @@ impl Gateway {
             "Gateway polling loop started"
         );
 
-        while self.is_running().await {
-            for (platform, adapter) in &enabled {
-                let updates = match adapter.poll_updates().await {
-                    Ok(u) => u,
-                    Err(e) => {
-                        warn!(platform = %platform, error = %e, "Poll failed; backing off");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        continue;
-                    }
-                };
+        // One polling task per adapter. Adapters have very different poll
+        // latencies (Telegram long-polls ~30s server-side; the WhatsApp
+        // bridge drains instantly), so a sequential loop would let the
+        // slowest adapter starve the rest. Each task owns its own loop and
+        // dispatches into the shared gateway.
+        let mut handles = Vec::new();
+        for (platform, adapter) in enabled {
+            let running = self.running.clone();
+            let message_handler = self.message_handler.clone();
+            let active_runs = self.active_runs.clone();
+            let admins = self.config.admins.clone();
 
-                for update in updates {
-                    let incoming = match adapter.handle_update(update).await {
-                        Ok(Some(msg)) => msg,
-                        Ok(None) => continue,
+            handles.push(tokio::spawn(async move {
+                while *running.read().await {
+                    let updates = match adapter.poll_updates().await {
+                        Ok(u) => u,
                         Err(e) => {
-                            warn!(platform = %platform, error = %e, "Failed to parse update");
+                            warn!(platform = %platform, error = %e, "Poll failed; backing off");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             continue;
                         }
                     };
 
-                    // Non-blocking dispatch: spawn the handler so the poll
-                    // loop keeps draining updates (including interrupts).
-                    self.dispatch(platform.clone(), adapter.clone(), incoming)
-                        .await;
-                }
-            }
+                    for update in updates {
+                        let incoming = match adapter.handle_update(update).await {
+                            Ok(Some(msg)) => msg,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                warn!(platform = %platform, error = %e, "Failed to parse update");
+                                continue;
+                            }
+                        };
 
-            // Small yield so an empty poll batch doesn't busy-spin. Long-polling
-            // adapters already block ~30s server-side when idle.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        // Non-blocking dispatch: spawn the handler so the poll
+                        // loop keeps draining updates (including interrupts).
+                        dispatch_message(
+                            &adapter,
+                            &platform,
+                            incoming,
+                            &admins,
+                            message_handler.clone(),
+                            active_runs.clone(),
+                        )
+                        .await;
+                    }
+
+                    // Small yield so an empty poll batch doesn't busy-spin.
+                    // Long-polling adapters already block server-side when idle.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }));
+        }
+
+        // Wait for all polling tasks to finish (they exit when stop() flips
+        // the running flag).
+        for handle in handles {
+            let _ = handle.await;
         }
 
         self.stop().await?;
         Ok(())
     }
+}
 
-    /// Dispatch one incoming message to the handler on a background task.
-    ///
-    /// Interrupt semantics (per channel):
-    /// - A message arriving while a run is active cancels that run. The
-    ///   gateway notifies the user, waits (bounded) for the run to wind
-    ///   down, then processes the new message.
-    /// - `/stop` cancels the active run without processing further.
-    /// - `/stop` with no active run is a no-op notification.
-    async fn dispatch(
-        &self,
-        platform: String,
-        adapter: Arc<dyn PlatformAdapter>,
-        incoming: IncomingMessage,
-    ) {
-        // Check if user is admin
-        if !self.config.admins.is_empty() && !self.config.admins.contains(&incoming.user_id) {
-            debug!(user = %incoming.user_id, "User not authorized");
-            let _ = adapter
-                .send_message(OutgoingMessage::new(
-                    &incoming.channel_id,
-                    "You are not authorized to use this bot.",
-                ))
-                .await;
-            return;
-        }
-
-        let handler = match &self.message_handler {
-            Some(h) => h.clone(),
-            None => {
-                warn!("No message handler configured");
-                return;
-            }
-        };
-
-        let run_key = format!("{}:{}", platform, incoming.channel_id);
-        let content = incoming.content.trim().to_string();
-        let is_stop = content.eq_ignore_ascii_case("/stop");
-
-        // Is there an active run in this channel?
-        let active = {
-            let runs = self.active_runs.read().await;
-            runs.get(&run_key).cloned()
-        };
-
-        if let Some(active) = active {
-            // Interrupt: cancel the running generation.
-            active
-                .cancel
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-
-            if is_stop {
-                let _ = adapter
-                    .send_message(OutgoingMessage::new(
-                        &incoming.channel_id,
-                        "🛑 Stopping current task...",
-                    ))
-                    .await;
-                return;
-            }
-
-            let _ = adapter
-                .send_message(OutgoingMessage::new(
-                    &incoming.channel_id,
-                    "⚡ Interrupting current task. I'll respond to your message shortly.",
-                ))
-                .await;
-
-            // Wait (bounded) for the old run to wind down so the agent's
-            // conversation state is repaired before the new turn starts.
-            let mut done_rx = active.done.subscribe();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while !*done_rx.borrow_and_update() {
-                    if done_rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
+/// Dispatch one incoming message to the handler on a background task.
+///
+/// Interrupt semantics (per channel):
+/// - A message arriving while a run is active cancels that run. The
+///   gateway notifies the user, waits (bounded) for the run to wind
+///   down, then processes the new message.
+/// - `/stop` cancels the active run without processing further.
+/// - `/stop` with no active run is a no-op notification.
+async fn dispatch_message(
+    adapter: &Arc<dyn PlatformAdapter>,
+    platform: &str,
+    incoming: IncomingMessage,
+    admins: &[String],
+    message_handler: Option<Arc<dyn MessageHandler>>,
+    active_runs: Arc<RwLock<HashMap<String, Arc<ActiveRun>>>>,
+) {
+    // Check if user is admin
+    if !admins.is_empty() && !admins.contains(&incoming.user_id) {
+        debug!(user = %incoming.user_id, "User not authorized");
+        let _ = adapter
+            .send_message(OutgoingMessage::new(
+                &incoming.channel_id,
+                "You are not authorized to use this bot.",
+            ))
             .await;
-        } else if is_stop {
+        return;
+    }
+
+    let handler = match &message_handler {
+        Some(h) => h.clone(),
+        None => {
+            warn!("No message handler configured");
+            return;
+        }
+    };
+
+    let run_key = format!("{}:{}", platform, incoming.channel_id);
+    let content = incoming.content.trim().to_string();
+    let is_stop = content.eq_ignore_ascii_case("/stop");
+
+    // Is there an active run in this channel?
+    let active = {
+        let runs = active_runs.read().await;
+        runs.get(&run_key).cloned()
+    };
+
+    if let Some(active) = active {
+        // Interrupt: cancel the running generation.
+        active
+            .cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        if is_stop {
             let _ = adapter
                 .send_message(OutgoingMessage::new(
                     &incoming.channel_id,
-                    "Nothing is running right now.",
+                    "🛑 Stopping current task...",
                 ))
                 .await;
             return;
         }
 
-        // Register the new run.
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (done_tx, _) = tokio::sync::watch::channel(false);
-        let run = Arc::new(ActiveRun {
-            cancel: cancel.clone(),
-            done: done_tx,
-        });
-        self.active_runs
-            .write()
-            .await
-            .insert(run_key.clone(), run.clone());
+        let _ = adapter
+            .send_message(OutgoingMessage::new(
+                &incoming.channel_id,
+                "⚡ Interrupting current task. I'll respond to your message shortly.",
+            ))
+            .await;
 
-        let sink: Arc<dyn MessageSink> = Arc::new(ChannelSink::new(
-            adapter.clone(),
-            incoming.channel_id.clone(),
-        ));
-        let active_runs = self.active_runs.clone();
-        let channel_id = incoming.channel_id.clone();
-
-        tokio::spawn(async move {
-            let result = handler.handle(incoming, sink, cancel).await;
-
-            // Mark the run done and deregister it.
-            let _ = run.done.send(true);
-            active_runs.write().await.remove(&run_key);
-
-            match result {
-                Ok(()) => {
-                    // The handler delivered the reply itself (via
-                    // send_final, reusing the status message). Nothing
-                    // left for the gateway to do.
-                }
-                Err(crate::error::Error::Cancelled) => {
-                    // Cancelled runs are expected; the handler already
-                    // notified the user. No error fallback.
-                    debug!(platform = %platform, channel = %channel_id, "Run cancelled");
-                }
-                Err(e) => {
-                    error!(platform = %platform, error = %e, "Handler failed");
-                    let fallback = OutgoingMessage::new(
-                        &channel_id,
-                        "Sorry, something went wrong processing your message.",
-                    )
-                    .no_markdown();
-                    let _ = adapter.send_message(fallback).await;
+        // Wait (bounded) for the old run to wind down so the agent's
+        // conversation state is repaired before the new turn starts.
+        let mut done_rx = active.done.subscribe();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !*done_rx.borrow_and_update() {
+                if done_rx.changed().await.is_err() {
+                    break;
                 }
             }
-        });
+        })
+        .await;
+    } else if is_stop {
+        let _ = adapter
+            .send_message(OutgoingMessage::new(
+                &incoming.channel_id,
+                "Nothing is running right now.",
+            ))
+            .await;
+        return;
     }
+
+    // Register the new run.
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, _) = tokio::sync::watch::channel(false);
+    let run = Arc::new(ActiveRun {
+        cancel: cancel.clone(),
+        done: done_tx,
+    });
+    active_runs
+        .write()
+        .await
+        .insert(run_key.clone(), run.clone());
+
+    let sink: Arc<dyn MessageSink> = Arc::new(ChannelSink::new(
+        adapter.clone(),
+        incoming.channel_id.clone(),
+    ));
+    let active_runs = active_runs.clone();
+    let channel_id = incoming.channel_id.clone();
+    let platform = platform.to_string();
+    let adapter = adapter.clone();
+
+    tokio::spawn(async move {
+        let result = handler.handle(incoming, sink, cancel).await;
+
+        // Mark the run done and deregister it.
+        let _ = run.done.send(true);
+        active_runs.write().await.remove(&run_key);
+
+        match result {
+            Ok(()) => {
+                // The handler delivered the reply itself (via
+                // send_final, reusing the status message). Nothing
+                // left for the gateway to do.
+            }
+            Err(crate::error::Error::Cancelled) => {
+                // Cancelled runs are expected; the handler already
+                // notified the user. No error fallback.
+                debug!(platform = %platform, channel = %channel_id, "Run cancelled");
+            }
+            Err(e) => {
+                error!(platform = %platform, error = %e, "Handler failed");
+                let fallback = OutgoingMessage::new(
+                    &channel_id,
+                    "Sorry, something went wrong processing your message.",
+                )
+                .no_markdown();
+                let _ = adapter.send_message(fallback).await;
+            }
+        }
+    });
 }
 
 /// Telegram adapter
@@ -1003,6 +1039,370 @@ impl PlatformAdapter for TelegramAdapter {
             "platform": "telegram",
             "enabled": self.enabled,
             "has_token": self.token.is_some()
+        })
+    }
+}
+
+/// WhatsApp adapter (via the Baileys HTTP bridge)
+///
+/// Talks to the standalone Node.js bridge (`scripts/whatsapp-bridge/bridge.js`)
+/// which owns the actual WhatsApp connection. The bridge exposes:
+///   GET  /messages  - drain queued incoming events (JSON array)
+///   POST /send      - send text { chatId, message, replyTo? }
+///   POST /edit      - edit a sent message { chatId, messageId, message }
+///   GET  /health    - connection status
+///
+/// Unlike Telegram, the bridge does its own long-message chunking and (in
+/// self-chat mode) reply-prefixing, so the adapter only converts standard
+/// markdown to WhatsApp's `*bold* _italic_ ~strike~` syntax before sending.
+pub struct WhatsAppAdapter {
+    /// Base URL of the bridge, e.g. "http://127.0.0.1:3000"
+    bridge_url: Option<String>,
+    enabled: bool,
+    client: reqwest::Client,
+}
+
+impl WhatsAppAdapter {
+    /// Create a new WhatsApp adapter pointing at the given bridge URL.
+    /// The HTTP client carries hard timeouts: a bridge that accepts a
+    /// connection but never answers must not hang the gateway forever
+    /// (the poll loop and the progress pump both call into this client).
+    pub fn new(bridge_url: Option<String>) -> Self {
+        let enabled = bridge_url.is_some();
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            bridge_url,
+            enabled,
+            client,
+        }
+    }
+
+    fn base(&self) -> String {
+        self.bridge_url
+            .as_deref()
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    /// POST a JSON body to a bridge endpoint, surfacing bridge-level errors.
+    async fn post_bridge(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base(), path))
+            .json(body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.unwrap_or_default();
+
+        if !status.is_success() {
+            let err = payload
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown bridge error");
+            return Err(crate::error::Error::ParseResponse(format!(
+                "WhatsApp bridge {path} failed (HTTP {status}): {err}"
+            )));
+        }
+        Ok(payload)
+    }
+}
+
+/// Convert standard markdown to WhatsApp-compatible formatting.
+///
+/// WhatsApp supports `*bold*`, `_italic_`, `~strikethrough~`, ``` ```code``` ```,
+/// and monospaced `` `inline` ``. Standard markdown uses different delimiters,
+/// so we convert. Fenced code blocks and inline code are protected via
+/// placeholder substitution so their contents are never reformatted.
+///
+/// This is a port of `whatsapp_common.py::format_message`, implemented without
+/// regex lookarounds (the `regex` crate doesn't support them) by protecting
+/// bold results from the later italic pass.
+fn markdown_to_whatsapp(content: &str) -> String {
+    if content.is_empty() {
+        return content.to_string();
+    }
+
+    let mut fences: Vec<String> = Vec::new();
+    let mut codes: Vec<String> = Vec::new();
+    let mut bolds: Vec<String> = Vec::new();
+
+    // 1. Protect fenced code blocks.
+    let fence_re = regex::Regex::new(r"```[\s\S]*?```").expect("static regex");
+    let mut result = fence_re
+        .replace_all(content, |caps: &regex::Captures| {
+            fences.push(caps[0].to_string());
+            format!("\u{0001}F{}\u{0001}", fences.len() - 1)
+        })
+        .into_owned();
+
+    // 2. Protect inline code.
+    let code_re = regex::Regex::new(r"`[^`\n]+`").expect("static regex");
+    result = code_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            codes.push(caps[0].to_string());
+            format!("\u{0001}C{}\u{0001}", codes.len() - 1)
+        })
+        .into_owned();
+
+    // 3. Bold: **text** or __text__ → *text*, protected so the italic pass
+    //    below doesn't re-process the resulting single-asterisk form.
+    let bold_star = regex::Regex::new(r"\*\*([\s\S]+?)\*\*").expect("static regex");
+    result = bold_star
+        .replace_all(&result, |caps: &regex::Captures| {
+            bolds.push(format!("*{}*", &caps[1]));
+            format!("\u{0001}B{}\u{0001}", bolds.len() - 1)
+        })
+        .into_owned();
+    let bold_under = regex::Regex::new(r"__([\s\S]+?)__").expect("static regex");
+    result = bold_under
+        .replace_all(&result, |caps: &regex::Captures| {
+            bolds.push(format!("*{}*", &caps[1]));
+            format!("\u{0001}B{}\u{0001}", bolds.len() - 1)
+        })
+        .into_owned();
+
+    // 4. Italic: *text* → _text_. Safe now: all ** pairs were consumed above,
+    //    so any remaining single-asterisk pair is a genuine italic. Require a
+    //    non-space, non-asterisk first char to avoid list bullets ("* item").
+    let italic_re = regex::Regex::new(r"\*([^\s*][^*\n]*?)\*").expect("static regex");
+    result = italic_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            format!("_{}_", &caps[1])
+        })
+        .into_owned();
+
+    // 5. Strikethrough: ~~text~~ → ~text~.
+    let strike_re = regex::Regex::new(r"~~([\s\S]+?)~~").expect("static regex");
+    result = strike_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            format!("~{}~", &caps[1])
+        })
+        .into_owned();
+
+    // 6. Headers: "# Title" → "*Title*". Strip any *...* wrapping the inner
+    //    text already carries so we don't emit "**Title**". If the header
+    //    content is exactly one protected bold placeholder, leave it alone —
+    //    restoration already yields "*Title*".
+    let bold_ph_re = regex::Regex::new(r"^\u{0001}B\d+\u{0001}$").expect("static regex");
+    let header_re = regex::Regex::new(r"(?m)^#{1,6}\s+(.+)$").expect("static regex");
+    result = header_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let inner = caps[1].trim();
+            if bold_ph_re.is_match(inner) {
+                return inner.to_string();
+            }
+            let mut inner = inner.to_string();
+            while inner.len() > 1 && inner.starts_with('*') && inner.ends_with('*') {
+                inner = inner[1..inner.len() - 1].trim().to_string();
+            }
+            format!("*{}*", inner)
+        })
+        .into_owned();
+
+    // 7. Links: [text](url) → text (url).
+    let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").expect("static regex");
+    result = link_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            format!("{} ({})", &caps[1], &caps[2])
+        })
+        .into_owned();
+
+    // 8. Restore protected sections (bold, then inline code, then fences).
+    for (i, bold) in bolds.iter().enumerate() {
+        result = result.replace(&format!("\u{0001}B{}\u{0001}", i), bold);
+    }
+    for (i, code) in codes.iter().enumerate() {
+        result = result.replace(&format!("\u{0001}C{}\u{0001}", i), code);
+    }
+    for (i, fence) in fences.iter().enumerate() {
+        result = result.replace(&format!("\u{0001}F{}\u{0001}", i), fence);
+    }
+
+    result
+}
+
+#[async_trait]
+impl PlatformAdapter for WhatsAppAdapter {
+    fn name(&self) -> &str {
+        "whatsapp"
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    async fn start(&self) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
+        // Verify the bridge is reachable and report its connection state.
+        let response = self
+            .client
+            .get(format!("{}/health", self.base()))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(crate::error::Error::Agent(format!(
+                "WhatsApp bridge health check failed (HTTP {})",
+                response.status()
+            )));
+        }
+
+        let payload: serde_json::Value = response.json().await.unwrap_or_default();
+        let status = payload
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown");
+        info!(status = %status, "WhatsApp bridge connected");
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        info!("WhatsApp adapter stopped");
+        Ok(())
+    }
+
+    async fn send_message(&self, message: OutgoingMessage) -> Result<()> {
+        let text = if message.parse_markdown {
+            markdown_to_whatsapp(&message.content)
+        } else {
+            message.content.clone()
+        };
+
+        let mut body = serde_json::json!({
+            "chatId": message.channel_id,
+            "message": text,
+        });
+        if let Some(ref reply_to) = message.reply_to {
+            body["replyTo"] = serde_json::json!(reply_to);
+        }
+
+        self.post_bridge("/send", &body).await?;
+        Ok(())
+    }
+
+    async fn send_message_tracked(&self, message: OutgoingMessage) -> Result<Option<String>> {
+        let text = if message.parse_markdown {
+            markdown_to_whatsapp(&message.content)
+        } else {
+            message.content.clone()
+        };
+
+        let mut body = serde_json::json!({
+            "chatId": message.channel_id,
+            "message": text,
+        });
+        if let Some(ref reply_to) = message.reply_to {
+            body["replyTo"] = serde_json::json!(reply_to);
+        }
+
+        let payload = self.post_bridge("/send", &body).await?;
+        let message_id = payload
+            .get("messageId")
+            .and_then(|id| id.as_str())
+            .map(|s| s.to_string());
+        Ok(message_id)
+    }
+
+    async fn edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        message: OutgoingMessage,
+    ) -> Result<()> {
+        let text = if message.parse_markdown {
+            markdown_to_whatsapp(&message.content)
+        } else {
+            message.content.clone()
+        };
+
+        let body = serde_json::json!({
+            "chatId": channel_id,
+            "messageId": message_id,
+            "message": text,
+        });
+        self.post_bridge("/edit", &body).await?;
+        Ok(())
+    }
+
+    async fn handle_update(&self, update: serde_json::Value) -> Result<Option<IncomingMessage>> {
+        // Bridge event shape (see bridge_helpers.js::extractBridgeEvent):
+        // { messageId, chatId, senderId, senderName, chatName, isGroup, body,
+        //   hasMedia, mediaType, ..., timestamp }
+        let body = update
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if body.is_empty() {
+            return Ok(None);
+        }
+
+        let chat_id = update
+            .get("chatId")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let sender_id = update
+            .get("senderId")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let sender_name = update
+            .get("senderName")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        Ok(Some(
+            IncomingMessage::new("whatsapp", sender_id, sender_name, chat_id, body)
+                .with_raw(update),
+        ))
+    }
+
+    async fn poll_updates(&self) -> Result<Vec<serde_json::Value>> {
+        if !self.is_enabled() {
+            return Ok(Vec::new());
+        }
+
+        // The bridge drains its queue on each GET, so this returns only new
+        // events since the last poll.
+        let response = self
+            .client
+            .get(format!("{}/messages", self.base()))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(crate::error::Error::Agent(format!(
+                "WhatsApp bridge /messages failed (HTTP {})",
+                response.status()
+            )));
+        }
+
+        let events: Vec<serde_json::Value> = response.json().await.unwrap_or_default();
+        Ok(events)
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "platform": "whatsapp",
+            "enabled": self.enabled,
+            "bridge_url": self.bridge_url,
         })
     }
 }
@@ -1985,5 +2385,109 @@ mod tests {
         let adapter = TelegramAdapter::new(Some("test-token".to_string()));
         let update = serde_json::json!({ "update_id": 1, "edited_message": {} });
         assert!(adapter.handle_update(update).await.unwrap().is_none());
+    }
+
+    // ---------- WhatsApp ----------
+
+    #[tokio::test]
+    async fn test_whatsapp_adapter_disabled() {
+        let adapter = WhatsAppAdapter::new(None);
+        assert!(!adapter.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn whatsapp_poll_updates_disabled_returns_empty() {
+        let adapter = WhatsAppAdapter::new(None);
+        let updates = adapter.poll_updates().await.unwrap();
+        assert!(updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn whatsapp_handle_update_parses_bridge_event() {
+        let adapter = WhatsAppAdapter::new(Some("http://127.0.0.1:3000".to_string()));
+        let update = serde_json::json!({
+            "messageId": "ABC123",
+            "chatId": "6285179682870@s.whatsapp.net",
+            "senderId": "6285179682870@s.whatsapp.net",
+            "senderName": "Nix",
+            "chatName": "Nix",
+            "isGroup": false,
+            "body": "halo bot",
+            "hasMedia": false,
+            "timestamp": 1755500000
+        });
+
+        let incoming = adapter.handle_update(update).await.unwrap().unwrap();
+        assert_eq!(incoming.platform, "whatsapp");
+        assert_eq!(incoming.user_id, "6285179682870@s.whatsapp.net");
+        assert_eq!(incoming.username, "Nix");
+        assert_eq!(incoming.channel_id, "6285179682870@s.whatsapp.net");
+        assert_eq!(incoming.content, "halo bot");
+    }
+
+    #[tokio::test]
+    async fn whatsapp_handle_update_ignores_empty_body() {
+        let adapter = WhatsAppAdapter::new(Some("http://127.0.0.1:3000".to_string()));
+        let update = serde_json::json!({
+            "chatId": "x@s.whatsapp.net",
+            "body": "",
+            "hasMedia": false
+        });
+        assert!(adapter.handle_update(update).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn whatsapp_markdown_bold() {
+        assert_eq!(markdown_to_whatsapp("**bold**"), "*bold*");
+        assert_eq!(markdown_to_whatsapp("__bold__"), "*bold*");
+    }
+
+    #[test]
+    fn whatsapp_markdown_italic() {
+        assert_eq!(markdown_to_whatsapp("*italic*"), "_italic_");
+    }
+
+    #[test]
+    fn whatsapp_markdown_bold_and_italic_no_crosstalk() {
+        // **bold** must not be mangled into italic by the single-* pass.
+        assert_eq!(
+            markdown_to_whatsapp("**bold** and *italic*"),
+            "*bold* and _italic_"
+        );
+    }
+
+    #[test]
+    fn whatsapp_markdown_strikethrough() {
+        assert_eq!(markdown_to_whatsapp("~~gone~~"), "~gone~");
+    }
+
+    #[test]
+    fn whatsapp_markdown_header_to_bold() {
+        assert_eq!(markdown_to_whatsapp("# Title"), "*Title*");
+        assert_eq!(markdown_to_whatsapp("## **Title**"), "*Title*");
+    }
+
+    #[test]
+    fn whatsapp_markdown_link() {
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.com)"),
+            "docs (https://example.com)"
+        );
+    }
+
+    #[test]
+    fn whatsapp_markdown_protects_code() {
+        // Inline code and fenced blocks must not be reformatted.
+        assert_eq!(markdown_to_whatsapp("`**not bold**`"), "`**not bold**`");
+        assert_eq!(
+            markdown_to_whatsapp("```\n**raw**\n```"),
+            "```\n**raw**\n```"
+        );
+    }
+
+    #[test]
+    fn whatsapp_markdown_list_bullet_not_italic() {
+        // "* item" is a list bullet, not italic.
+        assert_eq!(markdown_to_whatsapp("* item one"), "* item one");
     }
 }

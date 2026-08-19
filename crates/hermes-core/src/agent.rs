@@ -229,7 +229,11 @@ impl HermesAgent {
                 .and_then(|guard| guard.clone())
         };
         if let Some(tx) = tx {
-            let _ = tx.send(event).await;
+            // Non-blocking send: progress events are decorative. If the
+            // consumer (progress pump) is dead or wedged, the bounded
+            // channel fills up — blocking here would deadlock the entire
+            // agent loop. Drop the event instead.
+            let _ = tx.try_send(event);
         }
     }
 
