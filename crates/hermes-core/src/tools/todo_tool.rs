@@ -1,11 +1,12 @@
 //! Todo list tool
 //!
-//! In-memory task list management tool matching Python's todo_tool.py.
-//! Stores todos per session using a global lazy_static HashMap.
+//! Task list management tool matching Python's todo_tool.py.
+//! Stores todos per session, persisted to `~/.hermes-rs/todos/todos.json`
+//! so lists survive restarts.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::schema::ToolSchema;
@@ -15,12 +16,29 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Path of the todo store file.
+fn todo_file() -> std::path::PathBuf {
+    crate::persist::data_dir("todos").join("todos.json")
+}
+
+/// Load the todo map from disk (empty when missing/corrupt).
+fn load_from_disk() -> HashMap<String, Vec<TodoItem>> {
+    crate::persist::read_json::<HashMap<String, Vec<TodoItem>>>(&todo_file()).unwrap_or_default()
+}
+
+/// Persist the todo map to disk. Errors are logged, not fatal.
+fn save_to_disk(map: &HashMap<String, Vec<TodoItem>>) {
+    if let Err(e) = crate::persist::write_json(&todo_file(), map) {
+        tracing::warn!(error = %e, "Failed to persist todo store");
+    }
+}
+
 lazy_static! {
-    static ref TODO_STORE: Mutex<HashMap<String, Vec<TodoItem>>> = Mutex::new(HashMap::new());
+    static ref TODO_STORE: Mutex<HashMap<String, Vec<TodoItem>>> = Mutex::new(load_from_disk());
 }
 
 /// A single todo item
-#[derive(Debug, Clone, JsonSchema, Deserialize)]
+#[derive(Debug, Clone, JsonSchema, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TodoItem {
     /// Unique identifier for this todo
@@ -116,6 +134,7 @@ impl HermesTool for TodoTool {
                 }
             };
             store.insert(session_id.clone(), todos);
+            save_to_disk(&store);
         }
 
         ToolResult::success(

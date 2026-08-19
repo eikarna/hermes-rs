@@ -29,25 +29,13 @@ impl SessionStore {
 
     /// Default location: `~/.hermes-rs/sessions`.
     pub fn default_dir() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".hermes-rs")
-            .join("sessions")
+        crate::persist::data_dir("sessions")
     }
 
     /// Map a channel key to a safe file path.
     fn path_for(&self, channel_key: &str) -> PathBuf {
-        let sanitized: String = channel_key
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.dir.join(format!("{}.json", sanitized))
+        self.dir
+            .join(format!("{}.json", crate::persist::sanitize_key(channel_key)))
     }
 
     /// Load history for a channel. Returns an empty vec when no session file

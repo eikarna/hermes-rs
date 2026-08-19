@@ -1,10 +1,12 @@
 //! Memory operation tools
 //!
 //! Tools for storing, searching, and recalling memories.
+//! Backed by a JSON file (`~/.hermes-rs/memory/memories.json`) so memories
+//! survive restarts; the in-memory map is a cache loaded at first access.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,13 +15,33 @@ use tokio::sync::RwLock;
 use crate::schema::ToolSchema;
 use crate::tools::{HermesTool, ToolContext, ToolResult};
 
-// Global memory storage for the memory tools
-// In production, this would be backed by a proper database
-lazy_static::lazy_static! {
-    static ref MEMORY_STORE: Arc<RwLock<HashMap<String, MemoryEntry>>> = Arc::new(RwLock::new(HashMap::new()));
+/// Path of the memory store file.
+fn memory_file() -> std::path::PathBuf {
+    crate::persist::data_dir("memory").join("memories.json")
 }
 
-#[derive(Debug, Clone)]
+/// Load the memory map from disk (empty when missing/corrupt).
+fn load_from_disk() -> HashMap<String, MemoryEntry> {
+    match crate::persist::read_json::<HashMap<String, MemoryEntry>>(&memory_file()) {
+        Some(map) => map,
+        None => HashMap::new(),
+    }
+}
+
+/// Persist the memory map to disk. Errors are logged, not fatal.
+fn save_to_disk(map: &HashMap<String, MemoryEntry>) {
+    if let Err(e) = crate::persist::write_json(&memory_file(), map) {
+        tracing::warn!(error = %e, "Failed to persist memory store");
+    }
+}
+
+// Global memory storage for the memory tools, seeded from disk on first
+// access so memories survive restarts.
+lazy_static::lazy_static! {
+    static ref MEMORY_STORE: Arc<RwLock<HashMap<String, MemoryEntry>>> = Arc::new(RwLock::new(load_from_disk()));
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemoryEntry {
     content: String,
     block_type: String,
@@ -76,7 +98,11 @@ impl HermesTool for MemoryStoreTool {
             created_at: now,
         };
 
-        MEMORY_STORE.write().await.insert(args.key.clone(), entry);
+        {
+            let mut store = MEMORY_STORE.write().await;
+            store.insert(args.key.clone(), entry);
+            save_to_disk(&store);
+        }
 
         ToolResult::success(
             "memory_store",
