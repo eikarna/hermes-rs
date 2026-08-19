@@ -5,7 +5,7 @@ mod tui;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -189,7 +189,7 @@ fn init_logging(
         .with_file(logging.with_file)
         .with_line_number(logging.with_line_number);
 
-    match select_log_target(logging, rich_output) {
+    match select_log_target(logging, rich_output, io::stdout().is_terminal()) {
         LogTarget::File => {
             let file = OpenOptions::new()
                 .create(true)
@@ -228,12 +228,14 @@ fn init_logging(
     }
 }
 
-fn select_log_target(logging: &LoggingSettings, rich_output: bool) -> LogTarget {
+fn select_log_target(logging: &LoggingSettings, rich_output: bool, is_tty: bool) -> LogTarget {
     if logging.log_file.is_some() {
         LogTarget::File
-    } else if rich_output {
+    } else if rich_output && is_tty {
         LogTarget::Sink
     } else {
+        // Headless (no TTY): the TUI sink would swallow every log line,
+        // so fall back to stderr instead of going silent.
         LogTarget::Stderr
     }
 }
@@ -1793,9 +1795,17 @@ mod tests {
     }
 
     #[test]
-    fn rich_tui_without_log_file_uses_sink() {
+    fn rich_tui_on_tty_uses_sink() {
         let logging = LoggingSettings::default();
-        assert_eq!(select_log_target(&logging, true), LogTarget::Sink);
+        assert_eq!(select_log_target(&logging, true, true), LogTarget::Sink);
+    }
+
+    #[test]
+    fn rich_tui_headless_falls_back_to_stderr() {
+        // No TTY (systemd, cron, pipes): the TUI sink would swallow every
+        // log line, so headless runs must log to stderr.
+        let logging = LoggingSettings::default();
+        assert_eq!(select_log_target(&logging, true, false), LogTarget::Stderr);
     }
 
     #[test]
@@ -1804,7 +1814,7 @@ mod tests {
             log_file: Some("hermes.log".to_string()),
             ..Default::default()
         };
-        assert_eq!(select_log_target(&logging, true), LogTarget::File);
+        assert_eq!(select_log_target(&logging, true, true), LogTarget::File);
     }
 
     #[tokio::test]

@@ -627,9 +627,21 @@ async fn dispatch_message(
     tokio::spawn(async move {
         let result = handler.handle(incoming, sink, cancel).await;
 
-        // Mark the run done and deregister it.
+        // Mark the run done, then deregister it — but only if the entry
+        // still belongs to THIS run. An interrupt that timed out waiting
+        // for us to wind down may have already registered its replacement
+        // under the same key; a blind remove would evict the new run and
+        // make it invisible to /stop and future interrupts.
         let _ = run.done.send(true);
-        active_runs.write().await.remove(&run_key);
+        {
+            let mut runs = active_runs.write().await;
+            if runs
+                .get(&run_key)
+                .is_some_and(|r| Arc::ptr_eq(r, &run))
+            {
+                runs.remove(&run_key);
+            }
+        }
 
         match result {
             Ok(()) => {
@@ -673,7 +685,15 @@ impl TelegramAdapter {
             token,
             enabled,
             offset: AtomicI64::new(0),
-            client: reqwest::Client::new(),
+            // Hard timeouts so a half-open TCP connection can never hang a
+            // polling task forever. read_timeout is per-read, not total: the
+            // 30s server-side long-poll stays well under the 45s read cap,
+            // and a stalled connection dies instead of blocking silently.
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(45))
+                .build()
+                .expect("valid reqwest client config"),
         }
     }
 
@@ -787,8 +807,8 @@ impl PlatformAdapter for TelegramAdapter {
         }
 
         // Verify the token by getting bot info
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .get(format!("{}/getMe", self.api_url()))
             .send()
             .await?;
