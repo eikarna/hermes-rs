@@ -13,7 +13,8 @@ use tracing::{debug, error, info, instrument, warn};
 #[cfg(test)]
 use crate::client::AnthropicClient;
 use crate::client::{
-    ChatResponse, ChatStreamEvent, ChatStreamResponse, LLMProvider, Message, OpenAIClient, ToolCall,
+    ChatResponse, ChatStreamEvent, ChatStreamResponse, LLMProvider, Message, OpenAIClient, Role,
+    ToolCall,
 };
 use crate::config::{runtime_config, BehaviorSettings};
 use crate::context::{estimate_message_tokens, estimate_tokens};
@@ -23,6 +24,10 @@ use crate::memory::MemoryManager;
 use crate::parser::{ToolCallParser, ToolCallStreamParser};
 use crate::schema::ToolSchema;
 use crate::tools::{ToolContext, ToolRegistry, ToolResult};
+
+/// Prefix marking the rolling context-summary system message that
+/// [`HermesAgent::compact_history`] embeds as the first conversation entry.
+pub const CONTEXT_SUMMARY_MARKER: &str = "[CONTEXT SUMMARY]";
 
 /// Configuration for the Hermes agent
 #[derive(Debug, Clone)]
@@ -133,6 +138,9 @@ pub struct HermesAgent {
     /// Lazily-rendered `<repo_map>` block; parsed once per agent so per-turn
     /// message rebuilds stay cheap.
     repo_map_cache: Arc<tokio::sync::OnceCell<String>>,
+    /// Optional human-approval gate consulted before dangerous tools run.
+    /// Swapped per-run by the gateway (like `event_tx`).
+    approval_gate: Arc<std::sync::Mutex<Option<Arc<dyn crate::approval::ToolApprovalGate>>>>,
 }
 
 impl HermesAgent {
@@ -156,6 +164,7 @@ impl HermesAgent {
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
+            approval_gate: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -185,6 +194,7 @@ impl HermesAgent {
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
+            approval_gate: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -193,6 +203,14 @@ impl HermesAgent {
     pub fn set_event_sender(&self, sender: Option<mpsc::Sender<AgentEvent>>) {
         if let Ok(mut guard) = self.event_tx.lock() {
             *guard = sender;
+        }
+    }
+
+    /// Swap the approval gate for the next run. `None` disables approval
+    /// prompts (tools run immediately).
+    pub fn set_approval_gate(&self, gate: Option<Arc<dyn crate::approval::ToolApprovalGate>>) {
+        if let Ok(mut guard) = self.approval_gate.lock() {
+            *guard = gate;
         }
     }
 
@@ -252,6 +270,157 @@ impl HermesAgent {
     pub async fn clear_history(&self) {
         let mut conv = self.conversation.write().await;
         conv.clear();
+    }
+
+    /// Rolling context compaction.
+    ///
+    /// When the conversation buffer reaches `COMPACTION_TRIGGER` messages,
+    /// the oldest ones are summarized in a single one-shot LLM call and
+    /// replaced by one marker system message, keeping only the most recent
+    /// `COMPACTION_KEEP` messages. A previous summary (from an earlier
+    /// compaction) is rolled into the new one, so context degrades
+    /// gracefully instead of being hard-truncated.
+    ///
+    /// Returns the new summary text, or `None` when nothing was compacted
+    /// (buffer too small, no safe split point, or the summarization call
+    /// failed — compaction is fail-open and never breaks a run).
+    pub async fn compact_history(&self) -> Option<String> {
+        /// Compact once the buffer reaches this many messages.
+        const COMPACTION_TRIGGER: usize = 120;
+        /// Keep this many most-recent messages verbatim.
+        const COMPACTION_KEEP: usize = 40;
+        /// Cap the transcript fed to the summarizer (~6k tokens).
+        const TRANSCRIPT_CAP: usize = 24_000;
+
+        let conv = self.conversation.read().await.clone();
+        if conv.len() < COMPACTION_TRIGGER {
+            return None;
+        }
+
+        // Split point: keep the last KEEP messages, but never start the
+        // tail with an orphaned tool result, and never end the head with
+        // an assistant message whose tool results would be discarded.
+        let mut split = conv.len() - COMPACTION_KEEP;
+        while split < conv.len() {
+            let tail_starts_orphan = conv[split].role == Role::Tool;
+            let head_ends_toolcall = split > 0
+                && conv[split - 1].role == Role::Assistant
+                && conv[split - 1].tool_calls.is_some();
+            if !tail_starts_orphan && !head_ends_toolcall {
+                break;
+            }
+            split += 1;
+        }
+        if split >= conv.len() {
+            return None;
+        }
+
+        let (head, tail) = conv.split_at(split);
+
+        // Roll the previous summary (if any) into the new one.
+        let mut prior_summary = String::new();
+        let mut transcript_start = 0;
+        if let Some(first) = head.first() {
+            if first.role == Role::System && first.content.starts_with(CONTEXT_SUMMARY_MARKER) {
+                prior_summary = first
+                    .content
+                    .trim_start_matches(CONTEXT_SUMMARY_MARKER)
+                    .trim()
+                    .to_string();
+                transcript_start = 1;
+            }
+        }
+
+        // Render the discarded head as a compact transcript.
+        let mut transcript = String::new();
+        for m in &head[transcript_start..] {
+            let line = match m.role {
+                Role::User => format!("USER: {}\n", m.content),
+                Role::Assistant => {
+                    let mut line = String::new();
+                    if let Some(calls) = &m.tool_calls {
+                        let names: Vec<&str> =
+                            calls.iter().map(|c| c.function.name.as_str()).collect();
+                        line.push_str(&format!(
+                            "ASSISTANT: [called tools: {}]\n",
+                            names.join(", ")
+                        ));
+                    }
+                    if !m.content.trim().is_empty() {
+                        line.push_str(&format!("ASSISTANT: {}\n", m.content));
+                    }
+                    line
+                }
+                Role::Tool => {
+                    let preview: String = m.content.chars().take(200).collect();
+                    format!("TOOL RESULT: {}\n", preview)
+                }
+                Role::System => String::new(),
+            };
+            if transcript.len() + line.len() > TRANSCRIPT_CAP {
+                transcript.push_str("[transcript truncated]\n");
+                break;
+            }
+            transcript.push_str(&line);
+        }
+
+        let mut prompt = String::from(
+            "Summarize this conversation history so a future assistant can continue it \
+             seamlessly. Preserve: user goals, decisions made, facts learned, file paths, \
+             tool outcomes, and pending tasks. Be dense and factual; use bullet points; \
+             no preamble.\n\n",
+        );
+        if !prior_summary.is_empty() {
+            prompt.push_str("PREVIOUS SUMMARY (roll this into the new one):\n");
+            prompt.push_str(&prior_summary);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("NEW TRANSCRIPT:\n");
+        prompt.push_str(&transcript);
+
+        let request = vec![Message::user(prompt)];
+        let response = match self.client.chat(&self.config.model, &request, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "Context compaction summarization failed; keeping history as-is");
+                return None;
+            }
+        };
+        let summary_text = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+
+        let mut new_conv = Vec::with_capacity(tail.len() + 1);
+        new_conv.push(Message::system(format!(
+            "{}\n{}",
+            CONTEXT_SUMMARY_MARKER, summary_text
+        )));
+        new_conv.extend_from_slice(tail);
+        *self.conversation.write().await = new_conv;
+
+        info!(
+            discarded = split - transcript_start,
+            kept = tail.len(),
+            "Compacted conversation history into rolling summary"
+        );
+        Some(summary_text)
+    }
+
+    /// The rolling context summary currently embedded in the conversation
+    /// (first message carries the marker), if any.
+    pub async fn context_summary(&self) -> Option<String> {
+        let conv = self.conversation.read().await;
+        conv.first()
+            .filter(|m| m.role == Role::System && m.content.starts_with(CONTEXT_SUMMARY_MARKER))
+            .map(|m| {
+                m.content
+                    .trim_start_matches(CONTEXT_SUMMARY_MARKER)
+                    .trim()
+                    .to_string()
+            })
     }
 
     /// Run the agent with a user query
@@ -875,6 +1044,27 @@ impl HermesAgent {
                     format!("Tool '{}' not found", name),
                 ));
                 continue;
+            }
+
+            // Human approval gate for dangerous tools. The gate (installed
+            // per-run by the gateway) presents the request and blocks until
+            // the human decides or the gate's own timeout auto-denies.
+            if crate::approval::requires_approval(&name) {
+                let gate = self.approval_gate.lock().ok().and_then(|g| g.clone());
+                if let Some(gate) = gate {
+                    let preview: String = args_str.chars().take(300).collect();
+                    let decision = gate
+                        .request_approval(crate::approval::ApprovalRequest {
+                            tool_name: name.clone(),
+                            arguments_preview: preview,
+                        })
+                        .await;
+                    if let crate::approval::ApprovalDecision::Denied { reason } = decision {
+                        info!(tool = %name, reason = %reason, "Tool execution denied by approval gate");
+                        results.push(ToolResult::error(&tool_call.id, reason));
+                        continue;
+                    }
+                }
             }
 
             // Execute with timeout

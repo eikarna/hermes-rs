@@ -41,6 +41,14 @@ pub struct GatewayConfig {
     pub admins: Vec<String>,
     /// Stream model output live into the chat (edit message as tokens arrive)
     pub streaming_replies: bool,
+    /// Require explicit approval before executing dangerous tools.
+    pub tool_approval: bool,
+    /// Seconds to wait for an approval decision before auto-denying.
+    pub tool_approval_timeout_secs: u64,
+    /// Model for voice-note transcription (`None` disables STT).
+    pub stt_model: Option<String>,
+    /// Roll oldest messages into a summary instead of dropping them at cap.
+    pub context_compaction: bool,
 }
 
 impl Default for GatewayConfig {
@@ -59,6 +67,10 @@ impl Default for GatewayConfig {
             webhooks_addr: settings.webhooks_addr,
             admins: settings.admins,
             streaming_replies: settings.streaming_replies,
+            tool_approval: settings.tool_approval,
+            tool_approval_timeout_secs: settings.tool_approval_timeout_secs,
+            stt_model: settings.stt_model,
+            context_compaction: settings.context_compaction,
         }
     }
 }
@@ -216,6 +228,29 @@ pub trait PlatformAdapter: Send + Sync {
     /// Handle an incoming update (webhook or poll result)
     async fn handle_update(&self, update: serde_json::Value) -> Result<Option<IncomingMessage>>;
 
+    /// Handle an interactive callback (e.g. Telegram inline-keyboard button
+    /// presses for tool approval). Default: ignore.
+    async fn handle_callback_query(&self, _update: serde_json::Value) -> Result<()> {
+        Ok(())
+    }
+
+    /// Present a tool-approval prompt with approve/deny buttons and return
+    /// `(request_id, decision_receiver)`. [`Self::handle_callback_query`]
+    /// resolves the receiver when the human presses a button.
+    ///
+    /// Default: platforms without interactive buttons auto-approve so the
+    /// agent never hangs waiting for input that can never arrive.
+    async fn send_approval_prompt(
+        &self,
+        _channel_id: &str,
+        _tool_name: &str,
+        _arguments_preview: &str,
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<bool>)> {
+        let (id, rx) = register_pending_approval();
+        resolve_pending_approval(id, true);
+        Ok((id, rx))
+    }
+
     /// Poll for new updates (long-polling for platforms that support it).
     ///
     /// Returns a batch of raw updates. The default implementation returns an
@@ -248,6 +283,19 @@ pub trait MessageSink: Send + Sync {
     /// status message to reuse.
     async fn send_final(&self, status_msg_id: Option<&str>, message: OutgoingMessage)
         -> Result<()>;
+
+    /// Present a tool-approval prompt into this channel and return
+    /// `(request_id, decision_receiver)`. Default: auto-approve (platforms
+    /// without interactive buttons must never stall the agent).
+    async fn request_approval(
+        &self,
+        _tool_name: &str,
+        _arguments_preview: &str,
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<bool>)> {
+        let (id, rx) = register_pending_approval();
+        resolve_pending_approval(id, true);
+        Ok((id, rx))
+    }
 }
 
 /// Sink bound to one adapter + channel pair.
@@ -287,6 +335,73 @@ impl MessageSink for ChannelSink {
             .send_final(&self.channel_id, status_msg_id, message)
             .await
     }
+
+    async fn request_approval(
+        &self,
+        tool_name: &str,
+        arguments_preview: &str,
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<bool>)> {
+        self.adapter
+            .send_approval_prompt(&self.channel_id, tool_name, arguments_preview)
+            .await
+    }
+}
+
+/// Approval gate bound to one channel's sink.
+///
+/// Installed per-run on the agent by the gateway handler: dangerous tools
+/// pause execution, the prompt appears in the originating chat, and the run
+/// resumes when the human presses a button — or auto-denies after `timeout`.
+pub struct SinkApprovalGate {
+    sink: Arc<dyn MessageSink>,
+    timeout: std::time::Duration,
+}
+
+impl SinkApprovalGate {
+    /// Create a gate that prompts through `sink` and auto-denies after
+    /// `timeout` without a decision.
+    pub fn new(sink: Arc<dyn MessageSink>, timeout: std::time::Duration) -> Self {
+        Self { sink, timeout }
+    }
+}
+
+#[async_trait]
+impl crate::approval::ToolApprovalGate for SinkApprovalGate {
+    async fn request_approval(
+        &self,
+        request: crate::approval::ApprovalRequest,
+    ) -> crate::approval::ApprovalDecision {
+        let (id, rx) = match self
+            .sink
+            .request_approval(&request.tool_name, &request.arguments_preview)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Fail closed: a dangerous tool must never run just because
+                // the prompt couldn't be delivered.
+                return crate::approval::ApprovalDecision::Denied {
+                    reason: format!("Approval prompt could not be delivered: {e}"),
+                };
+            }
+        };
+
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(true)) => crate::approval::ApprovalDecision::Approved,
+            Ok(Ok(false)) => crate::approval::ApprovalDecision::Denied {
+                reason: "Tool execution denied by the user.".to_string(),
+            },
+            Ok(Err(_)) => crate::approval::ApprovalDecision::Denied {
+                reason: "Approval channel closed unexpectedly.".to_string(),
+            },
+            Err(_) => {
+                drop_pending_approval(id);
+                crate::approval::ApprovalDecision::Denied {
+                    reason: "Approval timed out; tool execution denied.".to_string(),
+                }
+            }
+        }
+    }
 }
 
 /// State of the currently active agent run in one channel.
@@ -302,6 +417,44 @@ struct ActiveRun {
     done: tokio::sync::watch::Sender<bool>,
 }
 
+/// Pending tool-approval requests: request ID → decision channel.
+///
+/// Process-wide because the approval prompt is sent by the adapter while the
+/// decision is awaited inside the agent's execute loop (different tasks).
+static PENDING_APPROVALS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+static NEXT_APPROVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Register a fresh approval request and return `(id, decision_receiver)`.
+/// The adapter resolves the receiver when the human presses a button; the
+/// gate awaits the receiver (bounded by its own timeout).
+pub fn register_pending_approval() -> (u64, tokio::sync::oneshot::Receiver<bool>) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let id = NEXT_APPROVAL_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    PENDING_APPROVALS.lock().map(|mut m| m.insert(id, tx)).ok();
+    (id, rx)
+}
+
+/// Resolve a pending approval request. Returns `false` when the ID is
+/// unknown (stale/duplicate button press).
+pub(crate) fn resolve_pending_approval(id: u64, approved: bool) -> bool {
+    let tx = PENDING_APPROVALS
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&id));
+    match tx {
+        Some(tx) => tx.send(approved).is_ok(),
+        None => false,
+    }
+}
+
+/// Drop a pending approval request (e.g. the gate timed out).
+pub(crate) fn drop_pending_approval(id: u64) {
+    PENDING_APPROVALS.lock().map(|mut m| m.remove(&id)).ok();
+}
+
 /// Gateway for routing messages between platforms and the agent
 pub struct Gateway {
     config: GatewayConfig,
@@ -310,6 +463,8 @@ pub struct Gateway {
     running: Arc<RwLock<bool>>,
     /// Active agent runs keyed by "platform:channel_id".
     active_runs: Arc<RwLock<HashMap<String, Arc<ActiveRun>>>>,
+    /// Recurring job scheduler (`None` disables the cron ticker).
+    scheduler: Option<Arc<crate::scheduler::Scheduler>>,
 }
 
 /// Handler for incoming messages from any platform
@@ -345,6 +500,7 @@ impl Gateway {
             message_handler: None,
             running: Arc::new(RwLock::new(false)),
             active_runs: Arc::new(RwLock::new(HashMap::new())),
+            scheduler: None,
         }
     }
 
@@ -359,6 +515,12 @@ impl Gateway {
     /// Set the message handler
     pub fn with_handler(mut self, handler: Arc<dyn MessageHandler>) -> Self {
         self.message_handler = Some(handler);
+        self
+    }
+
+    /// Attach the cron scheduler; `run()` starts its ticker task.
+    pub fn with_scheduler(mut self, scheduler: Arc<crate::scheduler::Scheduler>) -> Self {
+        self.scheduler = Some(scheduler);
         self
     }
 
@@ -473,6 +635,16 @@ impl Gateway {
                     };
 
                     for update in updates {
+                        // Interactive callbacks (Telegram inline-keyboard
+                        // button presses) resolve pending approval requests;
+                        // they never become agent messages.
+                        if update.get("callback_query").is_some() {
+                            if let Err(e) = adapter.handle_callback_query(update).await {
+                                warn!(platform = %platform, error = %e, "Failed to handle callback query");
+                            }
+                            continue;
+                        }
+
                         let incoming = match adapter.handle_update(update).await {
                             Ok(Some(msg)) => msg,
                             Ok(None) => continue,
@@ -498,6 +670,57 @@ impl Gateway {
                     // Small yield so an empty poll batch doesn't busy-spin.
                     // Long-polling adapters already block server-side when idle.
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }));
+        }
+
+        // Cron ticker: every 30s, fire due jobs by injecting their prompt
+        // as a synthetic incoming message into the owning channel.
+        if let Some(scheduler) = self.scheduler.clone() {
+            let running = self.running.clone();
+            let message_handler = self.message_handler.clone();
+            let active_runs = self.active_runs.clone();
+            let admins = self.config.admins.clone();
+            let adapters: HashMap<String, Arc<dyn PlatformAdapter>> = self.adapters.clone();
+
+            handles.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                while *running.read().await {
+                    tick.tick().await;
+                    let now = crate::scheduler::now_secs();
+                    for job in scheduler.due_jobs(now).await {
+                        // Mark fired BEFORE dispatch so a crash between the
+                        // two can't double-fire on the next tick.
+                        if let Err(e) = scheduler.mark_fired(job.id).await {
+                            warn!(job = job.id, error = %e, "Failed to mark cron job fired");
+                            continue;
+                        }
+                        let adapter = match adapters.get(&job.platform) {
+                            Some(a) => a.clone(),
+                            None => {
+                                warn!(job = job.id, platform = %job.platform, "Cron job platform not registered");
+                                continue;
+                            }
+                        };
+                        info!(job = job.id, channel = %job.channel_id, "Firing cron job");
+                        let incoming = IncomingMessage::new(
+                            &job.platform,
+                            "cron",
+                            "cron",
+                            &job.channel_id,
+                            &job.prompt,
+                        );
+                        dispatch_message(
+                            &adapter,
+                            &job.platform,
+                            incoming,
+                            &admins,
+                            message_handler.clone(),
+                            active_runs.clone(),
+                        )
+                        .await;
+                    }
                 }
             }));
         }
@@ -529,8 +752,10 @@ async fn dispatch_message(
     message_handler: Option<Arc<dyn MessageHandler>>,
     active_runs: Arc<RwLock<HashMap<String, Arc<ActiveRun>>>>,
 ) {
-    // Check if user is admin
-    if !admins.is_empty() && !admins.contains(&incoming.user_id) {
+    // Check if user is admin (synthetic cron messages bypass this: they
+    // were created by an already-authorized user in this channel).
+    let is_cron = incoming.user_id == "cron";
+    if !is_cron && !admins.is_empty() && !admins.contains(&incoming.user_id) {
         debug!(user = %incoming.user_id, "User not authorized");
         let _ = adapter
             .send_message(OutgoingMessage::new(
@@ -672,6 +897,20 @@ pub struct TelegramAdapter {
     offset: AtomicI64,
     /// Shared HTTP client (connection pooling across polls/sends)
     client: reqwest::Client,
+    /// Voice-note transcription config (`None` disables STT).
+    stt: Option<SttConfig>,
+}
+
+/// OpenAI-compatible speech-to-text endpoint used to transcribe incoming
+/// voice notes before they reach the agent.
+#[derive(Debug, Clone)]
+pub struct SttConfig {
+    /// OpenAI-compatible API base, e.g. `https://…/v1`.
+    pub base_url: String,
+    /// Bearer token for the API.
+    pub api_key: Option<String>,
+    /// Model slug, e.g. `gemini/gemini-2.5-pro`.
+    pub model: String,
 }
 
 impl TelegramAdapter {
@@ -691,7 +930,85 @@ impl TelegramAdapter {
                 .read_timeout(std::time::Duration::from_secs(45))
                 .build()
                 .expect("valid reqwest client config"),
+            stt: None,
         }
+    }
+
+    /// Attach a speech-to-text config so incoming voice notes are
+    /// transcribed into text before reaching the agent.
+    pub fn with_stt(mut self, stt: SttConfig) -> Self {
+        self.stt = Some(stt);
+        self
+    }
+
+    /// Transcribe a Telegram voice/audio message into text.
+    ///
+    /// Flow: `getFile` → download the `.oga` from `file.telegram.org` →
+    /// POST multipart to the OpenAI-compatible `/audio/transcriptions`
+    /// endpoint. Returns `None` (with a warning) on any failure so a
+    /// broken STT path never drops the user's message silently — the
+    /// caller surfaces a visible error message instead.
+    async fn transcribe_voice(&self, file_id: &str) -> Option<String> {
+        let stt = self.stt.as_ref()?;
+
+        // 1. Resolve the file path on Telegram's servers.
+        let url = format!("{}/getFile?file_id={}", self.api_url(), file_id);
+        let response = self.client.get(&url).send().await.ok()?;
+        let body: serde_json::Value = response.json().await.ok()?;
+        let file_path = body
+            .get("result")
+            .and_then(|r| r.get("file_path"))
+            .and_then(|p| p.as_str())?
+            .to_string();
+
+        // 2. Download the audio bytes.
+        let token = self.token.as_deref().unwrap_or("");
+        let download_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
+        let audio = self
+            .client
+            .get(&download_url)
+            .send()
+            .await
+            .ok()?
+            .bytes()
+            .await
+            .ok()?;
+        if audio.is_empty() {
+            warn!("Downloaded voice file is empty");
+            return None;
+        }
+
+        // 3. POST multipart to the transcription endpoint.
+        let part = reqwest::multipart::Part::bytes(audio.to_vec())
+            .file_name("voice.oga")
+            .mime_str("audio/ogg")
+            .ok()?;
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("model", stt.model.clone());
+
+        let endpoint = format!(
+            "{}/audio/transcriptions",
+            stt.base_url.trim_end_matches('/')
+        );
+        let mut request = self.client.post(&endpoint).multipart(form);
+        if let Some(key) = &stt.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await.ok()?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.ok()?;
+        if !status.is_success() {
+            warn!(status = %status, body = %body, "Transcription request failed");
+            return None;
+        }
+        let text = body
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())?;
+        info!(chars = text.len(), "Voice note transcribed");
+        Some(text)
     }
 
     fn api_url(&self) -> String {
@@ -701,6 +1018,20 @@ impl TelegramAdapter {
             base.trim_end_matches('/'),
             self.token.as_ref().unwrap_or(&String::new())
         )
+    }
+
+    /// Acknowledge a callback query so Telegram stops the button spinner.
+    async fn answer_callback(&self, callback_query_id: &str, text: &str) {
+        let body = serde_json::json!({
+            "callback_query_id": callback_query_id,
+            "text": text,
+        });
+        let _ = self
+            .client
+            .post(format!("{}/answerCallbackQuery", self.api_url()))
+            .json(&body)
+            .send()
+            .await;
     }
 
     /// Send one already-built sendMessage body, validating Telegram's `ok`
@@ -966,7 +1297,6 @@ impl PlatformAdapter for TelegramAdapter {
             Some(m) => m,
             None => return Ok(None),
         };
-
         let chat = match message.get("chat") {
             Some(c) => c,
             None => return Ok(None),
@@ -974,11 +1304,36 @@ impl PlatformAdapter for TelegramAdapter {
 
         let from = message.get("from");
 
-        let content = message
+        let mut content = message
             .get("text")
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string();
+
+        // Voice/audio notes: transcribe via STT when configured. Without
+        // STT the note is ignored (returning Ok(None)); a failed
+        // transcription surfaces a visible error so the user knows their
+        // message didn't land.
+        if content.is_empty() {
+            let voice_file_id = message
+                .get("voice")
+                .or_else(|| message.get("audio"))
+                .and_then(|v| v.get("file_id"))
+                .and_then(|f| f.as_str());
+            if let Some(file_id) = voice_file_id {
+                if self.stt.is_some() {
+                    match self.transcribe_voice(file_id).await {
+                        Some(text) => content = format!("🎤 [voice note] {}", text),
+                        None => {
+                            content =
+                                "⚠️ Voice note received but transcription failed.".to_string();
+                        }
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+        }
 
         if content.is_empty() {
             return Ok(None);
@@ -1004,6 +1359,93 @@ impl PlatformAdapter for TelegramAdapter {
         ))
     }
 
+    async fn handle_callback_query(&self, update: serde_json::Value) -> Result<()> {
+        let query = match update.get("callback_query") {
+            Some(q) => q,
+            None => return Ok(()),
+        };
+        let query_id = query
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let data = query
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        // Button payloads: "approve:<id>" / "deny:<id>".
+        let (approved, id) = match data.split_once(':') {
+            Some(("approve", id)) => (true, id),
+            Some(("deny", id)) => (false, id),
+            _ => {
+                self.answer_callback(&query_id, "Unknown action").await;
+                return Ok(());
+            }
+        };
+        let id: u64 = match id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                self.answer_callback(&query_id, "Malformed request id")
+                    .await;
+                return Ok(());
+            }
+        };
+
+        let resolved = resolve_pending_approval(id, approved);
+        let feedback = if !resolved {
+            "This request already expired."
+        } else if approved {
+            "✅ Approved"
+        } else {
+            "❌ Denied"
+        };
+        self.answer_callback(&query_id, feedback).await;
+        Ok(())
+    }
+
+    async fn send_approval_prompt(
+        &self,
+        channel_id: &str,
+        tool_name: &str,
+        arguments_preview: &str,
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<bool>)> {
+        let (id, rx) = register_pending_approval();
+
+        let preview: String = arguments_preview.chars().take(200).collect();
+        let text = format!(
+            "🔐 Tool approval required\n\nTool: {}\nArgs: {}\n\nApprove execution?",
+            tool_name,
+            if preview.is_empty() {
+                "(none)"
+            } else {
+                &preview
+            }
+        );
+
+        let body = serde_json::json!({
+            "chat_id": channel_id,
+            "text": text,
+            "reply_markup": {
+                "inline_keyboard": [[
+                    { "text": "✅ Approve", "callback_data": format!("approve:{}", id) },
+                    { "text": "❌ Deny", "callback_data": format!("deny:{}", id) }
+                ]]
+            }
+        });
+
+        match self.send_chunk(&body).await {
+            Ok(_) => Ok((id, rx)),
+            Err(e) => {
+                // Prompt never reached the user: don't leave a dangling
+                // pending entry, and fail closed (deny) rather than running
+                // a dangerous tool nobody saw.
+                drop_pending_approval(id);
+                Err(e)
+            }
+        }
+    }
+
     async fn poll_updates(&self) -> Result<Vec<serde_json::Value>> {
         if !self.is_enabled() {
             return Ok(Vec::new());
@@ -1011,7 +1453,7 @@ impl PlatformAdapter for TelegramAdapter {
 
         let offset = self.offset.load(Ordering::SeqCst);
         let url = format!(
-            "{}/getUpdates?offset={}&timeout=30&allowed_updates=%5B%22message%22%5D",
+            "{}/getUpdates?offset={}&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D",
             self.api_url(),
             offset
         );

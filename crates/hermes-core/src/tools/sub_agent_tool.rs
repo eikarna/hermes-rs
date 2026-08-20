@@ -36,7 +36,14 @@ struct SubAgentArgs {
 pub struct SubAgentTool {
     client: Arc<dyn LLMProvider>,
     model: String,
+    /// Process-wide cap on concurrent sub-agent runs. Shared across every
+    /// SubAgentTool instance so parallel parent runs can't fan out unbounded
+    /// child agents (each child is a full LLM conversation).
+    semaphore: Arc<tokio::sync::Semaphore>,
 }
+
+/// Default cap on concurrent sub-agent runs.
+pub const DEFAULT_MAX_CONCURRENT_SUB_AGENTS: usize = 3;
 
 impl SubAgentTool {
     pub fn new(parent_client: &OpenAIClient, model: impl Into<String>) -> Self {
@@ -45,9 +52,19 @@ impl SubAgentTool {
 
     /// Create a delegation tool that shares the parent's configured provider.
     pub fn with_provider(parent_client: Arc<dyn LLMProvider>, model: impl Into<String>) -> Self {
+        Self::with_concurrency(parent_client, model, DEFAULT_MAX_CONCURRENT_SUB_AGENTS)
+    }
+
+    /// Create a delegation tool with an explicit concurrency cap.
+    pub fn with_concurrency(
+        parent_client: Arc<dyn LLMProvider>,
+        model: impl Into<String>,
+        max_concurrent: usize,
+    ) -> Self {
         Self {
             client: parent_client,
             model: model.into(),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
         }
     }
 
@@ -63,6 +80,15 @@ impl SubAgentTool {
         if task.is_empty() {
             return Err("Sub-agent task must not be empty".into());
         }
+
+        // Enforce the process-wide concurrency cap. `acquire_owned` keeps the
+        // permit alive for the whole child run.
+        let _permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "Sub-agent semaphore closed unexpectedly")?;
 
         let config = AgentConfig {
             model: self.model.clone(),

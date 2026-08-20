@@ -40,6 +40,7 @@
 //! ```
 
 pub mod agent;
+pub mod approval;
 pub mod auth;
 pub mod client;
 pub mod config;
@@ -56,6 +57,7 @@ pub mod parser;
 pub mod persist;
 pub mod platform;
 pub mod repomap;
+pub mod scheduler;
 pub mod schema;
 pub mod session_store;
 pub mod skills;
@@ -89,7 +91,7 @@ pub use distillation::{distill_session_to_memory, distill_session_with_provider}
 pub use error::{Error, Result};
 pub use gateway::{
     DiscordAdapter, Gateway, GatewayConfig, IncomingMessage, MessageHandler, OutgoingMessage,
-    PlatformAdapter, SlackAdapter, TelegramAdapter, WhatsAppAdapter,
+    PlatformAdapter, SlackAdapter, SttConfig, TelegramAdapter, WhatsAppAdapter,
 };
 pub use githarness::{GitHarness, RepoSnapshot};
 pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};

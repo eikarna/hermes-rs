@@ -350,13 +350,56 @@ async fn runtime_client(config: &AppConfig) -> Result<Arc<dyn LLMProvider>> {
         if let Ok(store) = AuthStore::load_default() {
             if store.profiles.get(auth_ref).map(|p| p.method) == Some(AuthMethod::Oauth) {
                 let (kind, client) = runtime_client_with_store(config, store).await?;
-                return build_provider_for_kind(kind, client)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()));
+                let primary = build_provider_for_kind(kind, client)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                return wrap_with_fallbacks(primary, config);
             }
         }
     }
     let (kind, client) = client_config(config)?;
-    build_provider_for_kind(kind, client).map_err(|error| anyhow::anyhow!(error.to_string()))
+    let primary = build_provider_for_kind(kind, client)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    wrap_with_fallbacks(primary, config)
+}
+
+/// Wrap the primary provider in a fallback chain when `[[client.fallback]]`
+/// entries are configured. Opt-in only: an empty list returns the primary
+/// untouched, so the client stays locked to the single configured provider
+/// unless the user explicitly adds fallbacks.
+fn wrap_with_fallbacks(
+    primary: Arc<dyn LLMProvider>,
+    config: &AppConfig,
+) -> Result<Arc<dyn LLMProvider>> {
+    if config.client.fallback.is_empty() {
+        return Ok(primary);
+    }
+
+    let mut entries: Vec<hermes_core::client::FallbackEntry> = Vec::new();
+    for fb in &config.client.fallback {
+        let kind = ProviderKind::from_name(&fb.provider).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unsupported fallback provider '{}'. Expected one of: openai, anthropic, ollama, openrouter, gemini, nous.",
+                fb.provider
+            )
+        })?;
+        let client = ClientConfig {
+            base_url: fb
+                .base_url
+                .clone()
+                .unwrap_or_else(|| hermes_core::config::ClientSettings::default().base_url),
+            api_key: fb.api_key.clone(),
+            timeout: Duration::from_secs(fb.timeout_secs.unwrap_or(config.client.timeout_secs)),
+            max_context_length: config.client.max_context_length,
+        };
+        let provider = build_provider_for_kind(kind, client)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        entries.push((provider, fb.model.clone()));
+    }
+
+    tracing::info!(fallbacks = entries.len(), "Fallback provider chain enabled");
+    Ok(Arc::new(hermes_core::client::FallbackChainProvider::new(
+        primary, entries,
+    )))
 }
 
 fn apply_auth_profile_to_client(
@@ -427,12 +470,16 @@ pub(crate) async fn build_registry(
     model: &str,
 ) -> Result<ToolRegistry> {
     let registry = ToolRegistry::new(Duration::from_secs(config.tools.registry_timeout_secs));
-    hermes_core::tools::register_builtin_tools_with_provider_sub_agent(
-        &registry,
-        client.clone(),
-        model,
-    )
-    .await?;
+    hermes_core::tools::register_builtin_tools(&registry).await?;
+    if config.tools.delegation.enabled {
+        registry
+            .register(hermes_core::tools::SubAgentTool::with_concurrency(
+                client.clone(),
+                model,
+                config.tools.delegation.max_concurrent,
+            ))
+            .await?;
+    }
     registry.register(EchoTool::new()).await?;
     registry.register(CalculatorTool::new()).await?;
 
@@ -617,6 +664,15 @@ struct AgentMessageHandler {
     /// Stream model output live into the chat (SSE deltas → live message
     /// edits) instead of only showing a heartbeat until the reply is done.
     streaming_replies: bool,
+    /// Require explicit approval before executing dangerous tools.
+    tool_approval: bool,
+    /// Seconds to wait for an approval decision before auto-denying.
+    tool_approval_timeout_secs: u64,
+    /// Rolling context compaction: summarize the oldest messages into a
+    /// rolling summary instead of letting the message cap hard-truncate.
+    context_compaction: bool,
+    /// Recurring job scheduler for `/cron` commands.
+    scheduler: Arc<hermes_core::scheduler::Scheduler>,
     /// Per-channel conversation persistence so the bot survives restarts.
     session_store: hermes_core::session_store::SessionStore,
     /// Channel key currently loaded into the shared agent's conversation.
@@ -959,6 +1015,104 @@ impl RunProgress {
     }
 }
 
+impl AgentMessageHandler {
+    /// Handle `/cron` subcommands. Returns the reply text (plain, sent
+    /// with markdown disabled so ids/intervals render literally).
+    async fn handle_cron_command(&self, message: &hermes_core::gateway::IncomingMessage) -> String {
+        use hermes_core::scheduler;
+
+        let args = message
+            .content
+            .trim()
+            .strip_prefix("/cron")
+            .unwrap_or("")
+            .trim();
+
+        // /cron  (bare) or /cron list
+        if args.is_empty() || args.eq_ignore_ascii_case("list") {
+            let jobs = self.scheduler.list().await;
+            if jobs.is_empty() {
+                return "No cron jobs. Add one with:\n/cron add 30m <prompt>".to_string();
+            }
+            let mut out = String::from("Cron jobs:\n");
+            for job in &jobs {
+                let state = if job.enabled { "on" } else { "paused" };
+                out.push_str(&format!(
+                    "  #{} [{}] every {}s -> \"{}\"\n",
+                    job.id, state, job.interval_secs, job.prompt
+                ));
+            }
+            out.push_str("\n/cron pause <id> | resume <id> | remove <id>");
+            return out;
+        }
+
+        let mut parts = args.splitn(2, ' ');
+        let sub = parts.next().unwrap_or("").to_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "add" => {
+                // /cron add <interval> <prompt>
+                let mut rp = rest.splitn(2, ' ');
+                let interval_str = rp.next().unwrap_or("");
+                let prompt = rp.next().unwrap_or("").trim();
+                if interval_str.is_empty() || prompt.is_empty() {
+                    return "Usage: /cron add <interval> <prompt>\nExample: /cron add 30m check the news".to_string();
+                }
+                let interval = match scheduler::parse_interval(interval_str) {
+                    Ok(v) => v,
+                    Err(e) => return format!("Bad interval: {}", e),
+                };
+                match self
+                    .scheduler
+                    .add(
+                        prompt.to_string(),
+                        interval,
+                        message.platform.clone(),
+                        message.channel_id.clone(),
+                    )
+                    .await
+                {
+                    Ok(job) => format!(
+                        "Scheduled job #{}: every {}s -> \"{}\"",
+                        job.id, job.interval_secs, job.prompt
+                    ),
+                    Err(e) => format!("Failed to add job: {}", e),
+                }
+            }
+            "pause" | "resume" => {
+                let id: u64 = match rest.parse() {
+                    Ok(v) => v,
+                    Err(_) => return format!("Usage: /cron {} <id>", sub),
+                };
+                let enabled = sub == "resume";
+                match self.scheduler.set_enabled(id, enabled).await {
+                    Ok(true) => {
+                        format!("Job #{} {}", id, if enabled { "resumed" } else { "paused" })
+                    }
+                    Ok(false) => format!("No job #{}", id),
+                    Err(e) => format!("Failed: {}", e),
+                }
+            }
+            "remove" | "rm" | "delete" => {
+                let id: u64 = match rest.parse() {
+                    Ok(v) => v,
+                    Err(_) => return "Usage: /cron remove <id>".to_string(),
+                };
+                match self.scheduler.remove(id).await {
+                    Ok(Some(job)) => format!("Removed job #{} (\"{}\")", job.id, job.prompt),
+                    Ok(None) => format!("No job #{}", id),
+                    Err(e) => format!("Failed: {}", e),
+                }
+            }
+            other => format!(
+                "Unknown subcommand '{}'. Use: add, list, pause, resume, remove",
+                other
+            ),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
     async fn handle(
@@ -974,6 +1128,21 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
         );
 
         let channel_key = format!("{}:{}", message.platform, message.channel_id);
+
+        // /cron — manage recurring jobs.
+        //   /cron add <interval> <prompt>   schedule a job in this channel
+        //   /cron list                      show all jobs
+        //   /cron pause <id> | resume <id>  toggle a job
+        //   /cron remove <id>               delete a job
+        if message.content.trim().eq_ignore_ascii_case("/cron")
+            || message.content.trim().starts_with("/cron ")
+        {
+            let reply = self.handle_cron_command(&message).await;
+            let msg = hermes_core::gateway::OutgoingMessage::new(&message.channel_id, reply)
+                .no_markdown();
+            let _ = sink.send(msg).await;
+            return Ok(());
+        }
 
         // /new — wipe this channel's session and start fresh.
         if message.content.trim().eq_ignore_ascii_case("/new") {
@@ -1006,7 +1175,19 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
             let mut current = self.current_channel.lock().await;
             if current.as_deref() != Some(channel_key.as_str()) {
                 self.agent.clear_history().await;
-                for m in self.session_store.load(&channel_key) {
+                let data = self.session_store.load(&channel_key);
+                // Re-embed the rolling summary as the marker system message
+                // so the model sees it before the recent tail.
+                if let Some(summary) = data.summary {
+                    self.agent
+                        .add_message(hermes_core::client::Message::system(format!(
+                            "{}\n{}",
+                            hermes_core::agent::CONTEXT_SUMMARY_MARKER,
+                            summary
+                        )))
+                        .await;
+                }
+                for m in data.messages {
                     self.agent.add_message(m).await;
                 }
                 *current = Some(channel_key.clone());
@@ -1016,6 +1197,16 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
         // Per-run event channel. The shared agent swaps its sink for this run.
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
         self.agent.set_event_sender(Some(event_tx));
+
+        // Per-run approval gate: dangerous tools pause and prompt this
+        // channel's chat with approve/deny buttons.
+        if self.tool_approval {
+            let gate = hermes_core::gateway::SinkApprovalGate::new(
+                sink.clone(),
+                Duration::from_secs(self.tool_approval_timeout_secs),
+            );
+            self.agent.set_approval_gate(Some(Arc::new(gate)));
+        }
 
         // Oneshot carrying the final outcome so the pump can replace the
         // live status message with the model's actual reply.
@@ -1079,12 +1270,26 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
             .run_with_cancel(message.content.clone(), cancel)
             .await;
 
+        // Rolling context compaction: when the buffer grows past the
+        // trigger, summarize the oldest messages into a rolling summary
+        // instead of letting the 200-message cap hard-truncate them.
+        // Fail-open: compact_history logs and keeps history as-is on error.
+        if self.context_compaction {
+            if let Some(_summary) = self.agent.compact_history().await {
+                tracing::info!("Context compacted; rolling summary updated");
+            }
+        }
+
         // Persist the conversation for this channel so it survives restarts.
         // Save even on cancel/error: partial history is better than losing
         // the whole session.
         {
             let conv = self.agent.conversation().await;
-            if let Err(e) = self.session_store.save(&channel_key, &conv) {
+            let summary = self.agent.context_summary().await;
+            if let Err(e) = self
+                .session_store
+                .save(&channel_key, summary.as_deref(), &conv)
+            {
                 tracing::warn!(error = %e, "Failed to persist session");
             }
         }
@@ -1126,6 +1331,8 @@ impl hermes_core::gateway::MessageHandler for AgentMessageHandler {
         // Now that the outcome is queued, detach the event sink so no
         // further events reach the pump.
         self.agent.set_event_sender(None);
+        // Detach the per-run approval gate too (it borrows this run's sink).
+        self.agent.set_approval_gate(None);
         if let Err(e) = pump.await {
             // A panicked pump means the final reply may never have been
             // rendered — surface it instead of dying silently.
@@ -1151,22 +1358,41 @@ async fn run_gateway(config: &AppConfig, system_prompt: Option<&str>) -> Result<
     let mut mcp_manager = McpManager::new();
     let agent = create_agent_without_events(config, system_prompt, &mut mcp_manager).await?;
     let gateway_config = hermes_core::gateway::GatewayConfig::default();
+    let scheduler = Arc::new(hermes_core::scheduler::Scheduler::new(
+        hermes_core::scheduler::Scheduler::default_dir(),
+    ));
     let handler = Arc::new(AgentMessageHandler {
         agent: Arc::new(agent),
         streaming_replies: gateway_config.streaming_replies,
+        tool_approval: gateway_config.tool_approval,
+        tool_approval_timeout_secs: gateway_config.tool_approval_timeout_secs,
+        context_compaction: gateway_config.context_compaction,
+        scheduler: scheduler.clone(),
         session_store: hermes_core::session_store::SessionStore::new(
             hermes_core::session_store::SessionStore::default_dir(),
         ),
         current_channel: tokio::sync::Mutex::new(None),
         run_lock: tokio::sync::Mutex::new(()),
     });
-    let mut gateway =
-        hermes_core::gateway::Gateway::new(gateway_config.clone()).with_handler(handler);
+    let mut gateway = hermes_core::gateway::Gateway::new(gateway_config.clone())
+        .with_handler(handler)
+        .with_scheduler(scheduler);
 
     if gateway_config.telegram_enabled {
-        gateway = gateway.with_adapter(Arc::new(hermes_core::gateway::TelegramAdapter::new(
-            gateway_config.telegram_token.clone(),
-        )));
+        let mut telegram =
+            hermes_core::gateway::TelegramAdapter::new(gateway_config.telegram_token.clone());
+        // Voice-note STT: reuse the primary client's endpoint + key so no
+        // extra credentials are needed. Disabled unless stt_model is set.
+        if let Some(model) = gateway_config.stt_model.clone() {
+            let resolved = hermes_core::client::resolve_provider_settings(&config.client)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            telegram = telegram.with_stt(hermes_core::gateway::SttConfig {
+                base_url: resolved.config.base_url,
+                api_key: resolved.config.api_key,
+                model,
+            });
+        }
+        gateway = gateway.with_adapter(Arc::new(telegram));
     }
     if gateway_config.discord_enabled {
         gateway = gateway.with_adapter(Arc::new(hermes_core::gateway::DiscordAdapter::new(

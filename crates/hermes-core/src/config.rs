@@ -59,6 +59,25 @@ pub struct ClientSettings {
     pub ollama: ProviderEndpointSettings,
     pub openrouter: ProviderEndpointSettings,
     pub gemini: ProviderEndpointSettings,
+    /// Fallback providers tried in order when the primary provider fails
+    /// (rate limit, timeout, connection error). Empty by default: the client
+    /// stays locked to the single configured provider unless the user
+    /// explicitly opts in — a silent fallback could downgrade to a worse
+    /// model without the user noticing.
+    pub fallback: Vec<FallbackProviderSettings>,
+}
+
+/// One fallback provider entry: same shape as the primary `[client]` block,
+/// minus the fields that only make sense at the top level.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FallbackProviderSettings {
+    pub provider: String,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    /// Model override for this fallback (defaults to the primary model).
+    pub model: Option<String>,
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -80,6 +99,7 @@ impl Default for ClientSettings {
             timeout_secs: 300,
             max_context_length: 128_000,
             provider: "openai".to_string(),
+            fallback: Vec::new(),
             openai: ProviderEndpointSettings::default(),
             anthropic: ProviderEndpointSettings::default(),
             ollama: ProviderEndpointSettings::default(),
@@ -406,6 +426,18 @@ pub struct GatewaySettings {
     /// Stream model output live into the chat (message edited as tokens
     /// arrive) instead of showing a heartbeat until the full reply is ready.
     pub streaming_replies: bool,
+    /// Require explicit approval (Telegram inline keyboard ✅/❌) before
+    /// executing dangerous tools (terminal, file writes, code execution).
+    pub tool_approval: bool,
+    /// Seconds to wait for an approval decision before auto-denying.
+    pub tool_approval_timeout_secs: u64,
+    /// Model used to transcribe incoming voice notes via the OpenAI-compatible
+    /// `/audio/transcriptions` endpoint (e.g. "gemini/gemini-2.5-pro").
+    /// `None` disables voice transcription.
+    pub stt_model: Option<String>,
+    /// Roll the oldest messages into a summary when a session grows past the
+    /// compaction threshold, instead of silently dropping them at the cap.
+    pub context_compaction: bool,
 }
 
 impl Default for GatewaySettings {
@@ -426,6 +458,10 @@ impl Default for GatewaySettings {
             webhooks_addr: None,
             admins: Vec::new(),
             streaming_replies: false,
+            tool_approval: true,
+            tool_approval_timeout_secs: 300,
+            stt_model: None,
+            context_compaction: true,
         }
     }
 }
@@ -439,6 +475,27 @@ pub struct ToolSettings {
     pub http: HttpToolSettings,
     pub terminal: TerminalSettings,
     pub code_execution: CodeExecutionSettings,
+    pub delegation: DelegationSettings,
+}
+
+/// Sub-agent delegation (`delegate_to_sub_agent` tool) settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DelegationSettings {
+    /// Register the delegation tool at all. Default ON: the tool only costs
+    /// tokens when the model actively chooses to call it.
+    pub enabled: bool,
+    /// Max concurrent sub-agent runs (shared semaphore across the process).
+    pub max_concurrent: usize,
+}
+
+impl Default for DelegationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrent: 3,
+        }
+    }
 }
 
 impl Default for ToolSettings {
@@ -450,6 +507,7 @@ impl Default for ToolSettings {
             http: HttpToolSettings::default(),
             terminal: TerminalSettings::default(),
             code_execution: CodeExecutionSettings::default(),
+            delegation: DelegationSettings::default(),
         }
     }
 }
