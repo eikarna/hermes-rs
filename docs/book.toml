@@ -1,0 +1,21 @@
+[book]
+title = "Kerux"
+description = "Kerux — a fast, self-contained AI agent runtime written in Rust"
+authors = ["Nix Seymour"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/eikarna/hermes-rs"
+edit-url-template = "https://github.com/eikarna/hermes-rs/edit/main/docs/{path}"
+no-section-label = false
+
+[output.html.search]
+enable = true
+limit-results = 20

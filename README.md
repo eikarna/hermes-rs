@@ -2,6 +2,8 @@
 
 A high-performance Rust implementation of the Kerux-Agent orchestration loop for LLM-driven tool execution.
 
+📖 **Documentation:** [eikarna.github.io/hermes-rs](https://eikarna.github.io/hermes-rs/)
+
 ## Features
 
 - **Streaming-First Architecture**: Detect and execute tool calls incrementally from partial LLM outputs
@@ -17,6 +19,15 @@ A high-performance Rust implementation of the Kerux-Agent orchestration loop for
 - **Token-Efficient Edits**: `edit_block` tool applies ordered search/replace pairs atomically; model capability routing hints the right edit format per provider/model
 - **Transactional Git Harness**: Pre-run snapshots with dirty-tree protection, Conventional Commit derivation, and a TUI `/undo` command to roll back a run's file changes
 - **Lifecycle Curator**: Background pass keeping memory and skills healthy — importance decay, near-duplicate pruning, session archiving, stale skill auto-archiving, and distillation of recurring facts into draft skills
+
+### Gateway Features (F1–F6)
+
+- **F1 Tool Approval**: Telegram inline-keyboard `[✅][❌]` approval gate before tool execution
+- **F2 Context Compaction**: rolling LLM summarization of old turns, session format v2 with persistent summary
+- **F3 Fallback Provider Chain**: automatic failover on transient errors (network/429/5xx), default OFF
+- **F4 Voice Note STT**: Telegram voice notes transcribed via `/v1/audio/transcriptions`
+- **F5 Cron Scheduler**: `/cron add|list|pause|resume|remove` with atomic JSON persistence
+- **F6 Subagent Delegation**: `delegate_to_sub_agent` tool — isolated child agents, max 3 concurrent, depth 1
 
 ## Architecture
 

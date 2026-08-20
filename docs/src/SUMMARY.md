@@ -1,0 +1,29 @@
+# Summary
+
+[Introduction](introduction.md)
+
+# Getting Started
+
+- [Quickstart](quickstart.md)
+- [Configuration](configuration.md)
+
+# Architecture
+
+- [Overview](architecture/overview.md)
+- [Agent Loop](architecture/agent-loop.md)
+- [Gateway & Adapters](architecture/gateway.md)
+- [OAuth & Auth](architecture/oauth.md)
+
+# Features
+
+- [Tool Approval](features/tool-approval.md)
+- [Context Compaction](features/context-compaction.md)
+- [Fallback Provider Chain](features/fallback-chain.md)
+- [Voice Note STT](features/voice-stt.md)
+- [Cron Scheduler](features/cron-scheduler.md)
+- [Subagent Delegation](features/subagent-delegation.md)
+
+# Development
+
+- [Roadmap](development/roadmap.md)
+- [History](development/history.md)

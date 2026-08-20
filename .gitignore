@@ -36,3 +36,6 @@ USER.md
 
 # Local Hermes runtime config (provider/auth_ref/model — user-specific)
 hermes.toml
+
+# mdBook build output
+docs/book/
