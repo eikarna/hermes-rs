@@ -56,6 +56,7 @@ pub mod memory;
 pub mod parser;
 pub mod persist;
 pub mod platform;
+pub mod redaction;
 pub mod repomap;
 pub mod scheduler;
 pub mod schema;
