@@ -1,4 +1,4 @@
-# Cron Scheduler (F5)
+# Cron Scheduler
 
 Recurring jobs that fire agent prompts on an interval.
 

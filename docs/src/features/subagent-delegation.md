@@ -1,4 +1,4 @@
-# Subagent Delegation (F6)
+# Subagent Delegation
 
 The agent can delegate focused tasks to isolated child agents.
 

@@ -1,4 +1,4 @@
-# Tool Approval (F1)
+# Tool Approval
 
 Interactive approval gate for tool execution via Telegram inline keyboards.
 

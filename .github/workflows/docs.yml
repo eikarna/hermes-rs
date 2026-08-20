@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "assets/**"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -27,6 +28,11 @@ jobs:
         run: |
           curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar -xz
           sudo mv mdbook /usr/local/bin/
+
+      - name: Copy assets into book source
+        run: |
+          mkdir -p docs/src/assets
+          cp assets/banner.png assets/main.png assets/chat.png docs/src/assets/
 
       - name: Build book
         run: mdbook build docs

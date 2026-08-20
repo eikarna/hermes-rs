@@ -1,4 +1,4 @@
-# Fallback Provider Chain (F3)
+# Fallback Provider Chain
 
 Automatic failover to backup LLM providers on transient errors.
 

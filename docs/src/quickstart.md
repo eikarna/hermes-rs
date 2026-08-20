@@ -1,5 +1,7 @@
 # Quickstart
 
+![Kerux workspace](assets/chat.png)
+
 ## Build
 
 ```bash

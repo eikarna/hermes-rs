@@ -1,6 +1,7 @@
 //! Kerux CLI
 
 mod autonomous;
+mod screenshot;
 mod tui;
 
 use std::collections::HashMap;
@@ -125,6 +126,13 @@ enum Commands {
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
+    },
+    /// Render TUI screenshots headlessly (used by the docs preview workflow).
+    #[command(hide = true)]
+    Screenshot {
+        /// Output directory for the PNG files.
+        #[arg(short, long, default_value = "assets")]
+        out: PathBuf,
     },
 }
 
@@ -1993,6 +2001,9 @@ async fn main() -> Result<()> {
         }
         Commands::Auth { command } => {
             handle_auth_command(command).await?;
+        }
+        Commands::Screenshot { out } => {
+            screenshot::capture(&loaded.config, out)?;
         }
     }
 

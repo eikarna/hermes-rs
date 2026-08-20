@@ -1,0 +1,46 @@
+name: Screenshots
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/kerux-cli/src/tui/**"
+      - "crates/kerux-cli/src/screenshot.rs"
+      - ".github/workflows/screenshots.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install headless Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium fonts-dejavu-core
+
+      - name: Build kerux
+        run: cargo build -p kerux-cli
+
+      - name: Capture TUI screenshots
+        run: ./target/debug/kerux screenshot --out assets
+
+      - name: Commit updated screenshots
+        run: |
+          if git diff --quiet -- assets/main.png assets/chat.png; then
+            echo "Screenshots unchanged — nothing to commit."
+            exit 0
+          fi
+          git config user.name "kerux-bot"
+          git config user.email "kerux-bot@users.noreply.github.com"
+          git add assets/main.png assets/chat.png
+          git commit -m "chore(assets): refresh TUI screenshots [skip ci]"
+          git push

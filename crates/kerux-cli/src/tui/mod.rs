@@ -2,8 +2,8 @@ mod action;
 mod app;
 mod forms;
 mod layout;
-mod render;
-mod state;
+pub(crate) mod render;
+pub(crate) mod state;
 mod theme;
 
 pub use app::{LaunchMode, TuiApp};

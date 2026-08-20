@@ -1,4 +1,4 @@
-# Context Compaction (F2)
+# Context Compaction
 
 Rolling summarization of old conversation turns to stay within context limits.
 

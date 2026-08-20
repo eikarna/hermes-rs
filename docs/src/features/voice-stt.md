@@ -1,4 +1,4 @@
-# Voice Note STT (F4)
+# Voice Note STT
 
 Telegram voice notes are transcribed to text before hitting the agent.
 
