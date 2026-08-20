@@ -64,6 +64,11 @@ impl RunChain {
 /// Stable reasons why an in-memory chain cannot be verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationError {
+    UnsupportedSchemaVersion {
+        sequence: u64,
+        expected: u32,
+        actual: u32,
+    },
     SequenceMismatch {
         expected: u64,
         actual: u64,
@@ -85,6 +90,13 @@ pub enum VerificationError {
 pub fn verify_chain(events: &[RunEventEnvelope]) -> Result<(), VerificationError> {
     let expected_run_id = events.first().map(|event| event.run_id.as_str());
     for (index, event) in events.iter().enumerate() {
+        if event.schema_version != SCHEMA_VERSION {
+            return Err(VerificationError::UnsupportedSchemaVersion {
+                sequence: event.sequence,
+                expected: SCHEMA_VERSION,
+                actual: event.schema_version,
+            });
+        }
         let expected_sequence = index as u64;
         if event.sequence != expected_sequence {
             return Err(VerificationError::SequenceMismatch {
@@ -236,6 +248,32 @@ mod tests {
                 actual: "run-2".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn unsupported_schema_fails_at_any_sequence_with_recomputed_hashes() {
+        let mut chain = super::RunChain::new("run-1");
+        chain.append(1, "run_started", json!({})).unwrap();
+        chain.append(2, "run_completed", json!({})).unwrap();
+
+        for sequence in 0..2 {
+            let mut events = chain.events().to_vec();
+            events[sequence].schema_version = 2;
+            events[sequence].hash = super::calculate_hash(&events[sequence]).unwrap();
+            if sequence == 0 {
+                events[1].previous_hash = Some(events[0].hash.clone());
+                events[1].hash = super::calculate_hash(&events[1]).unwrap();
+            }
+
+            assert_eq!(
+                super::verify_chain(&events),
+                Err(super::VerificationError::UnsupportedSchemaVersion {
+                    sequence: sequence as u64,
+                    expected: super::SCHEMA_VERSION,
+                    actual: 2,
+                })
+            );
+        }
     }
 
     #[test]

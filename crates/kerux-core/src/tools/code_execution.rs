@@ -1,7 +1,8 @@
 //! Code execution tool
 //!
-//! Launches code as bounded child processes on the host. Timeouts limit how
-//! long a process may run, but this tool does not isolate the filesystem,
+//! Launches code as child processes on the host. Configured timeouts bound
+//! individual output reads and waits; they do not currently guarantee that a
+//! timed-out child is terminated. This tool does not isolate the filesystem,
 //! network, environment, or process privileges. Use an external sandbox such
 //! as a container or VM when executing untrusted code.
 
