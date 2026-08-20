@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 pub const REDACTED: &str = "[REDACTED]";
 
 static BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bbearer[ \t]+[A-Za-z0-9._~+/=-]{8,}")
+    Regex::new(r"(?i)\bbearer[ \t]+[A-Za-z0-9._~+/=-]+")
         .expect("the bearer redaction regex is valid")
 });
 
@@ -212,6 +212,15 @@ mod tests {
         assert!(!redacted.contains("sk-example_1234567890"));
         assert!(!redacted.contains("ghp_Example1234567890"));
         assert_eq!(redacted.matches("[REDACTED]").count(), 3);
+    }
+
+    #[test]
+    fn redacts_single_character_bearer_credentials() {
+        let input = "Authorization: Bearer x";
+
+        let redacted = super::redact_text(input);
+
+        assert_eq!(redacted, "Authorization: [REDACTED]");
     }
 
     #[test]
