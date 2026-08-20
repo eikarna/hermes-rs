@@ -2,7 +2,7 @@
 
 A high-performance Rust implementation of the Kerux-Agent orchestration loop for LLM-driven tool execution.
 
-📖 **Documentation:** [eikarna.github.io/hermes-rs](https://eikarna.github.io/hermes-rs/)
+📖 **Documentation:** [kerux.eikarna.dev](https://kerux.eikarna.dev/)
 
 ## Features
 
