@@ -1,7 +1,9 @@
 //! Pure secret-redaction primitives for data that may be persisted.
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
 
 /// Marker used in place of sensitive values.
@@ -38,6 +40,80 @@ pub fn redact_json(value: &Value) -> Value {
         Value::String(text) => Value::String(redact_text(text)),
         _ => value.clone(),
     }
+}
+
+/// A redacted serialized payload plus integrity and truncation metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundedPayload {
+    /// Redacted payload content, possibly shortened.
+    pub content: String,
+    /// Byte length after redaction but before truncation.
+    pub original_bytes: usize,
+    /// SHA-256 of the complete redacted payload.
+    pub sha256: String,
+    /// Whether `content` omits bytes from the complete redacted payload.
+    pub truncated: bool,
+}
+
+impl BoundedPayload {
+    /// Redact and compactly serialize JSON before applying a byte limit.
+    pub fn from_json(value: &Value, max_bytes: usize) -> Result<Self, serde_json::Error> {
+        let serialized = serde_json::to_string(&redact_json(value))?;
+        Ok(Self::from_redacted_text(&serialized, max_bytes))
+    }
+
+    fn from_redacted_text(text: &str, max_bytes: usize) -> Self {
+        let truncated = text.len() > max_bytes;
+        Self {
+            content: if truncated {
+                truncate_utf8(text, max_bytes)
+            } else {
+                text.to_string()
+            },
+            original_bytes: text.len(),
+            sha256: sha256_hex(text.as_bytes()),
+            truncated,
+        }
+    }
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+    const ELLIPSIS: &str = "…";
+
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    if max_bytes < ELLIPSIS.len() {
+        return ".".repeat(max_bytes);
+    }
+
+    let available = max_bytes - ELLIPSIS.len();
+    let prefix_budget = available.div_ceil(2);
+    let suffix_budget = available - prefix_budget;
+
+    let mut prefix_end = prefix_budget.min(text.len());
+    while !text.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+
+    let mut suffix_start = text.len().saturating_sub(suffix_budget);
+    while suffix_start < text.len() && !text.is_char_boundary(suffix_start) {
+        suffix_start += 1;
+    }
+
+    format!(
+        "{}{}{}",
+        &text[..prefix_end],
+        ELLIPSIS,
+        &text[suffix_start..]
+    )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn redact_object(object: &Map<String, Value>) -> Map<String, Value> {
@@ -155,5 +231,52 @@ mod tests {
         assert_eq!(once["label"], input["label"]);
         assert_eq!(input, original, "redaction mutated the borrowed input");
         assert_eq!(once, twice, "redaction must be idempotent");
+    }
+
+    #[test]
+    fn bounded_json_preserves_small_redacted_payload() {
+        let input = json!({"token": "do-not-persist", "answer": 42});
+
+        let bounded = super::BoundedPayload::from_json(&input, 1024).unwrap();
+
+        assert!(!bounded.truncated);
+        assert_eq!(bounded.content, r#"{"answer":42,"token":"[REDACTED]"}"#);
+        assert_eq!(bounded.original_bytes, bounded.content.len());
+        assert_eq!(bounded.sha256.len(), 64);
+        assert!(!bounded.content.contains("do-not-persist"));
+    }
+
+    #[test]
+    fn bounded_json_truncates_utf8_within_the_byte_limit() {
+        let input = json!({"text": "awal-αβγδεζηθικλμνξοπρστυφχψω-akhir"});
+
+        let bounded = super::BoundedPayload::from_json(&input, 32).unwrap();
+
+        assert!(bounded.truncated);
+        assert!(
+            bounded.content.len() <= 32,
+            "got {} bytes",
+            bounded.content.len()
+        );
+        assert!(bounded.original_bytes > bounded.content.len());
+        assert!(bounded.content.contains('…'));
+        assert_eq!(bounded.sha256.len(), 64);
+    }
+
+    #[test]
+    fn bounded_json_redacts_before_truncating_across_a_secret_boundary() {
+        let secret = "abcdef1234567890";
+        let command = format!("{} Bearer {secret} {}", "a".repeat(40), "z".repeat(40));
+        let input = json!({"command": command});
+
+        let bounded = super::BoundedPayload::from_json(&input, 40).unwrap();
+        let complete = super::BoundedPayload::from_json(&input, 4096).unwrap();
+
+        assert!(bounded.truncated);
+        assert!(bounded.content.len() <= 40);
+        assert!(!bounded.content.contains(secret));
+        assert!(!complete.content.contains(secret));
+        assert_eq!(bounded.sha256, complete.sha256);
+        assert_eq!(bounded.original_bytes, complete.original_bytes);
     }
 }
