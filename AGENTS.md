@@ -2,7 +2,7 @@
 
 ## Kerux Project Context
 
-- Current release line: `0.1.3`
+- Current release line: `0.2.x`
 - Runtime config is TOML-first and shared through `crates/kerux-core/src/config.rs`
 - Rich CLI/TUI uses `ratatui` and lives under `crates/kerux-cli/src/tui/`
 - Autonomous coding mode lives in `crates/kerux-cli/src/autonomous.rs` and is launched through `kerux autonomous` or `kerux run --autonomous`

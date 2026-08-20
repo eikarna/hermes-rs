@@ -1,6 +1,9 @@
 //! Code execution tool
 //!
-//! Provides secure code execution in a sandboxed environment.
+//! Launches code as bounded child processes on the host. Timeouts limit how
+//! long a process may run, but this tool does not isolate the filesystem,
+//! network, environment, or process privileges. Use an external sandbox such
+//! as a container or VM when executing untrusted code.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -13,7 +16,7 @@ use crate::config::runtime_config;
 use crate::schema::ToolSchema;
 use crate::tools::{KeruxTool, ToolContext, ToolResult};
 
-/// Tool for executing code in various languages
+/// Tool for executing code in various languages as host child processes.
 pub struct CodeExecutionTool;
 
 #[derive(JsonSchema, Deserialize)]
