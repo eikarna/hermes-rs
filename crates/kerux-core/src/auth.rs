@@ -24,8 +24,9 @@ const BASE64_URL_SAFE: &[u8; 64] =
 pub const NOUS_PORTAL_URL: &str = "https://portal.nousresearch.com";
 /// Default Nous Portal inference API base URL (OpenAI-compatible).
 pub const NOUS_INFERENCE_URL: &str = "https://inference-api.nousresearch.com/v1";
-/// OAuth client id Nous Portal expects from the Kerux CLI.
-pub const NOUS_CLIENT_ID: &str = "kerux-cli";
+/// Public OAuth client id registered for this CLI with Nous Portal.
+/// This protocol identifier intentionally retains the historical product name.
+pub const NOUS_CLIENT_ID: &str = "hermes-cli";
 /// Scope granting inference invoke access. The returned access token is itself
 /// a short-lived invoke JWT usable directly as the inference bearer.
 pub const NOUS_SCOPE: &str = "inference:invoke";
@@ -1165,6 +1166,11 @@ fn validate_base_url(value: Option<String>) -> Result<Option<String>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn nous_oauth_client_id_matches_portal_registration() {
+        assert_eq!(NOUS_CLIENT_ID, "hermes-cli");
+    }
+
     fn temp_auth_path(name: &str) -> PathBuf {
         std::env::temp_dir()
             .join(format!("kerux_auth_{}_{}", name, std::process::id()))
@@ -1654,7 +1660,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("POST", "/api/oauth/device/code")
-            .match_body(mockito::Matcher::Regex("client_id=kerux-cli".into()))
+            .match_body(mockito::Matcher::Regex("client_id=hermes-cli".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
