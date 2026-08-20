@@ -13,22 +13,22 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 - Model-agnostic provider routing `LLMProvider` trait, capability metadata, `[client].provider` selection, native adapters OpenAI, Anthropic, Ollama, OpenRouter
 - **Gemini adapter** (`[client] provider = "gemini"` or `"google"`): native `generateContent`/`streamGenerateContent?alt=sse` wiring with `x-goog-api-key`-equivalent `?key=` auth, `systemInstruction`/`contents`/`functionDeclarations` translation, `functionCall`↔`tool_calls` mapping, capability rows for gemini-2.5-pro/flash (1M ctx, 64K out, SearchReplace) plus generic `gemini-` fallback (Patch), and `GEMINI_API_KEY`/`GEMINI_BASE_URL` env overrides. Streaming currently one-shot (module `ponytail` note)
 - Native Anthropic Messages API adapter `x-api-key` / `anthropic-version` headers, `/messages` endpoint routing, native tool schemas, SSE streaming normalization
-- Provider-specific endpoint overrides under `[client.anthropic]`, `[client.ollama]`, `[client.openrouter]`, `[client.openai]`; environment overrides via `HERMES_PROVIDER` plus per-provider `*_API_KEY` vars
+- Provider-specific endpoint overrides under `[client.anthropic]`, `[client.ollama]`, `[client.openrouter]`, `[client.openai]`; environment overrides via `KERUX_PROVIDER` plus per-provider `*_API_KEY` vars
 - Provider-aware session distillation sub-agent delegation so background work follows configured provider
-- Autonomous coding mode through `hermes autonomous` `hermes run --autonomous` compatibility alias
+- Autonomous coding mode through `kerux autonomous` `kerux run --autonomous` compatibility alias
 - Shared `[autonomous]` runtime configuration autonomous polling interval, TODO path, status report path, validation command, git target, commit message, command timeout, repeated-failure pause threshold
 - Repo-root `TODO.md` task ledger `Implemented` `Pending` sections autonomous workspace planning
 - Repo-local `autonomous-status.toml` status reports capture autonomous state, validation results, failure summaries, last push targets
 - Disposable-repo autonomous validation coverage exercises full tick loop without live model call
 - Long-term memory injection into agent system prompts via `<long_term_memory>` context built durable `MEMORY.md` facts
 - Async state distillation extracts durable session facts into repo-local `MEMORY.md` after completed agent runs
-- Workspace context-file auto-loading `AGENTS.md`, `CLAUDE.md`, `.hermes.md`, `HERMES.md`, prompt-injection scanning child-agent ReAct Hermes-supported provider-specific TUI context-token auto-compaction Prompt-prefixed TUI Claude/Anthropic-style SSE tool-use OpenAI-compatible streaming chunks
+- Workspace context-file auto-loading `AGENTS.md`, `CLAUDE.md`, `.kerux.md`, `KERUX.md`, prompt-injection scanning child-agent ReAct Kerux-supported provider-specific TUI context-token auto-compaction Prompt-prefixed TUI Claude/Anthropic-style SSE tool-use OpenAI-compatible streaming chunks
 - Tree-sitter repo map AST-based file ranking personalized PageRank token-efficient codebase context (`[agent].repo_map_tokens`)
 - Aider-style SEARCH/REPLACE blocks lean code generation (vs. full-file rewrites) via `edit_block` tool; model routing hints `EditFormat::SearchReplace/Patch` from capabilities table
 - Repo-map file capping via `[agent].repo_map_max_files` (defaults to 500 files) prevents ranking stalls on very large repositories
 
 - Git harness pre-run snapshots dirty-tree protection Conventional Commit derivation from staged diffs `commit_transaction`, `/undo` rollback command
-- Lifecycle curator `hermes_core::curator` background pass memory importance decay near-duplicate pruning session auto-archiving stale skill archiving into `_archive/` tag-clustered distillation long-term facts draft skills; runs non-blockingly every agent startup and autonomous tick
+- Lifecycle curator `kerux_core::curator` background pass memory importance decay near-duplicate pruning session auto-archiving stale skill archiving into `_archive/` tag-clustered distillation long-term facts draft skills; runs non-blockingly every agent startup and autonomous tick
 - Memory pinning `pinned: true` flag `MemoryManager::set_pinned` MEMORY.md roundtrip curator exemption from decay/prune/dedup; pinned skills exempt archival
 - Optional LLM-assisted skill summarization `skill_distill_llm_summary` + `curate_with_llm` rewrites distilled drafts as prose fails back bullet lists CLI runtime client passed when enabled
 - Periodic mid-session passes `[curator].interval_secs` spawned once per process first tick delayed so startup/tick passes don't double up

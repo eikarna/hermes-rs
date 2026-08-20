@@ -1,4 +1,4 @@
-# Hermes-RS Development Progress & Handoff Document
+# Kerux Development Progress & Handoff Document
 
 **Last Updated:** August 10, 2024  
 **Current Version:** v0.1.3 (main branch)  
@@ -19,8 +19,8 @@
 | **Phase 5** | Skill & memory lifecycle management | ✅ Done | `aa53ed6`, `a309db0`, `2a4485a` | Curator passes, decay/prune/dedup, distillation, archival, pinning, LLM prose summarization |
 
 ### Test Coverage
-- **hermes-core**: 235 tests passing (1 pre-existing env failure: MCP stdio requires Python binary)
-- **hermes-cli**: 104 tests passing
+- **kerux-core**: 235 tests passing (1 pre-existing env failure: MCP stdio requires Python binary)
+- **kerux-cli**: 104 tests passing
 - **Repomap-specific**: 7 tests all passing
 - **Clippy**: Clean (`--all-targets --all-features -- -D warnings`)
 
@@ -43,7 +43,7 @@ Based on TODO.md tracking and natural progression after Aider integration, here 
 ---
 
 #### 3. ~~Gemini Adapter~~ (SHIPPED)
-`crates/hermes-core/src/client/gemini.rs`: `generateContent` + `streamGenerateContent?alt=sse` (one-shot replay through shared SSE parser — true token streaming is next), `systemInstruction`/`contents`/`functionDeclarations` translation, `functionCall`↔`tool_calls` mapping. Capability rows for gemini-2.5-pro/flash + generic `gemini-` fallback in `provider.rs`; `[client.gemini]` section + `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `GEMINI_TIMEOUT_SECS` env overrides in `config.rs`; `ProviderKind::Gemini` plumbed through `resolve_provider_settings`, `build_provider_for_kind`, CLI factory error text. Chose `v1beta` (current stable surface with function calling + streaming).
+`crates/kerux-core/src/client/gemini.rs`: `generateContent` + `streamGenerateContent?alt=sse` (one-shot replay through shared SSE parser — true token streaming is next), `systemInstruction`/`contents`/`functionDeclarations` translation, `functionCall`↔`tool_calls` mapping. Capability rows for gemini-2.5-pro/flash + generic `gemini-` fallback in `provider.rs`; `[client.gemini]` section + `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `GEMINI_TIMEOUT_SECS` env overrides in `config.rs`; `ProviderKind::Gemini` plumbed through `resolve_provider_settings`, `build_provider_for_kind`, CLI factory error text. Chose `v1beta` (current stable surface with function calling + streaming).
 
 ---
 
@@ -97,13 +97,13 @@ Distilled drafts default to `<skills>/_pending/` (`[curator].auto_approve_skills
 
 | Component | Primary Files | Purpose |
 |-----------|---------------|---------|
-| **Repo Map** | `crates/hermes-core/src/repomap/extractor.rs`, `scorer.rs`, `budgeter.rs` | Symbol extraction, PageRank ranking, token-budgeted rendering |
-| **Git Harness** | `crates/hermes-core/src/githarness.rs`, `crates/hermes-cli/src/tui/app.rs` (`/undo`) | Snapshot/restore, dirty-tree protection, Conventional Commits |
-| **Curator** | `crates/hermes-core/src/curator.rs` | Decay/prune/dedup/archive/distillation loops |
-| **Skills** | `crates/hermes-core/src/skills.rs`, `crates/hermes-core/src/repomap/budgeter.rs` | SKILL.md front matter loading, metadata persistence, archive management |
-| **Config** | `crates/hermes-core/src/config.rs`, `hermes.example.toml` | TOML-based settings runtime config resolution |
-| **Providers** | `crates/hermes-core/src/client/anthropic.rs`, `openai.rs`, `ollama.rs`, `openrouter.rs` | LLM provider implementations with streaming normalization |
-| **Agents** | `crates/hermes-core/src/agent.rs`, `crates/hermes-cli/src/tui/app.rs` | ReAct loop orchestration, system prompt construction |
+| **Repo Map** | `crates/kerux-core/src/repomap/extractor.rs`, `scorer.rs`, `budgeter.rs` | Symbol extraction, PageRank ranking, token-budgeted rendering |
+| **Git Harness** | `crates/kerux-core/src/githarness.rs`, `crates/kerux-cli/src/tui/app.rs` (`/undo`) | Snapshot/restore, dirty-tree protection, Conventional Commits |
+| **Curator** | `crates/kerux-core/src/curator.rs` | Decay/prune/dedup/archive/distillation loops |
+| **Skills** | `crates/kerux-core/src/skills.rs`, `crates/kerux-core/src/repomap/budgeter.rs` | SKILL.md front matter loading, metadata persistence, archive management |
+| **Config** | `crates/kerux-core/src/config.rs`, `kerux.example.toml` | TOML-based settings runtime config resolution |
+| **Providers** | `crates/kerux-core/src/client/anthropic.rs`, `openai.rs`, `ollama.rs`, `openrouter.rs` | LLM provider implementations with streaming normalization |
+| **Agents** | `crates/kerux-core/src/agent.rs`, `crates/kerux-cli/src/tui/app.rs` | ReAct loop orchestration, system prompt construction |
 
 ---
 
@@ -111,8 +111,8 @@ Distilled drafts default to `<skills>/_pending/` (`[curator].auto_approve_skills
 
 1. **Clone repository:**
    ```bash
-   git clone https://github.com/yourservice/hermes-rs.git
-   cd hermes-rs
+   git clone https://github.com/yourservice/kerux.git
+   cd kerux
    ```
 
 2. **Install dependencies:**
@@ -133,7 +133,7 @@ Distilled drafts default to `<skills>/_pending/` (`[curator].auto_approve_skills
 4. **Build binary:**
    ```bash
    cargo build --release
-   target/release/hermes
+   target/release/kerux
    ```
 
 5. **Start coding:**

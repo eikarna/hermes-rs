@@ -1,4 +1,4 @@
-# Integration Plan: Aider + Hermes-RS
+# Integration Plan: Aider + Kerux
 
 **Status:** SHIPPED (Phases 1-5 complete as of 0.1.3 main; deltas vs. spec below)
 
@@ -13,7 +13,7 @@ Phase-by-phase reality check against the original scope:
 - **Phase 1 (provider routing):** shipped with native OpenAI, Anthropic, Ollama, OpenRouter, and Gemini adapters, plus per-model capability tables with longest-prefix matching (`lookup_capabilities`), `supports_vision` / `supports_tool_calls` fields, and `<edit_format>` prompt hints routed from advertised capabilities.
 - **Phase 2 (repo map):** shipped (tree-sitter C/Python/Rust/TypeScript, personalized PageRank, token-budgeted renderer). Discovery is capped at 500 files before ranking (`discover_source_files_with_limit`). Format follows Aider's outline style; incremental file-watcher ranking not ported.
 - **Phase 3 (edit blocks):** shipped (`edit_block` tool, atomic multi-edit, exact+fuzzy sharing `patch` matching, parsed via `parse_edit_blocks`; model-level routing via `EditFormat::SearchReplace`/`Patch`).
-- **Phase 4 (git harness):** shipped (`hermes_core::githarness` with snapshot/guard/commit/undo; TUI `/undo`). `commit_transaction` runs per tick in autonomous mode and post-run in the TUI when `[agent].auto_commit = true`.
+- **Phase 4 (git harness):** shipped (`kerux_core::githarness` with snapshot/guard/commit/undo; TUI `/undo`). `commit_transaction` runs per tick in autonomous mode and post-run in the TUI when `[agent].auto_commit = true`.
 - **Phase 5 (skill & memory lifecycle):** shipped as `[curator]` policy + non-blocking pass on startup/tick; option `[curator].interval_secs` enables periodic mid-session passes. Memory pinning (`pinned: true`) exempts from decay/prune/dedup and is a serialized MEMORY.md header field. Skill staleness keyed off SKILL.md mtime, not usage telemetry. Skill distillation creates tag-clustered `distilled-<tag>` drafts; `[curator].skill_distill_llm_summary = true` rewrites the body via the active LLM (falls back to bullet list on error). Drafts route to `_pending/` by default (`[curator].auto_approve_skills = false`) and require TUI approval (`a`) before loading. Session archiving is idle-time-only. Trajectory compression folds aging low-importance facts into one `session_summary` per pass (`[curator].compression_*`; deterministic, no LLM).
 
 **Shipped since original plan:** skill provenance metadata (`SkillOrigin::Agent/User`, `pinned`, `use_count`, `last_activity_at`) in SKILL.md front matter, with provenance-gated auto-archive in the curator.
@@ -24,19 +24,19 @@ Phase-by-phase reality check against the original scope:
 
 ## Executive Summary
 
-Integrate Aider's three core capabilities into Hermes-RS to bridge model-agnostic LLM access, intelligent repo indexing, and robust git-driven development workflows:
+Integrate Aider's three core capabilities into Kerux to bridge model-agnostic LLM access, intelligent repo indexing, and robust git-driven development workflows:
 
 1. **Repo Map** — AST-based file ranking + Personalized PageRank for token-efficient codebase context
 2. **Edit Format** — SEARCH/REPLACE blocks for lean code generation (vs. full-file rewrites)
 3. **Git Integration** — Auto-commit with Conventional Commit messages + `/undo` rollback command
 
-**Outcome:** Hermes-RS gains Aider's productivity patterns (model-agnostic backend, edit-efficient workflows) while retaining Hermes-Agent's self-learning loop (skills, memory, curator, cron).
+**Outcome:** Kerux gains Aider's productivity patterns (model-agnostic backend, edit-efficient workflows) while retaining Hermes-Agent's self-learning loop (skills, memory, curator, cron).
 
 ---
 
 ## Current State Analysis
 
-### Hermes-RS (Rust, v0.1.3)
+### Kerux (Rust, v0.1.3)
 
 **Strengths:**
 - Streaming-first ReAct loop with tolerant XML parsing
@@ -86,10 +86,10 @@ Integrate Aider's three core capabilities into Hermes-RS to bridge model-agnosti
 - Capability negotiation: max_tokens, edit_format, streaming support
 
 **Key Files:**
-- New: `crates/hermes-core/src/client/provider.rs` (trait + routing)
-- New: `crates/hermes-core/src/client/providers/*.rs` (per-provider impl)
-- Modified: `crates/hermes-core/src/config.rs` (provider config section)
-- Modified: `crates/hermes-core/src/agent.rs` (use trait, not hardcoded client)
+- New: `crates/kerux-core/src/client/provider.rs` (trait + routing)
+- New: `crates/kerux-core/src/client/providers/*.rs` (per-provider impl)
+- Modified: `crates/kerux-core/src/config.rs` (provider config section)
+- Modified: `crates/kerux-core/src/agent.rs` (use trait, not hardcoded client)
 
 **Design Pattern:**
 
@@ -149,12 +149,12 @@ api_key = "sk-or-..."
 model_mapping = {}
 ```
 
-**Backward Compat:** Default to OpenAI if provider not specified; existing hermes.toml files continue working.
+**Backward Compat:** Default to OpenAI if provider not specified; existing kerux.toml files continue working.
 
 **Verification:**
 - All existing tests pass with default (OpenAI) provider
 - New provider tests mock HTTP responses (no live API calls)
-- CLI invocation still works: `hermes run --query "test"` defaults to OpenAI
+- CLI invocation still works: `kerux run --query "test"` defaults to OpenAI
 
 ---
 
@@ -169,12 +169,12 @@ model_mapping = {}
 - Render concise file tree with line numbers and key signatures
 
 **Key Files:**
-- New: `crates/hermes-core/src/repomap/extractor.rs` (tree-sitter symbol extraction)
-- New: `crates/hermes-core/src/repomap/scorer.rs` (PageRank ranking)
-- New: `crates/hermes-core/src/repomap/budgeter.rs` (token-budget trimming)
-- New: `crates/hermes-core/src/repomap/mod.rs` (public API)
-- Modified: `crates/hermes-core/src/agent.rs` (inject `<repo_map>` into system prompt)
-- Modified: `crates/hermes-core/src/config.rs` (add `[repomap]` section)
+- New: `crates/kerux-core/src/repomap/extractor.rs` (tree-sitter symbol extraction)
+- New: `crates/kerux-core/src/repomap/scorer.rs` (PageRank ranking)
+- New: `crates/kerux-core/src/repomap/budgeter.rs` (token-budget trimming)
+- New: `crates/kerux-core/src/repomap/mod.rs` (public API)
+- Modified: `crates/kerux-core/src/agent.rs` (inject `<repo_map>` into system prompt)
+- Modified: `crates/kerux-core/src/config.rs` (add `[repomap]` section)
 
 **Algorithm Summary:**
 
@@ -211,10 +211,10 @@ model_mapping = {}
 - Fallback: legacy patch tool for models without SEARCH/REPLACE support
 
 **Key Files:**
-- New: `crates/hermes-core/src/tools/edit_parser.rs` (SEARCH/REPLACE block parser)
-- New: `crates/hermes-core/src/tools/edit_applier.rs` (fuzzy diff applier)
-- Modified: `crates/hermes-core/src/agent.rs` (system prompt format spec injection)
-- Modified: `crates/hermes-core/src/tools/builtin.rs` (register edit tool)
+- New: `crates/kerux-core/src/tools/edit_parser.rs` (SEARCH/REPLACE block parser)
+- New: `crates/kerux-core/src/tools/edit_applier.rs` (fuzzy diff applier)
+- Modified: `crates/kerux-core/src/agent.rs` (system prompt format spec injection)
+- Modified: `crates/kerux-core/src/tools/builtin.rs` (register edit tool)
 
 **Verbatim Block Spec:**
 
@@ -255,9 +255,9 @@ Every *SEARCH/REPLACE block* must use this format:
 - Integration into autonomous coding loop
 
 **Key Files:**
-- New: `crates/hermes-cli/src/git_harness.rs` (git transactions, Conventional Commit generation, undo)
-- Modified: `crates/hermes-cli/src/autonomous.rs` (delegate git operations to git harness)
-- Modified: `crates/hermes-cli/src/main.rs` (register `/undo` subcommand)
+- New: `crates/kerux-cli/src/git_harness.rs` (git transactions, Conventional Commit generation, undo)
+- Modified: `crates/kerux-cli/src/autonomous.rs` (delegate git operations to git harness)
+- Modified: `crates/kerux-cli/src/main.rs` (register `/undo` subcommand)
 
 **Workflow Sequence:**
 
@@ -299,14 +299,14 @@ Every *SEARCH/REPLACE block* must use this format:
 - Skill search & memory integration
 
 **Key Files:**
-- New: `crates/hermes-core/src/curator.rs` (curator review loop & skill archiving)
-- Modified: `crates/hermes-core/src/skills.rs` (extend skill metadata and lifecycle state)
-- Modified: `crates/hermes-core/src/distillation.rs` (add skill creation pass after run)
-- Modified: `crates/hermes-cli/src/main.rs` (add `hermes curator` subcommands)
+- New: `crates/kerux-core/src/curator.rs` (curator review loop & skill archiving)
+- Modified: `crates/kerux-core/src/skills.rs` (extend skill metadata and lifecycle state)
+- Modified: `crates/kerux-core/src/distillation.rs` (add skill creation pass after run)
+- Modified: `crates/kerux-cli/src/main.rs` (add `kerux curator` subcommands)
 
 **Curator Rules:**
 - Only touch skills with `created_by = "agent"` provenance
-- Never hard-delete; max destructive action is archive (`~/.hermes/skills/.archive/`)
+- Never hard-delete; max destructive action is archive (`~/.kerux/skills/.archive/`)
 - Pinned skills (`pinned = true`) are exempt from auto-archiving and review passes
 - Usage tracking: record `use_count`, `last_activity_at` per skill invocation
 

@@ -24,20 +24,20 @@ jobs:
           - name: Linux x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: hermes-linux-x86_64
-            bin: hermes
+            artifact: kerux-linux-x86_64
+            bin: kerux
             archive: tar.gz
           - name: macOS ARM64
             os: macos-latest
             target: aarch64-apple-darwin
-            artifact: hermes-macos-arm64
-            bin: hermes
+            artifact: kerux-macos-arm64
+            bin: kerux
             archive: tar.gz
           - name: Windows x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: hermes-windows-x86_64
-            bin: hermes.exe
+            artifact: kerux-windows-x86_64
+            bin: kerux.exe
             archive: zip
 
     steps:
@@ -87,22 +87,22 @@ jobs:
         include:
           - name: Linux x86_64 musl
             target: x86_64-unknown-linux-musl
-            artifact: hermes-linux-x86_64-musl
+            artifact: kerux-linux-x86_64-musl
           - name: Linux ARM64 musl
             target: aarch64-unknown-linux-musl
-            artifact: hermes-linux-arm64-musl
+            artifact: kerux-linux-arm64-musl
           - name: Linux ARM64
             target: aarch64-unknown-linux-gnu
-            artifact: hermes-linux-arm64
+            artifact: kerux-linux-arm64
           - name: Linux ARMv7
             target: armv7-unknown-linux-gnueabihf
-            artifact: hermes-linux-armv7
+            artifact: kerux-linux-armv7
           - name: Android ARM64
             target: aarch64-linux-android
-            artifact: hermes-android-arm64
+            artifact: kerux-android-arm64
           - name: FreeBSD x86_64
             target: x86_64-unknown-freebsd
-            artifact: hermes-freebsd-x86_64
+            artifact: kerux-freebsd-x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -125,9 +125,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/hermes" "dist/hermes"
-          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" hermes
-          rm "dist/hermes"
+          cp "target/${{ matrix.target }}/release/kerux" "dist/kerux"
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" kerux
+          rm "dist/kerux"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

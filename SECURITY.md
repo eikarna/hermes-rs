@@ -6,7 +6,7 @@
 | ------- | --------- |
 | 0.1.x   | Active development |
 
-Hermes-RS is in early development. Security fixes are applied to the latest commit on `main`.
+Kerux is in early development. Security fixes are applied to the latest commit on `main`.
 
 ## Reporting a Vulnerability
 
@@ -37,19 +37,19 @@ You should receive a response within **48 hours**. If you don't, please follow u
 
 ### Tool Execution
 
-Hermes-RS executes arbitrary shell commands via the `terminal` tool and arbitrary code via the `code_execution` tool. These tools:
+Kerux executes arbitrary shell commands via the `terminal` tool and arbitrary code via the `code_execution` tool. These tools:
 
-- Run with the same privileges as the Hermes-RS process
+- Run with the same privileges as the Kerux process
 - Do not sandbox or isolate execution
 - Accept input from LLM-generated content, which may be manipulated
 
-**Mitigation**: Run Hermes-RS in a sandboxed environment (container, VM) when processing untrusted input.
+**Mitigation**: Run Kerux in a sandboxed environment (container, VM) when processing untrusted input.
 
 ### API Keys
 
 - API keys are read from environment variables or config files
 - Never commit API keys to the repository
-- Config files (`hermes.toml`) should be excluded from version control via `.gitignore`
+- Config files (`kerux.toml`) should be excluded from version control via `.gitignore`
 
 ### Supply Chain
 

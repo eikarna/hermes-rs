@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Suggest a feature for Hermes-RS
+about: Suggest a feature for Kerux
 title: "[FEAT] "
 labels: enhancement
 assignees: ""

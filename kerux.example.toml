@@ -1,0 +1,159 @@
+# Kerux configuration example
+
+[client]
+provider = "openai" # openai | anthropic | ollama | openrouter | gemini | nous
+base_url = "https://api.openai.com/v1"
+# api_key = "set me or use OPENAI_API_KEY"
+# auth_ref = "openai-default" # optional profile from `kerux auth set-api-key openai`
+timeout_secs = 60
+max_context_length = 128000
+
+# Nous Portal (OAuth device-code login):
+#   kerux auth login nous           # opens a browser device-code flow, stores tokens
+#   [client]
+#   provider = "nous"
+#   auth_ref = "nous-default"        # the OAuth profile created above; no api_key needed
+# The stored access token is a short-lived invoke JWT; Kerux refreshes it
+# automatically from the persisted refresh token before each request.
+
+# Optional provider endpoint overrides:
+# [client.anthropic]
+# api_key = "or set ANTHROPIC_API_KEY"
+# [client.openrouter]
+# api_key = "or set OPENROUTER_API_KEY"
+# [client.ollama]
+# base_url = "http://localhost:11434/v1" # or OLLAMA_BASE_URL
+# [client.gemini]
+# api_key = "or set GEMINI_API_KEY"
+# base_url = "https://generativelanguage.googleapis.com/v1beta"
+
+[agent]
+model = "gpt-4"
+max_iterations = 20
+tool_timeout_secs = 30
+request_timeout_secs = 120
+stream = true
+context_window = 128000
+max_healing_attempts = 3
+show_reasoning = true
+# repo_map_tokens = 1024 # token budget for <repo_map> context; 0 disables it
+
+repo_map_max_files = 500    # max files discovered for repo map scoring; cap huge repos
+# edit_format_override = "search_replace" # force edit hint: search_replace | patch | full_file
+auto_commit = false          # true: auto-commit a successful run's changes (Conventional Commit)
+# system_prompt = "You are Kerux."
+
+[autonomous]
+interval_secs = 300
+todo_path = "TODO.md"
+status_path = "autonomous-status.toml"
+test_command = "cargo test --workspace"
+git_remote = "origin"
+git_branch = "agent-dev"
+commit_message = "Auto-commit by kerux"
+command_timeout_secs = 900
+max_failures_per_state = 3
+
+[logging]
+level = "info"
+format = "pretty"
+with_target = false
+with_thread_ids = false
+with_file = false
+with_line_number = false
+
+[tui]
+theme = "opencode"
+rich_output = true
+show_tool_calls = true
+show_iterations = true
+landing_title = "KERUX"
+prompt_placeholder = "Ask anything... \"Fix a TODO in the codebase\""
+refresh_rate_ms = 80
+compact_width = 96
+medium_width = 120
+
+[telemetry]
+enabled = true
+currency = "USD"
+# Set these to your provider/model prices to show estimated spend.
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+
+[mcp]
+autoload = true
+
+[[mcp.servers]]
+name = "filesystem-demo"
+transport = "http"
+url = "http://127.0.0.1:8080/mcp"
+# auth_token = "optional"
+enabled = false
+
+[[mcp.servers]]
+name = "stdio-demo"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+enabled = false
+[mcp.servers.env]
+# EXAMPLE_ROOT = "C:/workspace"
+
+[curator]
+# Background lifecycle curation for long-term memory, sessions, and skills.
+memory_decay_days = 14      # days idle before importance decays (0 disables)
+memory_min_importance = 10  # drop memories at or below this after decay
+session_archive_days = 30   # idle days before a session archives (0 disables)
+skill_stale_days = 90       # days since SKILL.md edit before auto-archive (0 disables)
+dedup_threshold_pct = 80    # word-overlap % treated as near-duplicate memory
+skill_distill_min_facts = 3 # facts sharing a tag that promote into a draft skill
+skill_distill_llm_summary = false # true = rewrite distilled skills as prose via the LLM
+interval_secs = 0           # seconds between periodic curator passes (0 = startup/tick only)
+auto_approve_skills = false  # false: distilled drafts wait in `_pending/` for TUI 'a' approve
+# Trajectory compression: fold old low-importance facts into one summary block.
+compression_min_age_days = 60   # idle days before a fact is a compression candidate (0 disables)
+compression_max_importance = 90 # facts at/above this importance are never compressed
+compression_min_count = 5       # need at least this many candidates to create a summary
+
+[skills]
+root_dir = "C:/Users/Administrator/.config/kerux/skills"
+autoload = true
+template_name = "new-skill"
+template_description = "Describe what this skill does."
+
+[gateway]
+telegram_enabled = false
+# telegram_token = ""
+telegram_api_base = "https://api.telegram.org"
+discord_enabled = false
+# discord_token = ""
+discord_api_base = "https://discord.com/api/v10"
+slack_enabled = false
+# slack_token = ""
+slack_api_base = "https://slack.com/api"
+webhooks_enabled = false
+# webhooks_addr = "127.0.0.1:8080"
+admins = []
+
+[tools]
+registry_timeout_secs = 30
+event_channel_size = 100
+
+[tools.web]
+search_url = "https://lite.duckduckgo.com/lite/?q={query}"
+search_timeout_secs = 15
+fetch_timeout_secs = 30
+user_agent = "Mozilla/5.0 (compatible; KeruxAgent/0.1)"
+default_results = 10
+max_results = 20
+
+[tools.http]
+timeout_secs = 30
+
+[tools.terminal]
+max_timeout_secs = 300
+max_output_bytes = 1000000
+
+[tools.code_execution]
+default_timeout_secs = 60
+max_timeout_secs = 300

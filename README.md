@@ -1,6 +1,6 @@
-![Hermes-RS](assets/banner.png)
+![Kerux](assets/banner.png)
 
-A high-performance Rust implementation of the Hermes-Agent orchestration loop for LLM-driven tool execution.
+A high-performance Rust implementation of the Kerux-Agent orchestration loop for LLM-driven tool execution.
 
 ## Features
 
@@ -9,7 +9,7 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 - **Early Tool Detection**: Initiate tool execution as soon as `</tool_call>` is detected
 - **Self-Healing**: Automatically re-prompt LLM with error context on failures
 - **Dynamic Schema Generation**: Automatically generate JSON Schema from Rust structs
-- **Shared TOML Configuration**: One runtime config model across `hermes-cli` and `hermes-core`
+- **Shared TOML Configuration**: One runtime config model across `kerux-cli` and `kerux-core`
 - **Ratatui TUI**: Prompt-first landing view, responsive workspace panes, constrained-terminal fallback, blockquote-style reasoning, block-style tool activity, MCP/Skills/Behavior management
 - **Autonomous Coding Mode**: 24/7 workspace-driven loop that reads `TODO.md`, validates with local tests, and only pushes after success
 - **Structured Logging**: Comprehensive observability via the `tracing` crate
@@ -22,7 +22,7 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Hermes-RS                           │
+│                      Kerux                           │
 │  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐  │
 │  │ OpenAI      │  │ XMLParser    │  │ ToolRegistry      │  │
 │  │ Client      │  │ (Tolerant)   │  │ & Execution       │  │
@@ -41,7 +41,7 @@ A high-performance Rust implementation of the Hermes-Agent orchestration loop fo
 cargo build --release
 
 # Or install the CLI crate directly
-cargo install --path crates/hermes-cli
+cargo install --path crates/kerux-cli
 ```
 
 Tagged releases publish per-platform binaries automatically in the repository's GitHub Releases tab.
@@ -53,55 +53,55 @@ Tagged releases publish per-platform binaries automatically in the repository's 
 export OPENAI_API_KEY=your_api_key_here   # PowerShell: $env:OPENAI_API_KEY="..."
 
 # Start the prompt-first TUI
-hermes chat
+kerux chat
 
 # Run a one-shot query
-hermes run --query "What is 2 + 2?"
+kerux run --query "What is 2 + 2?"
 
 # Start 24/7 autonomous workspace mode
-hermes autonomous
+kerux autonomous
 
 # List available tools
-hermes tools
+kerux tools
 
 # Test a specific tool
-hermes test echo --args '{"message": "Hello, World!"}'
+kerux test echo --args '{"message": "Hello, World!"}'
 
 # Create a local auth profile that references an environment variable
-hermes auth set-api-key openai --env OPENAI_API_KEY
+kerux auth set-api-key openai --env OPENAI_API_KEY
 
-# Show provider names, documented auth methods, and Hermes-supported env sources
-hermes auth providers
+# Show provider names, documented auth methods, and Kerux-supported env sources
+kerux auth providers
 
 # Reference an existing OAuth/ADC bearer token without storing it in config
-hermes auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
+kerux auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
 ```
 
 ## Screenshots
 
 Prompt-first landing screen:
 
-![Hermes landing screen](assets/main.png)
+![Kerux landing screen](assets/main.png)
 
 Workspace session with conversation, reasoning, and activity panes:
 
-![Hermes workspace chat screen](assets/chat.png)
+![Kerux workspace chat screen](assets/chat.png)
 
 ## Configuration
 
-Hermes reads configuration in this order:
+Kerux reads configuration in this order:
 
 1. `--config <path>`
-2. `./hermes.toml`
-3. `./.hermes.toml`
-4. OS config directory (for example `~/.config/hermes/config.toml` on Linux)
+2. `./kerux.toml`
+3. `./.kerux.toml`
+4. OS config directory (for example `~/.config/kerux/config.toml` on Linux)
 5. Environment variables
 6. CLI flags
 
 Start from the checked-in example file:
 
 ```bash
-cp hermes.example.toml hermes.toml
+cp kerux.example.toml kerux.toml
 ```
 
 Configuration is TOML, not YAML. Example:
@@ -135,11 +135,11 @@ status_path = "autonomous-status.toml"
 test_command = "cargo test --workspace"
 git_remote = "origin"
 git_branch = "agent-dev"
-commit_message = "Auto-commit by hermes-rs"
+commit_message = "Auto-commit by kerux"
 
 [tui]
 rich_output = true
-landing_title = "HERMES"
+landing_title = "KERUX"
 prompt_placeholder = "Ask anything... \"Fix a TODO in the codebase\""
 
 [telemetry]
@@ -153,42 +153,42 @@ output_cost_per_million = 0.0
 Or use environment variables:
 
 ```bash
-export HERMES_PROVIDER=openai # anthropic | ollama | openrouter | gemini
+export KERUX_PROVIDER=openai # anthropic | ollama | openrouter | gemini
 export OPENAI_API_KEY=your_api_key_here
 export OPENAI_BASE_URL=https://api.openai.com/v1
-export HERMES_MODEL=gpt-4
+export KERUX_MODEL=gpt-4
 ```
 
-See [hermes.example.toml](hermes.example.toml) for the full schema, including MCP, Skills, gateway, and tool/runtime defaults.
+See [kerux.example.toml](kerux.example.toml) for the full schema, including MCP, Skills, gateway, and tool/runtime defaults.
 
 ## Authentication profiles
 
-Hermes supports local auth metadata profiles without storing API keys in the project config. Create one with:
+Kerux supports local auth metadata profiles without storing API keys in the project config. Create one with:
 
 ```bash
-hermes auth providers
-hermes auth login OpenAI # prints current external setup guidance; does not store tokens yet
-hermes auth set-api-key OpenAI --env OPENAI_API_KEY
-hermes auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
-hermes auth list
+kerux auth providers
+kerux auth login OpenAI # prints current external setup guidance; does not store tokens yet
+kerux auth set-api-key OpenAI --env OPENAI_API_KEY
+kerux auth set-bearer-token Google --env GOOGLE_OAUTH_ACCESS_TOKEN --base-url https://generativelanguage.googleapis.com/v1beta
+kerux auth list
 ```
 
 Then point `[client].auth_ref` at the profile name, for example `openai-default`. The profile stores only metadata and an environment-variable reference such as `env:OPENAI_API_KEY`; the actual secret remains in your environment or external secret manager.
 
-`set-bearer-token` is intended for provider-documented OAuth/ADC access tokens that are already obtained outside Hermes and requires `--base-url` so the token is bound to the intended provider endpoint. Hermes does not refresh those tokens yet; rotate or refresh the referenced environment value with the provider's official tooling.
+`set-bearer-token` is intended for provider-documented OAuth/ADC access tokens that are already obtained outside Kerux and requires `--base-url` so the token is bound to the intended provider endpoint. Kerux does not refresh those tokens yet; rotate or refresh the referenced environment value with the provider's official tooling.
 
-Current provider names are `Google`, `GitHub Copilot`, `OpenAI`, and `Anthropic`. `hermes auth providers` prints aliases, API-key environment variables, bearer-token defaults, documented auth methods, Hermes-supported environment sources, and implementation notes. `hermes auth login <provider>` prints provider-specific setup guidance and exits without creating credentials until Hermes has secure token storage and provider-specific login flows.
+Current provider names are `Google`, `GitHub Copilot`, `OpenAI`, and `Anthropic`. `kerux auth providers` prints aliases, API-key environment variables, bearer-token defaults, documented auth methods, Kerux-supported environment sources, and implementation notes. `kerux auth login <provider>` prints provider-specific setup guidance and exits without creating credentials until Kerux has secure token storage and provider-specific login flows.
 
 ### Nous Portal (OAuth device-code login)
 
-Hermes-RS supports the Nous Portal device-code OAuth flow natively — no API key required:
+Kerux supports the Nous Portal device-code OAuth flow natively — no API key required:
 
 ```bash
-hermes auth login nous
+kerux auth login nous
 # opens https://portal.nousresearch.com in your browser; approve the device code
 ```
 
-This stores an OAuth profile (`nous-default`) in the auth store. The access token is a short-lived invoke JWT; Hermes refreshes it automatically from the persisted refresh token before each inference request. Then point the client at it:
+This stores an OAuth profile (`nous-default`) in the auth store. The access token is a short-lived invoke JWT; Kerux refreshes it automatically from the persisted refresh token before each inference request. Then point the client at it:
 
 ```toml
 [client]
@@ -199,45 +199,45 @@ auth_ref = "nous-default"
 Or with CLI flags:
 
 ```bash
-hermes chat --auth-ref nous-default   # provider defaults to "nous" when auth_ref is an OAuth profile
+kerux chat --auth-ref nous-default   # provider defaults to "nous" when auth_ref is an OAuth profile
 ```
 
 To remove the stored credentials:
 
 ```bash
-hermes auth logout nous
+kerux auth logout nous
 ```
 
 Provider reality check:
 
-- **OpenAI**: Hermes supports API-key profiles today. OpenAI also documents ChatGPT/Codex browser login, device/headless login, and access-token/cache workflows for Codex, but Hermes has not wired those OAuth credentials into runtime requests yet.
-- **Google**: Gemini supports API keys and OAuth/ADC. Direct desktop OAuth requires a Google OAuth client ID; using `gcloud auth application-default login` keeps token management outside Hermes.
-- **GitHub Copilot**: Copilot CLI supports OAuth device flow, supported GitHub tokens via `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, OS keychain storage, and GitHub CLI fallback. Hermes can reference external tokens today; it does not run Copilot login itself yet.
-- **Anthropic**: Hermes supports the native Messages API with `x-api-key` headers, tool calls, and SSE streaming through `[client].provider = "anthropic"` and `ANTHROPIC_API_KEY`. Claude-account OAuth and cloud-provider routes such as Vertex/Bedrock are not wired yet.
+- **OpenAI**: Kerux supports API-key profiles today. OpenAI also documents ChatGPT/Codex browser login, device/headless login, and access-token/cache workflows for Codex, but Kerux has not wired those OAuth credentials into runtime requests yet.
+- **Google**: Gemini supports API keys and OAuth/ADC. Direct desktop OAuth requires a Google OAuth client ID; using `gcloud auth application-default login` keeps token management outside Kerux.
+- **GitHub Copilot**: Copilot CLI supports OAuth device flow, supported GitHub tokens via `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, OS keychain storage, and GitHub CLI fallback. Kerux can reference external tokens today; it does not run Copilot login itself yet.
+- **Anthropic**: Kerux supports the native Messages API with `x-api-key` headers, tool calls, and SSE streaming through `[client].provider = "anthropic"` and `ANTHROPIC_API_KEY`. Claude-account OAuth and cloud-provider routes such as Vertex/Bedrock are not wired yet.
 
-Hermes routes runtime requests by `[client].provider`. OpenAI, Ollama, and OpenRouter use OpenAI-compatible chat-completions endpoints; Anthropic uses the native Messages API. API keys continue to flow through `auth_ref` profiles when configured. When `auth_ref` is active, credentials are bound to the endpoint stored in the auth profile to prevent repo-local config from redirecting secrets.
+Kerux routes runtime requests by `[client].provider`. OpenAI, Ollama, and OpenRouter use OpenAI-compatible chat-completions endpoints; Anthropic uses the native Messages API. API keys continue to flow through `auth_ref` profiles when configured. When `auth_ref` is active, credentials are bound to the endpoint stored in the auth profile to prevent repo-local config from redirecting secrets.
 
-When `auth_ref` is active, Hermes binds the credential to the profile endpoint, including provider-specific endpoints. Use `hermes auth set-api-key <provider> --base-url <url>` for non-default endpoints instead of setting a repo-local `[client].base_url` that could redirect credentials.
+When `auth_ref` is active, Kerux binds the credential to the profile endpoint, including provider-specific endpoints. Use `kerux auth set-api-key <provider> --base-url <url>` for non-default endpoints instead of setting a repo-local `[client].base_url` that could redirect credentials.
 
 OAuth browser/device login is intentionally not enabled until provider-specific secure token storage and documented OAuth flows are implemented. See [OAUTH_DESIGN.md](OAUTH_DESIGN.md) for the phased plan.
 
 ## Workspace Context
 
-- Hermes automatically loads the nearest workspace guidance file from `AGENTS.md`, `CLAUDE.md`, `.hermes.md`, `HERMES.md`, or `.cursorrules` and injects it into the system prompt as `<workspace_context>`
-- Global `.md` / `.txt` context files under the user Hermes context directory are also included when present
+- Kerux automatically loads the nearest workspace guidance file from `AGENTS.md`, `CLAUDE.md`, `.kerux.md`, `KERUX.md`, or `.cursorrules` and injects it into the system prompt as `<workspace_context>`
+- Global `.md` / `.txt` context files under the user Kerux context directory are also included when present
 - Oversized context files are truncated and obvious prompt-injection patterns are blocked before injection
 
 ## Autonomous Mode
 
-- `hermes autonomous` runs a continuous loop against the current workspace
-- `hermes run --autonomous` is kept as a compatibility alias for the same mode
+- `kerux autonomous` runs a continuous loop against the current workspace
+- `kerux run --autonomous` is kept as a compatibility alias for the same mode
 - Autonomous mode reads repo-root `TODO.md` on every tick and skips work when `## Pending` is empty
-- The loop uses the existing Hermes agent and tools to inspect the repo, implement the next pending task, and update `TODO.md`
-- Hermes writes a repo-local `autonomous-status.toml` report on each tick with the current state, failure summary, validation result, and last push target
-- After each iteration Hermes runs the configured validation command, which defaults to `cargo test --workspace`
+- The loop uses the existing Kerux agent and tools to inspect the repo, implement the next pending task, and update `TODO.md`
+- Kerux writes a repo-local `autonomous-status.toml` report on each tick with the current state, failure summary, validation result, and last push target
+- After each iteration Kerux runs the configured validation command, which defaults to `cargo test --workspace`
 - Git operations are strict:
   - tests must pass before any push is attempted
-  - successful runs stage workspace changes while excluding the status report, then execute `git commit -m "Auto-commit by hermes-rs"` and `git push origin agent-dev`
+  - successful runs stage workspace changes while excluding the status report, then execute `git commit -m "Auto-commit by kerux"` and `git push origin agent-dev`
   - repeated failures on the same workspace state pause the loop until `TODO.md` or git state changes, and that pause survives process restarts through `autonomous-status.toml`
 
 `TODO.md` is the autonomous source of truth and should keep this structure:
@@ -252,7 +252,7 @@ OAuth browser/device login is intentionally not enabled until provider-specific 
 
 ## TUI Overview
 
-- `hermes chat` starts on a prompt-first landing screen
+- `kerux chat` starts on a prompt-first landing screen
 - `i` enters prompt editing, and typing on landing also bootstraps prompt entry immediately
 - `Enter` runs the current prompt
 - Prefix a prompt with `!` or `$ ` to prepare a shell command in the workspace, then press `Enter` again to confirm and run it
@@ -273,11 +273,11 @@ OAuth browser/device login is intentionally not enabled until provider-specific 
 Use a throwaway repository first to validate your autonomous setup end to end:
 
 ```bash
-mkdir hermes-autonomous-sample
-cd hermes-autonomous-sample
+mkdir kerux-autonomous-sample
+cd kerux-autonomous-sample
 git init
 git checkout -b agent-dev
-cp ../hermes-rs/hermes.example.toml ./hermes.toml
+cp ../kerux/kerux.example.toml ./kerux.toml
 ```
 
 Create a minimal `TODO.md`:
@@ -290,7 +290,7 @@ Create a minimal `TODO.md`:
 - add one safe autonomous task
 ```
 
-Then tune `[autonomous]` in `hermes.toml` for the sample repo:
+Then tune `[autonomous]` in `kerux.toml` for the sample repo:
 
 ```toml
 [autonomous]
@@ -301,10 +301,10 @@ git_remote = "origin"
 git_branch = "agent-dev"
 ```
 
-Run Hermes:
+Run Kerux:
 
 ```bash
-hermes autonomous
+kerux autonomous
 ```
 
 While it runs, inspect:
@@ -313,15 +313,15 @@ While it runs, inspect:
 - `autonomous-status.toml` to see `state`, timing fields, failure or pause metadata, the last validation summary, and the last push target
 - `git log --oneline` to confirm only validated work is committed
 
-If the loop pauses after repeated failures, edit `TODO.md` or otherwise change the workspace state, then start or continue `hermes autonomous` again. Hermes reloads the persisted pause state from `autonomous-status.toml` and resumes only after the workspace fingerprint changes.
+If the loop pauses after repeated failures, edit `TODO.md` or otherwise change the workspace state, then start or continue `kerux autonomous` again. Kerux reloads the persisted pause state from `autonomous-status.toml` and resumes only after the workspace fingerprint changes.
 
 ## Library Usage
 
 ```rust
-use hermes_core::{
-    agent::{HermesAgent, AgentConfig},
+use kerux_core::{
+    agent::{KeruxAgent, AgentConfig},
     client::{OpenAIClient, ClientConfig},
-    tools::{HermesTool, ToolRegistry, ToolContext},
+    tools::{KeruxTool, ToolRegistry, ToolContext},
     schema::ToolSchema,
 };
 use async_trait::async_trait;
@@ -331,7 +331,7 @@ use serde_json::Value;
 struct MyTool;
 
 #[async_trait]
-impl HermesTool for MyTool {
+impl KeruxTool for MyTool {
     fn name(&self) -> &str { "my_tool" }
     fn description(&self) -> &str { "My custom tool" }
     fn schema(&self) -> ToolSchema { /* ... */ }
@@ -346,7 +346,7 @@ let client = OpenAIClient::new(ClientConfig::default());
 let registry = ToolRegistry::new(std::time::Duration::from_secs(30));
 registry.register(MyTool).await.unwrap();
 
-let agent = HermesAgent::new(
+let agent = KeruxAgent::new(
     AgentConfig::default(),
     client,
     registry,
@@ -360,7 +360,7 @@ println!("{}", response.content);
 ## CLI Options
 
 ```
-hermes [OPTIONS] <COMMAND>
+kerux [OPTIONS] <COMMAND>
 
 Commands:
   autonomous  Run the autonomous coding loop
@@ -387,7 +387,7 @@ Options:
 
 ## Tool Definition
 
-Tools are defined via the `HermesTool` trait. The framework automatically generates JSON Schema from your Rust structs:
+Tools are defined via the `KeruxTool` trait. The framework automatically generates JSON Schema from your Rust structs:
 
 ```rust
 use schemars::JsonSchema;
@@ -403,7 +403,7 @@ struct WeatherArgs {
 struct WeatherTool;
 
 #[async_trait]
-impl HermesTool for WeatherTool {
+impl KeruxTool for WeatherTool {
     fn name(&self) -> &str { "get_weather" }
     fn description(&self) -> &str { "Get weather information for a city" }
     fn schema(&self) -> ToolSchema {
@@ -416,14 +416,14 @@ impl HermesTool for WeatherTool {
 }
 ```
 
-Hermes can also register `delegate_to_sub_agent`, an opt-in built-in tool that lets the parent ReAct agent delegate focused deep-analysis tasks to an isolated child `HermesAgent` with a fresh conversation.
+Kerux can also register `delegate_to_sub_agent`, an opt-in built-in tool that lets the parent ReAct agent delegate focused deep-analysis tasks to an isolated child `KeruxAgent` with a fresh conversation.
 
 ## Error Handling
 
 The library provides structured error types with self-healing capabilities:
 
 ```rust
-use hermes_core::error::Error;
+use kerux_core::error::Error;
 
 match result {
     Ok(response) => { /* handle success */ }
@@ -449,7 +449,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for coding conventions, testing requireme
 
 Documentation and release hygiene for maintainers:
 
-- keep `hermes.example.toml` in sync with runtime config changes
+- keep `kerux.example.toml` in sync with runtime config changes
 - add every user-facing change to `CHANGELOG.md` before cutting a tag
 - update README screenshots or keybinding docs when TUI behavior changes
 - update `AGENTS.md` / `CLAUDE.md` when the project context changes enough that an agent would otherwise rediscover it from scratch

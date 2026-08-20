@@ -1,0 +1,45 @@
+[package]
+name = "kerux-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI for Kerux: A high-performance ReAct agent framework"
+readme = "README.md"
+
+[[bin]]
+name = "kerux"
+path = "src/main.rs"
+
+[dependencies]
+# Core library
+kerux-core = { path = "../kerux-core" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+
+# CLI
+clap = { workspace = true, features = ["derive"] }
+config = { workspace = true }
+
+# Serialization
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Terminal UI
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+
+# Utilities
+anyhow = { workspace = true }
+dirs = "5.0"
+console = "0.15"

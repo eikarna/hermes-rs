@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug in Hermes-RS
+about: Report a bug in Kerux
 title: "[BUG] "
 labels: bug
 assignees: ""
@@ -12,7 +12,7 @@ A clear description of what the bug is.
 
 ## Environment
 
-- **Hermes-RS version**: <!-- e.g., 0.1.0 or git commit hash -->
+- **Kerux version**: <!-- e.g., 0.1.0 or git commit hash -->
 - **Rust version**: <!-- output of `rustc --version` -->
 - **OS**: <!-- e.g., Ubuntu 24.04, macOS 15, Windows 11, Android -->
 - **Architecture**: <!-- e.g., x86_64, aarch64 -->

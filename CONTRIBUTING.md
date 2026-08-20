@@ -1,6 +1,6 @@
-# Contributing to Hermes-RS
+# Contributing to Kerux
 
-Thank you for your interest in contributing to Hermes-RS! This document outlines the process and conventions for contributing.
+Thank you for your interest in contributing to Kerux! This document outlines the process and conventions for contributing.
 
 ## Table of Contents
 
@@ -22,8 +22,8 @@ Thank you for your interest in contributing to Hermes-RS! This document outlines
 ### Fork and Clone
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/hermes-rs.git
-cd hermes-rs
+git clone https://github.com/YOUR_USERNAME/kerux.git
+cd kerux
 ```
 
 ## Development Setup
@@ -48,9 +48,9 @@ cargo build --workspace --release
 ### Project Structure
 
 ```
-hermes-rs/
+kerux/
 ├── crates/
-│   ├── hermes-core/       # Core library (agent loop, tools, client, parser)
+│   ├── kerux-core/       # Core library (agent loop, tools, client, parser)
 │   │   └── src/
 │   │       ├── agent.rs       # ReAct orchestration loop
 │   │       ├── client.rs      # OpenAI API client + SSE streaming
@@ -66,7 +66,7 @@ hermes-rs/
 │   │       ├── tools.rs       # Tool registry + trait
 │   │       ├── tools/         # Built-in tool implementations
 │   │       └── trajectory.rs  # RL trajectory export
-│   └── hermes-cli/        # CLI binary
+│   └── kerux-cli/        # CLI binary
 │       └── src/
 │           └── main.rs        # CLI entry point + subcommands
 ├── Cargo.toml             # Workspace root
@@ -86,7 +86,7 @@ hermes-rs/
 
 | Item | Convention | Example |
 |------|-----------|---------|
-| Crates | `kebab-case` | `hermes-core`, `hermes-cli` |
+| Crates | `kebab-case` | `kerux-core`, `kerux-cli` |
 | Types/Structs/Enums | `PascalCase` | `AgentConfig`, `ToolRegistry` |
 | Functions/Methods | `snake_case` | `register_builtin_tools` |
 | Constants | `SCREAMING_SNAKE` | `MAX_RETRY_ATTEMPTS` |
@@ -95,11 +95,11 @@ hermes-rs/
 
 ### Architecture Patterns
 
-**Tool Implementation**: All tools implement the `HermesTool` trait:
+**Tool Implementation**: All tools implement the `KeruxTool` trait:
 
 ```rust
 #[async_trait]
-impl HermesTool for MyTool {
+impl KeruxTool for MyTool {
     fn name(&self) -> &str { "my_tool" }
     fn description(&self) -> &str { "Description for LLM" }
     fn schema(&self) -> ToolSchema {
@@ -175,7 +175,7 @@ mod tests {
 cargo test --workspace
 
 # Specific test
-cargo test -p hermes-core test_parser
+cargo test -p kerux-core test_parser
 
 # With output
 cargo test --workspace -- --nocapture
@@ -248,7 +248,7 @@ ci(build): add cross-compilation for ARM64 and musl targets
 
 Use the **Bug Report** template. Include:
 
-1. **Hermes-RS version**: `hermes --version` or git commit hash
+1. **Kerux version**: `kerux --version` or git commit hash
 2. **Rust version**: `rustc --version`
 3. **OS and architecture**: e.g., `aarch64-linux-android`, `x86_64 Windows`
 4. **Steps to reproduce**: Minimal reproducer

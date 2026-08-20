@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/hermes-core",
-    "crates/hermes-cli",
+    "crates/kerux-core",
+    "crates/kerux-cli",
 ]
 
 [workspace.package]

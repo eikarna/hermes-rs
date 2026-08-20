@@ -8,17 +8,17 @@ This is a design checkpoint, not a runtime behavior change.
 
 ## Provider reality check
 
-- **OpenAI**: public OpenAI-compatible API access continues to support API keys. OpenAI also documents ChatGPT/Codex auth for Codex clients, including browser login, device/headless login, access-token injection, and auth-cache reuse. Hermes should model this as a separate OpenAI/Codex account-auth capability, not silently treat Codex tokens as generic OpenAI API keys.
-- **Google**: Gemini supports API keys and OAuth/Application Default Credentials. Direct desktop OAuth requires a Google OAuth client ID; ADC via `gcloud auth application-default login` keeps token creation, refresh, and storage outside Hermes.
-- **GitHub Copilot**: official Copilot CLI authentication supports OAuth device flow, supported GitHub token types (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`), OS keychain storage, and GitHub CLI fallback. Hermes should reference external tokens first and only run Copilot login after provider-specific client behavior is defined.
-- **Anthropic**: Claude access is not one single OAuth path. Documented routes include Claude.ai / Claude Code account login, Anthropic Console API keys, Team/Enterprise accounts, and cloud-provider routes such as Google Vertex AI, Amazon Bedrock, and Microsoft Foundry. Hermes should keep these as separate capabilities because Vertex/Bedrock/Foundry require provider-specific request/auth behavior, not just a bearer token swap.
-- **OpenCode comparison**: OpenCode stores provider credentials outside project config and exposes `/connect` flows. Hermes should copy the credential separation pattern, not vendor-private auth internals.
+- **OpenAI**: public OpenAI-compatible API access continues to support API keys. OpenAI also documents ChatGPT/Codex auth for Codex clients, including browser login, device/headless login, access-token injection, and auth-cache reuse. Kerux should model this as a separate OpenAI/Codex account-auth capability, not silently treat Codex tokens as generic OpenAI API keys.
+- **Google**: Gemini supports API keys and OAuth/Application Default Credentials. Direct desktop OAuth requires a Google OAuth client ID; ADC via `gcloud auth application-default login` keeps token creation, refresh, and storage outside Kerux.
+- **GitHub Copilot**: official Copilot CLI authentication supports OAuth device flow, supported GitHub token types (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`), OS keychain storage, and GitHub CLI fallback. Kerux should reference external tokens first and only run Copilot login after provider-specific client behavior is defined.
+- **Anthropic**: Claude access is not one single OAuth path. Documented routes include Claude.ai / Claude Code account login, Anthropic Console API keys, Team/Enterprise accounts, and cloud-provider routes such as Google Vertex AI, Amazon Bedrock, and Microsoft Foundry. Kerux should keep these as separate capabilities because Vertex/Bedrock/Foundry require provider-specific request/auth behavior, not just a bearer token swap.
+- **OpenCode comparison**: OpenCode stores provider credentials outside project config and exposes `/connect` flows. Kerux should copy the credential separation pattern, not vendor-private auth internals.
 
 ## Recommended architecture
 
 ### 1. Keep project config non-secret
 
-`hermes.toml` should continue to describe provider selection, base URLs, and model defaults. It should not become the default storage location for OAuth access tokens or refresh tokens.
+`kerux.toml` should continue to describe provider selection, base URLs, and model defaults. It should not become the default storage location for OAuth access tokens or refresh tokens.
 
 Recommended future config shape:
 
@@ -35,9 +35,9 @@ auth_ref = "openai-default"
 
 Recommended metadata path:
 
-- Windows: `%APPDATA%/hermes/auth.json`
-- macOS: `~/Library/Application Support/hermes/auth.json`
-- Linux: `~/.local/share/hermes/auth.json` or config-dir equivalent from existing platform helpers
+- Windows: `%APPDATA%/kerux/auth.json`
+- macOS: `~/Library/Application Support/kerux/auth.json`
+- Linux: `~/.local/share/kerux/auth.json` or config-dir equivalent from existing platform helpers
 
 Rules:
 
@@ -46,7 +46,7 @@ Rules:
 - Bind credentials to the endpoint stored in the auth profile, and reject repo-local base URL overrides when an `auth_ref` is active.
 - Require explicit base URLs for non-OpenAI profiles until provider-specific clients own their official endpoints.
 - Prefer OS credential storage for long-lived secrets and refresh tokens.
-- Recommended implementation: use platform credential storage (Windows Credential Manager, macOS Keychain, Linux Secret Service/libsecret) behind a small Hermes abstraction before persisting OAuth refresh tokens. Until that exists, keep tokens in environment variables or provider-managed stores such as Google ADC / GitHub CLI or Copilot CLI keychain.
+- Recommended implementation: use platform credential storage (Windows Credential Manager, macOS Keychain, Linux Secret Service/libsecret) behind a small Kerux abstraction before persisting OAuth refresh tokens. Until that exists, keep tokens in environment variables or provider-managed stores such as Google ADC / GitHub CLI or Copilot CLI keychain.
 - If OS credential storage is not implemented yet, keep long-lived secrets in environment variables or explicit config only; do not silently migrate them into plaintext JSON.
 - If a plaintext fallback is ever added, it must be opt-in, clearly warned, and protected by best-effort owner-only file permissions.
 - Store non-secret provider id, auth type, created/updated timestamps, expiry, and refresh metadata in `auth.json`.
@@ -90,18 +90,18 @@ Initial implementations should be minimal:
 1. `ApiKeyAuthProvider` for the current OpenAI-compatible behavior.
 2. `BearerTokenAuthProvider` for official OAuth/ADC access tokens where the provider accepts bearer tokens.
 
-Provider-specific request formats should stay separate from auth. Hermes currently has an OpenAI-compatible client; OAuth should not imply that every provider can use `/v1/chat/completions`.
+Provider-specific request formats should stay separate from auth. Kerux currently has an OpenAI-compatible client; OAuth should not imply that every provider can use `/v1/chat/completions`.
 
 ### 4. CLI/TUI flows
 
 Future commands:
 
-- `hermes auth login <provider>`
-- `hermes auth set-api-key <provider>`
-- `hermes auth set-bearer-token <provider> --env <ENV_VAR> --base-url <URL>`
-- `hermes auth providers`
-- `hermes auth list`
-- `hermes auth logout <auth-ref>`
+- `kerux auth login <provider>`
+- `kerux auth set-api-key <provider>`
+- `kerux auth set-bearer-token <provider> --env <ENV_VAR> --base-url <URL>`
+- `kerux auth providers`
+- `kerux auth list`
+- `kerux auth logout <auth-ref>`
 - TUI command/modal equivalent after CLI flow is stable
 
 Login flow order:
@@ -137,9 +137,9 @@ Security requirements:
 ### Phase 1: auth profiles, no OAuth
 
 - Add local auth metadata store module.
-- Add `hermes auth set-api-key <provider>` to create a profile that references an environment variable or explicitly configured key source; do not silently persist the secret itself.
+- Add `kerux auth set-api-key <provider>` to create a profile that references an environment variable or explicitly configured key source; do not silently persist the secret itself.
 - Move current API-key resolution behind auth profile lookup while preserving env/config behavior and precedence.
-- Add `hermes auth list` and `hermes auth logout`.
+- Add `kerux auth list` and `kerux auth logout`.
 - Tests: redacted list output, env precedence, missing-secret error, permission best-effort for metadata file.
 
 ### Phase 2: Google OAuth / ADC-compatible bearer auth
@@ -151,15 +151,15 @@ Security requirements:
 
 Implemented Phase 2a:
 
-- `hermes auth set-bearer-token <provider> --env <ENV_VAR> --base-url <URL>` stores metadata for externally managed OAuth/ADC bearer tokens.
-- Hermes still does not run browser OAuth or refresh tokens itself.
+- `kerux auth set-bearer-token <provider> --env <ENV_VAR> --base-url <URL>` stores metadata for externally managed OAuth/ADC bearer tokens.
+- Kerux still does not run browser OAuth or refresh tokens itself.
 - Bearer credentials use the same endpoint binding protections as API-key profiles.
 
 Implemented Phase 2b:
 
-- `hermes auth providers` reports provider aliases, documented auth methods, Hermes-supported environment sources, and implementation notes for Google, GitHub Copilot, OpenAI, and Anthropic.
+- `kerux auth providers` reports provider aliases, documented auth methods, Kerux-supported environment sources, and implementation notes for Google, GitHub Copilot, OpenAI, and Anthropic.
 - OpenAI Codex/ChatGPT auth and Anthropic Claude account/cloud-provider auth are documented as distinct capabilities instead of being collapsed into generic API-key or bearer-token auth.
-- `hermes auth login <provider>` prints provider-specific external setup guidance and intentionally fails without creating credentials until secure token storage and provider-specific runtime clients are available.
+- `kerux auth login <provider>` prints provider-specific external setup guidance and intentionally fails without creating credentials until secure token storage and provider-specific runtime clients are available.
 
 ### Phase 3: browser PKCE flow
 
@@ -174,7 +174,7 @@ Implemented Phase 3a:
 - Callback parsing accepts only authorization codes with matching `state` and rejects access tokens in query strings or fragments.
 - Added a loopback callback receiver that binds only to `127.0.0.1` on a random local port and accepts one GET callback.
 - Added provider-neutral authorization-code token exchange helper for PKCE flows. Token endpoints must use HTTPS; tests use loopback HTTP only through private test plumbing.
-- Hermes still does not launch browsers or refresh/store OAuth tokens itself.
+- Kerux still does not launch browsers or refresh/store OAuth tokens itself.
 
 ### Phase 4: provider-specific clients
 
@@ -185,5 +185,5 @@ Implemented Phase 3a:
 
 - Reverse-engineered ChatGPT/Codex login beyond documented OpenAI flows.
 - Reusing Claude Code private credential formats without documented support.
-- Storing tokens in repo-local `hermes.toml`.
+- Storing tokens in repo-local `kerux.toml`.
 - Supporting every provider in one change.
