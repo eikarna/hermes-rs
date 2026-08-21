@@ -3440,8 +3440,7 @@ mod tests {
         let memory = crate::memory::MemoryManager::new();
         memory
             .store(
-                crate::memory::MemoryBlock::new("mem-1", "fact", "important fact")
-                    .importance(80),
+                crate::memory::MemoryBlock::new("mem-1", "fact", "important fact").importance(80),
             )
             .await;
 
@@ -3453,10 +3452,7 @@ mod tests {
         .with_memory_manager(memory);
         agent.set_run_recorder(Some(Arc::clone(&recorder)));
 
-        let messages = vec![
-            Message::system("You are helpful."),
-            Message::user("Hello"),
-        ];
+        let messages = vec![Message::system("You are helpful."), Message::user("Hello")];
         let tools = vec![crate::schema::ToolSchema {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
