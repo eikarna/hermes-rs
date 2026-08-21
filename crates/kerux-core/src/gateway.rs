@@ -382,6 +382,7 @@ impl crate::approval::ToolApprovalGate for SinkApprovalGate {
                 // the prompt couldn't be delivered.
                 return crate::approval::ApprovalDecision::Denied {
                     reason: format!("Approval prompt could not be delivered: {e}"),
+                    outcome: crate::approval::ApprovalOutcome::PromptFailed,
                 };
             }
         };
@@ -390,14 +391,17 @@ impl crate::approval::ToolApprovalGate for SinkApprovalGate {
             Ok(Ok(true)) => crate::approval::ApprovalDecision::Approved,
             Ok(Ok(false)) => crate::approval::ApprovalDecision::Denied {
                 reason: "Tool execution denied by the user.".to_string(),
+                outcome: crate::approval::ApprovalOutcome::Denied,
             },
             Ok(Err(_)) => crate::approval::ApprovalDecision::Denied {
                 reason: "Approval channel closed unexpectedly.".to_string(),
+                outcome: crate::approval::ApprovalOutcome::ChannelClosed,
             },
             Err(_) => {
                 drop_pending_approval(id);
                 crate::approval::ApprovalDecision::Denied {
                     reason: "Approval timed out; tool execution denied.".to_string(),
+                    outcome: crate::approval::ApprovalOutcome::Timeout,
                 }
             }
         }

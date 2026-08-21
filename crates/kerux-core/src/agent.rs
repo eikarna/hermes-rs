@@ -480,6 +480,63 @@ impl KeruxAgent {
         Ok(())
     }
 
+    /// Record an `approval_decision` event so every approval request and its
+    /// outcome is auditable and correlated with the tool call it gates.
+    ///
+    /// Approval is a human decision channel — it is never labelled as
+    /// sandbox enforcement. The denial reason is redacted by the journal's
+    /// central redaction pass before it is persisted.
+    fn record_approval_decision(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        decision: &crate::approval::ApprovalDecision,
+    ) -> Result<()> {
+        let recorder = self
+            .run_recorder
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(recorder) = recorder else {
+            return Ok(());
+        };
+
+        let (approved, outcome, reason) = match decision {
+            crate::approval::ApprovalDecision::Approved => (true, "approved", None),
+            crate::approval::ApprovalDecision::Denied { reason, outcome } => (
+                false,
+                match outcome {
+                    crate::approval::ApprovalOutcome::Approved => "approved",
+                    crate::approval::ApprovalOutcome::Denied => "denied",
+                    crate::approval::ApprovalOutcome::Timeout => "timeout",
+                    crate::approval::ApprovalOutcome::ChannelClosed => "channel_closed",
+                    crate::approval::ApprovalOutcome::PromptFailed => "prompt_failed",
+                },
+                Some(reason.as_str()),
+            ),
+        };
+
+        let payload = serde_json::json!({
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "approved": approved,
+            "outcome": outcome,
+            "reason": reason,
+        });
+
+        if let Err(error) = recorder.record(unix_timestamp_ms(), "approval_decision", payload) {
+            match recorder.failure_mode() {
+                crate::run_journal::RecorderFailureMode::Warn => {
+                    warn!(error = %error, "Run recorder failed; continuing in warn mode");
+                }
+                crate::run_journal::RecorderFailureMode::Fail => {
+                    return Err(Error::Agent(format!("run recorder failed: {error}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn finish_recording(
         &self,
         status: crate::run_journal::RunStatus,
@@ -1384,7 +1441,8 @@ impl KeruxAgent {
                             arguments_preview: preview,
                         })
                         .await;
-                    if let crate::approval::ApprovalDecision::Denied { reason } = decision {
+                    self.record_approval_decision(&tool_call.id, &name, &decision)?;
+                    if let crate::approval::ApprovalDecision::Denied { reason, .. } = decision {
                         info!(tool = %name, reason = %reason, "Tool execution denied by approval gate");
                         results.push(ToolResult::error(&tool_call.id, reason));
                         continue;
@@ -3515,5 +3573,258 @@ mod tests {
 
         // Skills array present (empty until wired)
         assert!(payload["skills"].is_array());
+    }
+
+    // ── Task 1.5: approval decision recording ──────────────────────────
+
+    /// A tool registered under a dangerous name so the approval gate fires.
+    struct DangerousTool;
+
+    #[async_trait]
+    impl crate::tools::KeruxTool for DangerousTool {
+        fn name(&self) -> &str {
+            "terminal"
+        }
+
+        fn description(&self) -> &str {
+            "A dangerous tool for approval tests"
+        }
+
+        fn schema(&self) -> crate::schema::ToolSchema {
+            crate::schema::ToolSchema::new(
+                "terminal",
+                "A dangerous tool for approval tests",
+                serde_json::json!({ "type": "object", "properties": {} }),
+            )
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _context: crate::tools::ToolContext,
+        ) -> ToolResult {
+            ToolResult::success("dangerous_call", serde_json::json!({ "ran": true }))
+        }
+    }
+
+    /// A gate that returns a fixed decision.
+    struct FixedGate(crate::approval::ApprovalDecision);
+
+    #[async_trait]
+    impl crate::approval::ToolApprovalGate for FixedGate {
+        async fn request_approval(
+            &self,
+            _request: crate::approval::ApprovalRequest,
+        ) -> crate::approval::ApprovalDecision {
+            self.0.clone()
+        }
+    }
+
+    /// Build an agent with a recorder, a dangerous tool, and a fixed gate.
+    async fn approval_test_agent(
+        recorder: Arc<crate::run_journal::RunRecorder>,
+        decision: crate::approval::ApprovalDecision,
+    ) -> KeruxAgent {
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        registry.register(DangerousTool).await.unwrap();
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            registry,
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+        agent.set_approval_gate(Some(Arc::new(FixedGate(decision))));
+        agent
+    }
+
+    fn dangerous_tool_call() -> ToolCall {
+        ToolCall {
+            id: "call_dangerous".to_string(),
+            function: crate::client::ToolCallFunction {
+                name: "terminal".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    fn approval_events(
+        recorder: &crate::run_journal::RunRecorder,
+    ) -> Vec<(String, serde_json::Value)> {
+        recorder
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "approval_decision")
+            .map(|e| {
+                let bounded: crate::redaction::BoundedPayload =
+                    serde_json::from_value(e.payload).unwrap();
+                let payload: serde_json::Value = serde_json::from_str(&bounded.content).unwrap();
+                (e.kind, payload)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn approval_approved_records_decision_and_runs_tool() {
+        let home = tempfile::tempdir().unwrap();
+        let manifest = test_run_manifest("approval-approved");
+        let journal =
+            crate::run_journal::RunJournal::create_in(home.path().join("runs"), manifest).unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let agent = approval_test_agent(
+            Arc::clone(&recorder),
+            crate::approval::ApprovalDecision::Approved,
+        )
+        .await;
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let results = agent
+            .execute_tools(vec![dangerous_tool_call()], &no_cancel)
+            .await
+            .unwrap();
+
+        // Tool ran.
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+
+        // Decision journaled and correlated by call_id.
+        let events = approval_events(&recorder);
+        assert_eq!(events.len(), 1);
+        let payload = &events[0].1;
+        assert_eq!(payload["call_id"], "call_dangerous");
+        assert_eq!(payload["tool_name"], "terminal");
+        assert_eq!(payload["approved"], true);
+        assert_eq!(payload["outcome"], "approved");
+        assert!(payload["reason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn approval_denied_records_redacted_reason_and_blocks_tool() {
+        let home = tempfile::tempdir().unwrap();
+        let manifest = test_run_manifest("approval-denied");
+        let journal =
+            crate::run_journal::RunJournal::create_in(home.path().join("runs"), manifest).unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let agent = approval_test_agent(
+            Arc::clone(&recorder),
+            crate::approval::ApprovalDecision::Denied {
+                reason: "not allowed: sk-secret12345678".to_string(),
+                outcome: crate::approval::ApprovalOutcome::Denied,
+            },
+        )
+        .await;
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let results = agent
+            .execute_tools(vec![dangerous_tool_call()], &no_cancel)
+            .await
+            .unwrap();
+
+        // Tool blocked; denial reason fed back as the tool error.
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(results[0].error.as_deref().unwrap().contains("not allowed"));
+
+        // Decision journaled with the secret redacted.
+        let events = approval_events(&recorder);
+        assert_eq!(events.len(), 1);
+        let payload = &events[0].1;
+        assert_eq!(payload["call_id"], "call_dangerous");
+        assert_eq!(payload["approved"], false);
+        assert_eq!(payload["outcome"], "denied");
+        let reason = payload["reason"].as_str().unwrap();
+        assert!(reason.contains("not allowed"));
+        assert!(!reason.contains("sk-secret12345678"));
+    }
+
+    #[tokio::test]
+    async fn approval_timeout_records_auto_deny() {
+        let home = tempfile::tempdir().unwrap();
+        let manifest = test_run_manifest("approval-timeout");
+        let journal =
+            crate::run_journal::RunJournal::create_in(home.path().join("runs"), manifest).unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let agent = approval_test_agent(
+            Arc::clone(&recorder),
+            crate::approval::ApprovalDecision::Denied {
+                reason: "Approval timed out; tool execution denied.".to_string(),
+                outcome: crate::approval::ApprovalOutcome::Timeout,
+            },
+        )
+        .await;
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let results = agent
+            .execute_tools(vec![dangerous_tool_call()], &no_cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+
+        let events = approval_events(&recorder);
+        assert_eq!(events.len(), 1);
+        let payload = &events[0].1;
+        assert_eq!(payload["approved"], false);
+        assert_eq!(payload["outcome"], "timeout");
+    }
+
+    #[tokio::test]
+    async fn approval_channel_closed_records_stale_response() {
+        let home = tempfile::tempdir().unwrap();
+        let manifest = test_run_manifest("approval-stale");
+        let journal =
+            crate::run_journal::RunJournal::create_in(home.path().join("runs"), manifest).unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let agent = approval_test_agent(
+            Arc::clone(&recorder),
+            crate::approval::ApprovalDecision::Denied {
+                reason: "Approval channel closed unexpectedly.".to_string(),
+                outcome: crate::approval::ApprovalOutcome::ChannelClosed,
+            },
+        )
+        .await;
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let results = agent
+            .execute_tools(vec![dangerous_tool_call()], &no_cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+
+        let events = approval_events(&recorder);
+        assert_eq!(events.len(), 1);
+        let payload = &events[0].1;
+        assert_eq!(payload["approved"], false);
+        assert_eq!(payload["outcome"], "channel_closed");
+    }
+
+    #[tokio::test]
+    async fn approval_cancelled_before_gate_records_nothing_and_blocks_tool() {
+        let home = tempfile::tempdir().unwrap();
+        let manifest = test_run_manifest("approval-cancelled");
+        let journal =
+            crate::run_journal::RunJournal::create_in(home.path().join("runs"), manifest).unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let agent = approval_test_agent(
+            Arc::clone(&recorder),
+            crate::approval::ApprovalDecision::Approved,
+        )
+        .await;
+
+        // Cancel flag set before the tool loop reaches the gate.
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let results = agent
+            .execute_tools(vec![dangerous_tool_call()], &cancelled)
+            .await
+            .unwrap();
+
+        // Tool never reached the gate: placeholder error, no approval event.
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(results[0].error.as_deref().unwrap().contains("cancelled"));
+        assert!(approval_events(&recorder).is_empty());
     }
 }

@@ -32,13 +32,37 @@ pub struct ApprovalRequest {
     pub arguments_preview: String,
 }
 
+/// Why an approval request resolved the way it did.
+///
+/// Recorded alongside the decision so a run journal can distinguish a human
+/// "no" from an auto-deny (timeout), a dropped/cancelled waiter, or a prompt
+/// that never reached the human. Approval is a human decision channel — it is
+/// never labelled as sandbox enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ApprovalOutcome {
+    /// The human explicitly approved the tool call.
+    Approved,
+    /// The human explicitly denied the tool call.
+    Denied,
+    /// No decision arrived before the gate's timeout (auto-deny).
+    Timeout,
+    /// The decision channel closed without a decision (stale or cancelled).
+    ChannelClosed,
+    /// The approval prompt could not be delivered to the human.
+    PromptFailed,
+}
+
 /// Outcome of an approval request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     /// Run the tool.
     Approved,
     /// Do not run the tool; feed `reason` back to the model as the tool error.
-    Denied { reason: String },
+    /// `outcome` records *why* it was denied (human, timeout, cancelled, ...).
+    Denied {
+        reason: String,
+        outcome: ApprovalOutcome,
+    },
 }
 
 /// Host-side hook the agent calls before executing a dangerous tool.
