@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
+<title>kerux proof capsule — run-smoke-1</title>
+<style>
+:root { color-scheme: dark; }
+body { background:#0d1117; color:#e6edf3; font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; margin:0; padding:24px; }
+h1 { font-size:18px; margin:0 0 4px; }
+h2 { font-size:14px; margin:24px 0 8px; color:#8b949e; text-transform:uppercase; letter-spacing:.08em; }
+.badge { display:inline-block; padding:2px 10px; border-radius:999px; font-weight:700; font-size:12px; }
+.badge.pending { background:#1f2937; color:#9ca3af; }
+.badge.ok { background:#052e16; color:#4ade80; border:1px solid #14532d; }
+.badge.bad { background:#3f0d0d; color:#f87171; border:1px solid #7f1d1d; }
+.badge.info { background:#172554; color:#93c5fd; border:1px solid #1e3a8a; }
+table { border-collapse:collapse; width:100%; margin:8px 0; }
+th,td { border:1px solid #21262d; padding:4px 8px; text-align:left; vertical-align:top; }
+th { color:#8b949e; font-weight:600; white-space:nowrap; }
+td.hash { font-size:12px; color:#7ee787; word-break:break-all; }
+details { margin:2px 0; }
+summary { cursor:pointer; color:#8b949e; }
+pre { background:#161b22; border:1px solid #21262d; padding:8px; overflow:auto; max-height:320px; white-space:pre-wrap; word-break:break-word; }
+.muted { color:#8b949e; }
+#warnings li { color:#f0b429; }
+</style>
+</head>
+<body>
+<h1>Kerux Proof Capsule</h1>
+<p>
+  run <strong id="run-id"></strong>
+  &middot; integrity <span id="integrity-badge" class="badge pending">VERIFYING…</span>
+  &middot; replayability <span id="replay-badge" class="badge info"></span>
+  &middot; status <span id="status-badge" class="badge info"></span>
+</p>
+<p class="muted" id="detail"></p>
+<ul id="warnings"></ul>
+
+<h2>Manifest</h2>
+<table id="manifest-table"><tbody></tbody></table>
+
+<h2>Events</h2>
+<table>
+<thead><tr><th>#</th><th>kind</th><th>timestamp (ms)</th><th>hash</th><th>payload</th></tr></thead>
+<tbody id="events-body"></tbody>
+</table>
+
+<p class="muted">
+This file is fully self-contained: no network access, no external assets.
+Integrity is re-computed locally by re-hashing each event&rsquo;s canonical
+material (SHA-256) and re-linking the chain. Events scrubbed for export are
+re-chained; their original journal hashes are kept for cross-reference.
+</p>
+
+<script id="capsule-data" type="application/json">{"format":"kerux.capsule","capsule_version":1,"schema_version":1,"run_id":"run-smoke-1","manifest":{"schema_version":1,"run_id":"run-smoke-1","parent_run_id":null,"parent_sequence":null,"created_at_ms":1725000000000,"completed_at_ms":1725000000300,"status":"succeeded","surface":"cli","model":"glm-5.2","provider_kind":"custom","workspace_fingerprint":"ws-sha256","repository_head":null,"repository_dirty_hash":null,"repository_branch":null,"repository_clean":null,"repository_changed_files":[],"recorder_policy":{"max_payload_bytes":1024},"last_sequence":1,"last_hash":"a7316c03f47860039d46dd0679bbd588bbfa632407039f5c23204ce26fe2a98b","replayability":"full","warnings":[]},"events":[{"sequence":0,"timestamp_ms":1725000000100,"kind":"run_started","payload":{"content":"{\"home\":\"~/.hermes\",\"surface\":\"cli\"}","original_bytes":40,"sha256":"04bba178c06a2d478b6c16e8154f1e34c171e16ec7fa8143d5b0d784111730fe","truncated":false},"hash_material":"{\"schema_version\":1,\"run_id\":\"run-smoke-1\",\"sequence\":0,\"timestamp_ms\":1725000000100,\"kind\":\"run_started\",\"payload\":{\"content\":\"{\\\"home\\\":\\\"~/.hermes\\\",\\\"surface\\\":\\\"cli\\\"}\",\"original_bytes\":40,\"sha256\":\"04bba178c06a2d478b6c16e8154f1e34c171e16ec7fa8143d5b0d784111730fe\",\"truncated\":false},\"previous_hash\":null}","previous_hash":null,"hash":"640a36c0ac226d9023cad9d101e2452280069fb556d74caeb90611066b75b926","journal_hash":"e9f9f40c6930d186c89e02929b0b8e392fb5483106c000f4edb7118047546b43"},{"sequence":1,"timestamp_ms":1725000000200,"kind":"tool_start","payload":{"content":"{\"command\":\"ls ~\",\"tool\":\"terminal\"}","original_bytes":40,"sha256":"a49348a724266515ff6ce52dce4be2aae2d6d49ced47b19c30acfc3d65984dd7","truncated":false},"hash_material":"{\"schema_version\":1,\"run_id\":\"run-smoke-1\",\"sequence\":1,\"timestamp_ms\":1725000000200,\"kind\":\"tool_start\",\"payload\":{\"content\":\"{\\\"command\\\":\\\"ls ~\\\",\\\"tool\\\":\\\"terminal\\\"}\",\"original_bytes\":40,\"sha256\":\"a49348a724266515ff6ce52dce4be2aae2d6d49ced47b19c30acfc3d65984dd7\",\"truncated\":false},\"previous_hash\":\"640a36c0ac226d9023cad9d101e2452280069fb556d74caeb90611066b75b926\"}","previous_hash":"640a36c0ac226d9023cad9d101e2452280069fb556d74caeb90611066b75b926","hash":"e4dc591628ef2bef1a24210ece001f4e2df8efd667be70ba35abf49eaa44a47f","journal_hash":"a7316c03f47860039d46dd0679bbd588bbfa632407039f5c23204ce26fe2a98b"}],"event_count":2,"first_hash":"640a36c0ac226d9023cad9d101e2452280069fb556d74caeb90611066b75b926","last_hash":"e4dc591628ef2bef1a24210ece001f4e2df8efd667be70ba35abf49eaa44a47f","journal_last_hash":"a7316c03f47860039d46dd0679bbd588bbfa632407039f5c23204ce26fe2a98b","redacted_events":2,"warnings":[]}</script>
+<script>
+"use strict";
+/*SHA256-START*/
+function sha256fallback(bytes) {
+  var K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+  function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+  var H = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+  ];
+  var data = [];
+  for (var i = 0; i < bytes.length; i++) data.push(bytes[i]);
+  var bitLen = bytes.length * 8;
+  data.push(0x80);
+  while (data.length % 64 !== 56) data.push(0);
+  for (var s = 56; s >= 0; s -= 8) data.push(Math.floor(bitLen / Math.pow(2, s)) & 0xff);
+  var w = new Array(64);
+  for (var off = 0; off < data.length; off += 64) {
+    for (var t = 0; t < 16; t++) {
+      w[t] = (data[off + t * 4] << 24) | (data[off + t * 4 + 1] << 16) |
+             (data[off + t * 4 + 2] << 8) | data[off + t * 4 + 3];
+    }
+    for (var t = 16; t < 64; t++) {
+      var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+      var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+      w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
+    }
+    var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    for (var t = 0; t < 64; t++) {
+      var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      var ch = (e & f) ^ (~e & g);
+      var temp1 = (h + S1 + ch + K[t] + w[t]) | 0;
+      var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      var maj = (a & b) ^ (a & c) ^ (b & c);
+      var temp2 = (S0 + maj) | 0;
+      h = g; g = f; f = e; e = (d + temp1) | 0;
+      d = c; c = b; b = a; a = (temp1 + temp2) | 0;
+    }
+    H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+    H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+  }
+  var out = "";
+  for (var i = 0; i < 8; i++) {
+    for (var j = 7; j >= 0; j--) out += ((H[i] >>> (j * 4)) & 0xf).toString(16);
+  }
+  return out;
+}
+/*SHA256-END*/
+
+function sha256hex(text) {
+  var bytes = new TextEncoder().encode(text);
+  if (window.crypto && window.crypto.subtle && window.crypto.subtle.digest) {
+    return window.crypto.subtle.digest("SHA-256", bytes).then(function (buf) {
+      var out = "";
+      var view = new Uint8Array(buf);
+      for (var i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, "0");
+      return out;
+    });
+  }
+  return Promise.resolve(sha256fallback(bytes));
+}
+
+function same(a, b) { return (a === null ? null : a) === (b === null ? null : b); }
+
+function setText(id, value) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = String(value);
+}
+
+function setBadge(id, cls, text) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.className = "badge " + cls;
+  el.textContent = text;
+}
+
+function fail(message) {
+  setBadge("integrity-badge", "bad", "TAMPERED");
+  setText("detail", "Verification failed: " + message);
+}
+
+(function () {
+  var capsule;
+  try {
+    capsule = JSON.parse(document.getElementById("capsule-data").textContent);
+  } catch (error) {
+    fail("embedded capsule is not valid JSON");
+    return;
+  }
+
+  setText("run-id", capsule.run_id);
+  setBadge("replay-badge", "info", String(capsule.manifest.replayability));
+  setBadge("status-badge", "info", String(capsule.manifest.status));
+
+  var warningsList = document.getElementById("warnings");
+  (capsule.warnings || []).forEach(function (warning) {
+    var li = document.createElement("li");
+    li.textContent = warning;
+    warningsList.appendChild(li);
+  });
+
+  var manifest = capsule.manifest;
+  var rows = [
+    ["run id", manifest.run_id],
+    ["schema version", manifest.schema_version],
+    ["status", manifest.status],
+    ["replayability", manifest.replayability],
+    ["surface", manifest.surface],
+    ["model", manifest.model],
+    ["provider", manifest.provider_kind],
+    ["created (ms)", manifest.created_at_ms],
+    ["completed (ms)", manifest.completed_at_ms === null ? "—" : manifest.completed_at_ms],
+    ["git head", manifest.repository_head === null ? "—" : manifest.repository_head],
+    ["git branch", manifest.repository_branch === null ? "—" : manifest.repository_branch],
+    ["workspace fingerprint", manifest.workspace_fingerprint],
+    ["journal last hash", capsule.journal_last_hash === null ? "—" : capsule.journal_last_hash],
+    ["events scrubbed for export", capsule.redacted_events]
+  ];
+  var tbody = document.querySelector("#manifest-table tbody");
+  rows.forEach(function (row) {
+    var tr = document.createElement("tr");
+    var th = document.createElement("th");
+    th.textContent = row[0];
+    var td = document.createElement("td");
+    td.textContent = String(row[1]);
+    tr.appendChild(th);
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  });
+
+  var eventsBody = document.getElementById("events-body");
+  capsule.events.forEach(function (event) {
+    var tr = document.createElement("tr");
+    var cells = [event.sequence, event.kind, event.timestamp_ms];
+    cells.forEach(function (value) {
+      var td = document.createElement("td");
+      td.textContent = String(value);
+      tr.appendChild(td);
+    });
+    var hashTd = document.createElement("td");
+    hashTd.className = "hash";
+    hashTd.textContent = event.hash;
+    tr.appendChild(hashTd);
+    var payloadTd = document.createElement("td");
+    var details = document.createElement("details");
+    var summary = document.createElement("summary");
+    summary.textContent = "payload";
+    var pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(event.payload, null, 2);
+    details.appendChild(summary);
+    details.appendChild(pre);
+    payloadTd.appendChild(details);
+    tr.appendChild(payloadTd);
+    eventsBody.appendChild(tr);
+  });
+
+  (async function verify() {
+    var previous = null;
+    var redacted = 0;
+    for (var i = 0; i < capsule.events.length; i++) {
+      var event = capsule.events[i];
+      if (event.sequence !== i) { fail("sequence gap at event " + i); return; }
+      if (!same(event.previous_hash, previous)) { fail("broken chain link at event " + i); return; }
+      var material;
+      try { material = JSON.parse(event.hash_material); }
+      catch (error) { fail("unparseable hash material at event " + i); return; }
+      var materialPrevious = material.previous_hash === null ? null : material.previous_hash;
+      var eventPrevious = event.previous_hash === null ? null : event.previous_hash;
+      if (material.run_id !== capsule.run_id ||
+          material.sequence !== event.sequence ||
+          material.timestamp_ms !== event.timestamp_ms ||
+          material.kind !== event.kind ||
+          JSON.stringify(material.payload) !== JSON.stringify(event.payload) ||
+          materialPrevious !== eventPrevious) {
+        fail("hash material does not match event fields at event " + i);
+        return;
+      }
+      var digest = await sha256hex(event.hash_material);
+      if (digest !== event.hash) { fail("hash mismatch at event " + i); return; }
+      if (event.hash !== event.journal_hash) redacted++;
+      previous = event.hash;
+    }
+    if (capsule.last_hash !== previous) { fail("last_hash does not match final event"); return; }
+    if (redacted !== capsule.redacted_events) { fail("redacted event count mismatch"); return; }
+    setBadge("integrity-badge", "ok", "VERIFIED");
+    setText("detail", capsule.event_count + " events verified locally (SHA-256 chain intact" +
+      (redacted > 0 ? "; " + redacted + " event(s) scrubbed for export and re-chained" : "") + ").");
+  })();
+})();
+</script>
+</body>
+</html>

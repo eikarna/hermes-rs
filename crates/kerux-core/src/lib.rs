@@ -42,6 +42,7 @@
 pub mod agent;
 pub mod approval;
 pub mod auth;
+pub mod capsule;
 pub mod client;
 pub mod config;
 pub mod context;

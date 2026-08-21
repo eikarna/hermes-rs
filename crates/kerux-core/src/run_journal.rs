@@ -1096,7 +1096,12 @@ struct HashMaterial<'a> {
     previous_hash: &'a Option<String>,
 }
 
-fn calculate_hash(event: &RunEventEnvelope) -> Result<String, serde_json::Error> {
+/// The canonical JSON bytes that [`calculate_hash`] digests for one event.
+///
+/// Exposed so export formats (such as proof capsules) can embed the exact
+/// hashed material, letting offline verifiers re-check event hashes without
+/// re-serializing events themselves.
+pub fn hash_material(event: &RunEventEnvelope) -> Result<String, serde_json::Error> {
     let material = HashMaterial {
         schema_version: event.schema_version,
         run_id: &event.run_id,
@@ -1106,8 +1111,12 @@ fn calculate_hash(event: &RunEventEnvelope) -> Result<String, serde_json::Error>
         payload: &event.payload,
         previous_hash: &event.previous_hash,
     };
-    let bytes = serde_json::to_vec(&material)?;
-    Ok(Sha256::digest(bytes)
+    serde_json::to_string(&material)
+}
+
+fn calculate_hash(event: &RunEventEnvelope) -> Result<String, serde_json::Error> {
+    let material = hash_material(event)?;
+    Ok(Sha256::digest(material.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())

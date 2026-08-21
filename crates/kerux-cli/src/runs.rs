@@ -41,6 +41,21 @@ pub enum RunsCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Export one run as a portable, offline-verifiable proof capsule.
+    ///
+    /// The capsule is a scrubbed re-chain of the journal: home-directory
+    /// paths are replaced with `~`, payloads are re-redacted, and the
+    /// capsule carries its own self-consistent hash chain plus per-event
+    /// anchors back to the original journal hashes.
+    Export {
+        run_id: String,
+        /// Output file (default: `<run_id>.capsule.html` in the current dir).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        /// Emit machine-readable JSON (never contains ANSI).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn handle(command: &RunsCommands) -> Result<()> {
@@ -48,6 +63,7 @@ pub fn handle(command: &RunsCommands) -> Result<()> {
         RunsCommands::List { json } => list_runs(*json),
         RunsCommands::Inspect { run_id, json } => inspect_run(run_id, *json),
         RunsCommands::Verify { run_id, json } => verify_run(run_id, *json),
+        RunsCommands::Export { run_id, out, json } => export_run(run_id, out.as_deref(), *json),
     }
 }
 
@@ -261,6 +277,71 @@ fn verify_run(run_id: &str, json: bool) -> Result<()> {
         if incomplete_tail {
             println!("warning: journal ends with an incomplete final line");
         }
+    }
+    Ok(())
+}
+
+fn export_run(run_id: &str, out: Option<&Path>, json: bool) -> Result<()> {
+    use kerux_core::capsule;
+
+    let root = runs_root();
+    if journal_not_found(&root, run_id) {
+        return Err(fail(
+            json,
+            reason::RUN_NOT_FOUND,
+            &format!("no run '{run_id}' under {}", root.display()),
+        ));
+    }
+    let reader = match RunReader::open_in(&root, run_id) {
+        Ok(reader) => reader,
+        Err(error) => {
+            return Err(fail(json, journal_reason(&error), &error.to_string()));
+        }
+    };
+    let capsule = match capsule::build_capsule(&reader) {
+        Ok(capsule) => capsule,
+        Err(error) => {
+            return Err(fail(json, reason::IO_ERROR, &error.to_string()));
+        }
+    };
+    // Defense in depth: the capsule must verify before we write it out.
+    if let Err(error) = capsule::verify_capsule(&capsule) {
+        return Err(fail(
+            json,
+            reason::CHAIN_VERIFICATION_FAILED,
+            &error.to_string(),
+        ));
+    }
+    let html = match capsule::render_html(&capsule) {
+        Ok(html) => html,
+        Err(error) => {
+            return Err(fail(json, reason::IO_ERROR, &error.to_string()));
+        }
+    };
+    let out_path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(format!("{run_id}.capsule.html")));
+    if let Err(error) = std::fs::write(&out_path, html) {
+        return Err(fail(json, reason::IO_ERROR, &error.to_string()));
+    }
+    if json {
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "run_id": run_id,
+                "capsule_last_hash": capsule.last_hash,
+                "events": capsule.events.len(),
+                "redacted_events": capsule.redacted_events,
+                "path": out_path.display().to_string(),
+            })
+        );
+    } else {
+        println!(
+            "exported {} events for run '{run_id}' -> {}",
+            capsule.events.len(),
+            out_path.display()
+        );
     }
     Ok(())
 }
