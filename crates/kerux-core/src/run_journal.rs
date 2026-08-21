@@ -241,15 +241,33 @@ impl RunJournal {
             }
         };
 
-        if let Err(error) = std::fs::rename(&staging_dir, &run_dir) {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            return Err(error.into());
-        }
+        // On Windows, an open handle inside the staging directory makes
+        // MoveFileExW fail with ERROR_ACCESS_DENIED, so the event file is
+        // closed before the rename and reopened from the published location.
+        // On Unix, flock follows the descriptor across rename, so the handle
+        // can stay open.
         #[cfg(target_os = "windows")]
-        if let Err(error) = lock_event_file(&event_file) {
-            // The run is already published; do not remove it, a concurrent
-            // reader may legitimately hold the writer lock from this window.
-            return Err(error);
+        let event_file = {
+            drop(event_file);
+            if let Err(error) = std::fs::rename(&staging_dir, &run_dir) {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(error.into());
+            }
+            let events_path = run_dir.join("events.ndjson");
+            let event_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&events_path)?;
+            lock_event_file(&event_file)?;
+            event_file
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Err(error) = std::fs::rename(&staging_dir, &run_dir) {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(error.into());
+            }
         }
         sync_directory(runs_root)?;
 
