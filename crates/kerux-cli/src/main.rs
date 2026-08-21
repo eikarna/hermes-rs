@@ -1,6 +1,7 @@
 //! Kerux CLI
 
 mod autonomous;
+mod runs;
 mod screenshot;
 mod tui;
 
@@ -126,6 +127,11 @@ enum Commands {
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
+    },
+    /// Inspect recorded run journals (read-only; never executes anything)
+    Runs {
+        #[command(subcommand)]
+        command: runs::RunsCommands,
     },
     /// Render TUI screenshots headlessly (used by the docs preview workflow).
     #[command(hide = true)]
@@ -2001,6 +2007,9 @@ async fn main() -> Result<()> {
         }
         Commands::Auth { command } => {
             handle_auth_command(command).await?;
+        }
+        Commands::Runs { command } => {
+            runs::handle(command)?;
         }
         Commands::Screenshot { out } => {
             screenshot::capture(&loaded.config, out)?;

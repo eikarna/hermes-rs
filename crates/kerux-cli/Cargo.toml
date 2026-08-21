@@ -43,3 +43,6 @@ unicode-width = { workspace = true }
 anyhow = { workspace = true }
 dirs = "5.0"
 console = "0.15"
+
+[dev-dependencies]
+tempfile = "3"

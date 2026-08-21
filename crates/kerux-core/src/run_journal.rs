@@ -480,6 +480,88 @@ impl RunJournal {
     }
 }
 
+/// A strictly read-only view of one persisted run journal.
+///
+/// Unlike [`RunJournal::open_in`], the reader never locks the event file and
+/// never rewrites the manifest head, so it is safe to run concurrently with
+/// an active writer and can never execute or mutate anything.
+#[derive(Debug)]
+pub struct RunReader {
+    run_dir: PathBuf,
+    manifest: RunManifestV1,
+    events: Vec<RunEventEnvelope>,
+    tail_state: TailState,
+}
+
+impl RunReader {
+    /// Open a run under `$KERUX_HOME/runs` for inspection only.
+    pub fn open(run_id: &str) -> Result<Self, JournalError> {
+        Self::open_in(crate::platform::kerux_home().join("runs"), run_id)
+    }
+
+    /// Open a run under an explicit runs root for inspection only.
+    pub fn open_in(runs_root: impl AsRef<Path>, run_id: &str) -> Result<Self, JournalError> {
+        validate_run_id(run_id)?;
+        let run_dir = runs_root.as_ref().join(run_id);
+        if !std::fs::symlink_metadata(&run_dir)?.file_type().is_dir() {
+            return Err(JournalError::InvalidManifest(
+                "run path must be a real directory".to_string(),
+            ));
+        }
+        let manifest_path = run_dir.join("manifest.json");
+        if !std::fs::symlink_metadata(&manifest_path)?
+            .file_type()
+            .is_file()
+        {
+            return Err(JournalError::InvalidManifest(
+                "manifest.json must be a regular file".to_string(),
+            ));
+        }
+        let manifest: RunManifestV1 = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        validate_existing_manifest(&manifest, run_id)?;
+
+        let events_path = run_dir.join("events.ndjson");
+        if !std::fs::symlink_metadata(&events_path)?
+            .file_type()
+            .is_file()
+        {
+            return Err(JournalError::InvalidManifest(
+                "events.ndjson must be a regular file".to_string(),
+            ));
+        }
+        let mut event_file = std::fs::File::open(&events_path)?;
+        let (events, tail_state) = read_events(&mut event_file)?;
+        verify_chain_for_run(&events, run_id).map_err(JournalError::Verification)?;
+
+        Ok(Self {
+            run_dir,
+            manifest,
+            events,
+            tail_state,
+        })
+    }
+
+    /// Directory containing this run's manifest, events, and artifacts.
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
+    /// The persisted manifest, exactly as stored on disk.
+    pub fn manifest(&self) -> &RunManifestV1 {
+        &self.manifest
+    }
+
+    /// Events parsed from complete NDJSON lines, chain-verified.
+    pub fn events(&self) -> &[RunEventEnvelope] {
+        &self.events
+    }
+
+    /// State of the final NDJSON line observed while reading the journal.
+    pub fn tail_state(&self) -> TailState {
+        self.tail_state
+    }
+}
+
 fn validate_new_manifest(manifest: &RunManifestV1) -> Result<(), JournalError> {
     validate_run_id(&manifest.run_id)?;
     if manifest.schema_version != SCHEMA_VERSION {
