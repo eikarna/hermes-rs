@@ -288,7 +288,7 @@ impl RunJournal {
         }
         let mut event_file = std::fs::OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .open(&events_path)?;
         if !event_file.metadata()?.is_file() {
             return Err(JournalError::InvalidManifest(
@@ -340,7 +340,8 @@ impl RunJournal {
         line.push(b'\n');
         if let Err(error) = self
             .event_file
-            .write_all(&line)
+            .seek(SeekFrom::End(0))
+            .and_then(|_| self.event_file.write_all(&line))
             .and_then(|()| self.event_file.sync_data())
         {
             self.tail_state = TailState::IncompleteTail;
@@ -495,7 +496,12 @@ fn write_manifest(path: &Path, manifest: &RunManifestV1) -> Result<(), JournalEr
 
 fn open_new_event_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).append(true).create_new(true);
+    options.read(true).write(true).create_new(true);
+    // On Unix, append mode is atomic; on Windows, append mode strips
+    // FILE_WRITE_DATA from the access mask, which breaks LockFileEx and
+    // FlushFileBuffers (sync_all/sync_data) with "Access is denied"
+    // (rust-lang/rust#54118). Use plain write mode and seek-to-end before
+    // each append instead.
     set_private_creation_mode(&mut options);
     options.open(path)
 }
