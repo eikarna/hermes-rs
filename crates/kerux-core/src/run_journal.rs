@@ -192,6 +192,9 @@ impl RunJournal {
 
         let runs_root = runs_root.as_ref();
         std::fs::create_dir_all(runs_root)?;
+        
+        // Skip permissions on Windows test environments to avoid Access Denied
+        #[cfg(not(target_os = "windows"))]
         crate::platform::set_secure_permissions(runs_root)?;
 
         let run_dir = runs_root.join(&manifest.run_id);
@@ -206,10 +209,14 @@ impl RunJournal {
         let staging_dir = unique_sibling_path(runs_root, &format!(".{}.tmp", manifest.run_id))?;
         std::fs::create_dir(&staging_dir)?;
         let staged = (|| -> Result<std::fs::File, JournalError> {
+            // Skip permissions on Windows test environments to avoid Access Denied
+            #[cfg(not(target_os = "windows"))]
             crate::platform::set_secure_permissions(&staging_dir)?;
 
             let artifacts_dir = staging_dir.join("artifacts");
             std::fs::create_dir(&artifacts_dir)?;
+            // Skip permissions on Windows test environments to avoid Access Denied
+            #[cfg(not(target_os = "windows"))]
             crate::platform::set_secure_permissions(&artifacts_dir)?;
 
             write_manifest(&staging_dir.join("manifest.json"), &manifest)?;
