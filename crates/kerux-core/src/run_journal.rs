@@ -192,7 +192,6 @@ impl RunJournal {
 
         let runs_root = runs_root.as_ref();
         std::fs::create_dir_all(runs_root)?;
-        
         // Skip permissions on Windows test environments to avoid Access Denied
         #[cfg(not(target_os = "windows"))]
         crate::platform::set_secure_permissions(runs_root)?;
