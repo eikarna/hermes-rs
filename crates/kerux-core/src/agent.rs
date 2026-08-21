@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, instrument, warn};
@@ -121,6 +122,87 @@ pub struct AgentTelemetry {
     pub billable: bool,
 }
 
+fn unix_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn agent_event_record(event: &AgentEvent) -> Option<(&'static str, serde_json::Value)> {
+    match event {
+        AgentEvent::ToolStart {
+            call_id,
+            name,
+            arguments,
+        } => Some((
+            "tool_started",
+            serde_json::json!({
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }),
+        )),
+        AgentEvent::ToolComplete { result } => Some((
+            "tool_completed",
+            serde_json::json!({
+                "call_id": result.tool_call_id,
+                "success": result.success,
+                "content": result.content,
+            }),
+        )),
+        AgentEvent::Reasoning { text } => Some((
+            "reasoning_metadata",
+            serde_json::json!({
+                "bytes": text.len(),
+                "sha256": format!("{:x}", Sha256::digest(text.as_bytes())),
+            }),
+        )),
+        AgentEvent::Thinking { content } => Some((
+            "thinking_metadata",
+            serde_json::json!({
+                "bytes": content.len(),
+                "sha256": format!("{:x}", Sha256::digest(content.as_bytes())),
+            }),
+        )),
+        AgentEvent::Content { text } => {
+            Some(("content_delta", serde_json::json!({"content": text})))
+        }
+        AgentEvent::Done { message } => Some((
+            "assistant_message",
+            serde_json::json!({
+                "content": message.content,
+                "tool_call_ids": message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| calls.iter().map(|call| call.id.as_str()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            }),
+        )),
+        AgentEvent::Telemetry { telemetry } => Some((
+            "telemetry",
+            serde_json::json!({
+                "prompt_tokens": telemetry.prompt_tokens,
+                "completion_tokens": telemetry.completion_tokens,
+                "total_tokens": telemetry.total_tokens,
+                "context_window": telemetry.context_window,
+                "compacted": telemetry.compacted,
+                "estimated": telemetry.estimated,
+                "billable": telemetry.billable,
+            }),
+        )),
+        AgentEvent::IterationComplete { iteration } => Some((
+            "iteration_completed",
+            serde_json::json!({"iteration": iteration}),
+        )),
+        AgentEvent::ToolError { name, error } => Some((
+            "tool_failed",
+            serde_json::json!({"call_id": name, "error": error}),
+        )),
+        AgentEvent::Error { .. } => None,
+    }
+}
+
 /// Kerux Agent for tool orchestration
 pub struct KeruxAgent {
     config: AgentConfig,
@@ -130,6 +212,8 @@ pub struct KeruxAgent {
     /// Event sender. Wrapped in a Mutex so gateway runs can swap the sink
     /// per-run (one shared agent, many sequential chat turns).
     event_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<AgentEvent>>>>,
+    /// Optional per-run recorder, parallel to the UI/gateway event sink.
+    run_recorder: Arc<std::sync::Mutex<Option<Arc<crate::run_journal::RunRecorder>>>>,
     /// Cooperative cancellation flag. Set externally (e.g. by the gateway on
     /// user interrupt); checked between iterations, per stream chunk, and
     /// before each tool execution.
@@ -161,6 +245,7 @@ impl KeruxAgent {
             registry,
             conversation: Arc::new(RwLock::new(Vec::new())),
             event_tx: Arc::new(std::sync::Mutex::new(None)),
+            run_recorder: Arc::new(std::sync::Mutex::new(None)),
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
@@ -191,6 +276,7 @@ impl KeruxAgent {
             registry,
             conversation: Arc::new(RwLock::new(Vec::new())),
             event_tx: Arc::new(std::sync::Mutex::new(Some(event_tx))),
+            run_recorder: Arc::new(std::sync::Mutex::new(None)),
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
@@ -203,6 +289,13 @@ impl KeruxAgent {
     pub fn set_event_sender(&self, sender: Option<mpsc::Sender<AgentEvent>>) {
         if let Ok(mut guard) = self.event_tx.lock() {
             *guard = sender;
+        }
+    }
+
+    /// Swap the native run recorder without changing surface event delivery.
+    pub fn set_run_recorder(&self, recorder: Option<Arc<crate::run_journal::RunRecorder>>) {
+        if let Ok(mut guard) = self.run_recorder.lock() {
+            *guard = recorder;
         }
     }
 
@@ -238,16 +331,119 @@ impl KeruxAgent {
         self
     }
 
-    /// Send an event to the channel
-    async fn emit(&self, event: AgentEvent) {
+    /// Send an event to the surface channel and optional native recorder.
+    async fn emit(&self, event: AgentEvent) -> Result<()> {
         let tx = { self.event_tx.lock().ok().and_then(|guard| guard.clone()) };
         if let Some(tx) = tx {
             // Non-blocking send: progress events are decorative. If the
             // consumer (progress pump) is dead or wedged, the bounded
             // channel fills up — blocking here would deadlock the entire
             // agent loop. Drop the event instead.
-            let _ = tx.try_send(event);
+            let _ = tx.try_send(event.clone());
         }
+        self.record_agent_event(&event)?;
+        Ok(())
+    }
+
+    fn record_agent_event(&self, event: &AgentEvent) -> Result<()> {
+        let recorder = self
+            .run_recorder
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(recorder) = recorder else {
+            return Ok(());
+        };
+
+        let Some((kind, payload)) = agent_event_record(event) else {
+            return Ok(());
+        };
+        if let Err(error) = recorder.record(unix_timestamp_ms(), kind, payload) {
+            match recorder.failure_mode() {
+                crate::run_journal::RecorderFailureMode::Warn => {
+                    warn!(error = %error, "Run recorder failed; continuing in warn mode");
+                }
+                crate::run_journal::RecorderFailureMode::Fail => {
+                    return Err(Error::Agent(format!("run recorder failed: {error}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_recording(
+        &self,
+        status: crate::run_journal::RunStatus,
+        kind: &'static str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let recorder = self
+            .run_recorder
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(recorder) = recorder else {
+            return Ok(());
+        };
+
+        if let Err(error) = recorder.finish(unix_timestamp_ms(), kind, payload, status) {
+            match recorder.failure_mode() {
+                crate::run_journal::RecorderFailureMode::Warn => {
+                    warn!(error = %error, "Run recorder finalization failed; continuing in warn mode");
+                }
+                crate::run_journal::RecorderFailureMode::Fail => {
+                    return Err(Error::Agent(format!(
+                        "run recorder finalization failed: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_run_result(&self, result: &Result<Message>) -> Result<()> {
+        match result {
+            Ok(_) => self.finish_recording(
+                crate::run_journal::RunStatus::Succeeded,
+                "run_completed",
+                serde_json::json!({}),
+            ),
+            Err(Error::Cancelled) => self.finish_recording(
+                crate::run_journal::RunStatus::Cancelled,
+                "run_cancelled",
+                serde_json::json!({"reason": "user_cancelled"}),
+            ),
+            Err(error) => self.finish_recording(
+                crate::run_journal::RunStatus::Failed,
+                "run_failed",
+                serde_json::json!({"error": error.to_string()}),
+            ),
+        }
+    }
+
+    fn start_recording(&self) -> Result<()> {
+        let recorder = self
+            .run_recorder
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(recorder) = recorder else {
+            return Ok(());
+        };
+
+        if let Err(error) =
+            recorder.record(unix_timestamp_ms(), "run_started", serde_json::json!({}))
+        {
+            match recorder.failure_mode() {
+                crate::run_journal::RecorderFailureMode::Warn => {
+                    warn!(error = %error, "Run recorder start failed; continuing in warn mode");
+                }
+                crate::run_journal::RecorderFailureMode::Fail => {
+                    return Err(Error::Agent(format!("run recorder start failed: {error}")));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Add a message to the conversation history
@@ -446,6 +642,17 @@ impl KeruxAgent {
         user_query: String,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Message> {
+        self.start_recording()?;
+        let result = self.run_inner(user_query, cancel).await;
+        self.finish_run_result(&result)?;
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        user_query: String,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Message> {
         info!("Starting agent run");
 
         // Add user message
@@ -480,7 +687,7 @@ impl KeruxAgent {
                     iteration, self.config.max_iterations
                 ),
             })
-            .await;
+            .await?;
 
             // Get tool schemas
             let tools = self.registry.get_schemas().await;
@@ -489,7 +696,7 @@ impl KeruxAgent {
             self.emit(AgentEvent::Telemetry {
                 telemetry: preflight_telemetry.clone(),
             })
-            .await;
+            .await?;
 
             let response = if self.config.stream {
                 let stream = self
@@ -507,7 +714,7 @@ impl KeruxAgent {
                             &reasoning_text,
                             &tool_calls,
                         )
-                        .await;
+                        .await?;
                         Ok((response_text, reasoning_text, tool_calls))
                     }
                     Err(error) => Err(error),
@@ -541,7 +748,7 @@ impl KeruxAgent {
                         self.emit(AgentEvent::Done {
                             message: assistant_msg,
                         })
-                        .await;
+                        .await?;
                         return Ok(result);
                     }
 
@@ -553,13 +760,13 @@ impl KeruxAgent {
                             self.emit(AgentEvent::ToolComplete {
                                 result: result.clone(),
                             })
-                            .await;
+                            .await?;
                         } else {
                             self.emit(AgentEvent::ToolError {
                                 name: result.tool_call_id.clone(),
                                 error: result.error.clone().unwrap_or_default(),
                             })
-                            .await;
+                            .await?;
                         }
                     }
 
@@ -580,12 +787,13 @@ impl KeruxAgent {
                     self.emit(AgentEvent::Error {
                         error: e.to_string(),
                     })
-                    .await;
+                    .await?;
                     return Err(e);
                 }
             }
 
-            self.emit(AgentEvent::IterationComplete { iteration }).await;
+            self.emit(AgentEvent::IterationComplete { iteration })
+                .await?;
         }
     }
 
@@ -736,7 +944,7 @@ impl KeruxAgent {
         response_text: &str,
         reasoning_text: &str,
         tool_calls: &[ToolCall],
-    ) {
+    ) -> Result<()> {
         let completion_tokens = estimate_tokens(response_text)
             + estimate_tokens(reasoning_text)
             + total_tool_call_tokens(tool_calls);
@@ -751,7 +959,7 @@ impl KeruxAgent {
                 billable: true,
             },
         })
-        .await;
+        .await
     }
 
     async fn emit_stream_telemetry_snapshot(
@@ -760,7 +968,7 @@ impl KeruxAgent {
         response_text: &str,
         reasoning_text: &str,
         tool_calls: &[ToolCall],
-    ) {
+    ) -> Result<()> {
         let completion_tokens = estimate_tokens(response_text)
             + estimate_tokens(reasoning_text)
             + total_tool_call_tokens(tool_calls);
@@ -775,7 +983,7 @@ impl KeruxAgent {
                 billable: false,
             },
         })
-        .await;
+        .await
     }
 
     fn spawn_session_distillation(&self, history: Vec<Message>) {
@@ -833,14 +1041,14 @@ impl KeruxAgent {
                         let reasoning = strip_reasoning_tags(&reasoning);
                         if !reasoning.is_empty() {
                             accumulated_reasoning.push_str(&reasoning);
-                            self.emit(AgentEvent::Reasoning { text: reasoning }).await;
+                            self.emit(AgentEvent::Reasoning { text: reasoning }).await?;
                             self.emit_stream_telemetry_snapshot(
                                 preflight,
                                 &accumulated_text,
                                 &accumulated_reasoning,
                                 &tool_calls,
                             )
-                            .await;
+                            .await?;
                         }
                     }
 
@@ -858,14 +1066,15 @@ impl KeruxAgent {
                             let visible_text = tool_call_router.feed(&content_delta);
                             if !visible_text.is_empty() {
                                 accumulated_text.push_str(&visible_text);
-                                self.emit(AgentEvent::Content { text: visible_text }).await;
+                                self.emit(AgentEvent::Content { text: visible_text })
+                                    .await?;
                                 self.emit_stream_telemetry_snapshot(
                                     preflight,
                                     &accumulated_text,
                                     &accumulated_reasoning,
                                     &tool_calls,
                                 )
-                                .await;
+                                .await?;
                             }
                         }
 
@@ -874,14 +1083,14 @@ impl KeruxAgent {
                             self.emit(AgentEvent::Reasoning {
                                 text: reasoning_delta,
                             })
-                            .await;
+                            .await?;
                             self.emit_stream_telemetry_snapshot(
                                 preflight,
                                 &accumulated_text,
                                 &accumulated_reasoning,
                                 &tool_calls,
                             )
-                            .await;
+                            .await?;
                         }
                     }
 
@@ -898,7 +1107,7 @@ impl KeruxAgent {
                             &accumulated_reasoning,
                             &tool_calls,
                         )
-                        .await;
+                        .await?;
                     }
                 }
                 Err(e) => {
@@ -967,13 +1176,13 @@ impl KeruxAgent {
             self.emit(AgentEvent::Content {
                 text: content.clone(),
             })
-            .await;
+            .await?;
         }
         if !reasoning.is_empty() {
             self.emit(AgentEvent::Reasoning {
                 text: reasoning.clone(),
             })
-            .await;
+            .await?;
         }
         self.emit(AgentEvent::Telemetry {
             telemetry: AgentTelemetry {
@@ -986,7 +1195,7 @@ impl KeruxAgent {
                 billable: true,
             },
         })
-        .await;
+        .await?;
 
         Ok((content, reasoning, tool_calls))
     }
@@ -1021,7 +1230,7 @@ impl KeruxAgent {
                 name: name.clone(),
                 arguments: args_str.clone(),
             })
-            .await;
+            .await?;
 
             // Parse arguments
             let args: serde_json::Value = match serde_json::from_str(&args_str) {
@@ -1135,14 +1344,18 @@ impl KeruxAgent {
 
     /// Run agent and handle self-healing on tool errors
     pub async fn run_with_healing(&self, user_query: String) -> Result<Message> {
+        self.start_recording()?;
+        self.cancel_flag
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let cancel = self.cancel_flag();
         let mut iteration = 0;
         let max_healing_attempts = self.config.max_healing_attempts;
 
-        loop {
+        let result = loop {
             iteration += 1;
 
-            match self.run(user_query.clone()).await {
-                Ok(response) => return Ok(response),
+            match self.run_inner(user_query.clone(), cancel.clone()).await {
+                Ok(response) => break Ok(response),
                 Err(e) if e.is_self_healing() && iteration <= max_healing_attempts => {
                     warn!(iteration, error = %e, "Self-healing: re-prompting LLM");
 
@@ -1157,10 +1370,13 @@ impl KeruxAgent {
                 }
                 Err(e) => {
                     error!(error = %e, "Agent run failed");
-                    return Err(e);
+                    break Err(e);
                 }
             }
-        }
+        };
+
+        self.finish_run_result(&result)?;
+        result
     }
 }
 
@@ -1697,7 +1913,136 @@ mod tests {
     use async_trait::async_trait;
     use serial_test::serial;
 
+    fn test_run_manifest(run_id: &str) -> crate::run_journal::RunManifestV1 {
+        crate::run_journal::RunManifestV1 {
+            schema_version: crate::run_journal::SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            parent_run_id: None,
+            parent_sequence: None,
+            created_at_ms: 1_725_000_000_000,
+            completed_at_ms: None,
+            status: crate::run_journal::RunStatus::Running,
+            surface: "test".to_string(),
+            model: "test-model".to_string(),
+            provider_kind: "test-provider".to_string(),
+            workspace_fingerprint: "test-workspace".to_string(),
+            repository_head: None,
+            repository_dirty_hash: None,
+            recorder_policy: serde_json::json!({"max_payload_bytes": 1024}),
+            last_sequence: None,
+            last_hash: None,
+            replayability: crate::run_journal::Replayability::Full,
+            warnings: vec![],
+        }
+    }
+
     struct WrongIdTool;
+
+    struct StaticProvider;
+
+    #[async_trait]
+    impl crate::client::LLMProvider for StaticProvider {
+        async fn chat(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> Result<crate::client::ChatResponse> {
+            Ok(crate::client::ChatResponse {
+                id: "static-response".to_string(),
+                object: "chat.completion".to_string(),
+                created: 0,
+                model: "test-model".to_string(),
+                choices: vec![crate::client::Choice {
+                    index: 0,
+                    message: crate::client::MessageDelta {
+                        role: Some(crate::client::Role::Assistant),
+                        content: Some("done".to_string()),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: crate::client::Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            })
+        }
+
+        async fn chat_streaming(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> Result<crate::client::ChatStreamResponse> {
+            Err(Error::Agent("streaming not expected".to_string()))
+        }
+
+        fn capabilities(&self, _model: &str) -> crate::client::ProviderCapabilities {
+            crate::client::ProviderCapabilities::default()
+        }
+    }
+
+    struct FailingProvider;
+
+    struct HealingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::client::LLMProvider for FailingProvider {
+        async fn chat(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> Result<crate::client::ChatResponse> {
+            Err(Error::Agent("provider exploded".to_string()))
+        }
+
+        async fn chat_streaming(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> Result<crate::client::ChatStreamResponse> {
+            Err(Error::Agent("provider exploded".to_string()))
+        }
+
+        fn capabilities(&self, _model: &str) -> crate::client::ProviderCapabilities {
+            crate::client::ProviderCapabilities::default()
+        }
+    }
+
+    #[async_trait]
+    impl crate::client::LLMProvider for HealingProvider {
+        async fn chat(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> Result<crate::client::ChatResponse> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(Error::Agent("first attempt failed".to_string()));
+            }
+            StaticProvider.chat(_model, _messages, _tools).await
+        }
+
+        async fn chat_streaming(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> Result<crate::client::ChatStreamResponse> {
+            Err(Error::Agent("streaming not expected".to_string()))
+        }
+
+        fn capabilities(&self, _model: &str) -> crate::client::ProviderCapabilities {
+            crate::client::ProviderCapabilities::default()
+        }
+    }
 
     #[async_trait]
     impl crate::tools::KeruxTool for WrongIdTool {
@@ -2437,6 +2782,468 @@ mod tests {
             crate::client::Role::Assistant
         );
         assert!(compacted[tool_index - 1].tool_calls.is_some());
+    }
+
+    #[tokio::test]
+    async fn warn_mode_continues_without_raw_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let mut journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("agent-recorder-warn-mode"),
+        )
+        .unwrap();
+        journal
+            .finalize(
+                crate::run_journal::RunStatus::Succeeded,
+                unix_timestamp_ms(),
+            )
+            .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::with_failure_mode(
+            journal,
+            crate::run_journal::RecorderFailureMode::Warn,
+        ));
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent.set_run_recorder(Some(recorder));
+        let secret = "Bearer sk-recorder-warn-fallback-secret";
+        let events_path = runs_root
+            .join("agent-recorder-warn-mode")
+            .join("events.ndjson");
+        let before = std::fs::read(&events_path).unwrap();
+
+        let result = agent
+            .emit(AgentEvent::ToolStart {
+                call_id: "call-warn".to_string(),
+                name: "example".to_string(),
+                arguments: secret.to_string(),
+            })
+            .await;
+
+        assert!(result.is_ok());
+        let after = std::fs::read(&events_path).unwrap();
+        assert_eq!(after, before);
+        assert!(!String::from_utf8(after).unwrap().contains(secret));
+    }
+
+    #[tokio::test]
+    async fn fail_mode_surfaces_recorder_errors_without_raw_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let mut journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("agent-recorder-fail-mode"),
+        )
+        .unwrap();
+        journal
+            .finalize(
+                crate::run_journal::RunStatus::Succeeded,
+                unix_timestamp_ms(),
+            )
+            .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::with_failure_mode(
+            journal,
+            crate::run_journal::RecorderFailureMode::Fail,
+        ));
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent.set_run_recorder(Some(recorder));
+        let secret = "Bearer sk-recorder-fallback-secret";
+        let events_path = runs_root
+            .join("agent-recorder-fail-mode")
+            .join("events.ndjson");
+        let before = std::fs::read(&events_path).unwrap();
+
+        let result = agent
+            .emit(AgentEvent::ToolStart {
+                call_id: "call-fail".to_string(),
+                name: "example".to_string(),
+                arguments: secret.to_string(),
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::Agent(message)) if message.contains("run recorder failed"))
+        );
+        let after = std::fs::read(&events_path).unwrap();
+        assert_eq!(after, before);
+        assert!(!String::from_utf8(after).unwrap().contains(secret));
+    }
+
+    #[tokio::test]
+    async fn attached_recorder_preserves_existing_event_delivery() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let manifest = test_run_manifest("agent-event-delivery");
+        let journal = crate::run_journal::RunJournal::create_in(&runs_root, manifest).unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let agent = KeruxAgent::with_events(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+            tx,
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        agent
+            .emit(AgentEvent::ToolStart {
+                call_id: "call-42".to_string(),
+                name: "example".to_string(),
+                arguments: "{}".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(AgentEvent::ToolStart { call_id, .. }) if call_id == "call-42"
+        ));
+        let events = recorder.events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "tool_started");
+        let bounded: crate::redaction::BoundedPayload =
+            serde_json::from_value(events[0].payload.clone()).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&bounded.content).unwrap();
+        assert_eq!(payload["call_id"], "call-42");
+    }
+
+    #[tokio::test]
+    async fn recorder_omits_raw_reasoning_and_keeps_only_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("agent-reasoning-privacy"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+        let raw_reasoning = "private chain of thought that must never be persisted";
+
+        agent
+            .emit(AgentEvent::Reasoning {
+                text: raw_reasoning.to_string(),
+            })
+            .await
+            .unwrap();
+
+        let raw_journal = std::fs::read_to_string(
+            runs_root
+                .join("agent-reasoning-privacy")
+                .join("events.ndjson"),
+        )
+        .unwrap();
+        assert!(!raw_journal.contains(raw_reasoning));
+        let events = recorder.events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "reasoning_metadata");
+        let bounded: crate::redaction::BoundedPayload =
+            serde_json::from_value(events[0].payload.clone()).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&bounded.content).unwrap();
+        assert_eq!(payload["bytes"], raw_reasoning.len());
+        assert_eq!(payload["sha256"].as_str().unwrap().len(), 64);
+        assert!(payload.get("text").is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_records_exactly_one_terminal_status() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("agent-cancelled-run"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let result = agent.run_with_cancel("stop now".to_string(), cancel).await;
+
+        assert!(matches!(result, Err(Error::Cancelled)));
+        let events = recorder.events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "run_cancelled")
+                .count(),
+            1
+        );
+        let manifest: crate::run_journal::RunManifestV1 = serde_json::from_slice(
+            &std::fs::read(runs_root.join("agent-cancelled-run").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.status, crate::run_journal::RunStatus::Cancelled);
+        assert!(recorder
+            .finalize(
+                crate::run_journal::RunStatus::Cancelled,
+                unix_timestamp_ms()
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_run_records_exactly_one_terminal_status() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("agent-failed-run"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let config = AgentConfig {
+            max_iterations: 0,
+            ..AgentConfig::default()
+        };
+        let agent = KeruxAgent::new(
+            config,
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let result = agent
+            .run_with_cancel(
+                "fail before provider".to_string(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::MaxIterationsExceeded { max: 0 })
+        ));
+        let events = recorder.events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "run_failed")
+                .count(),
+            1
+        );
+        let manifest: crate::run_journal::RunManifestV1 = serde_json::from_slice(
+            &std::fs::read(runs_root.join("agent-failed-run").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.status, crate::run_journal::RunStatus::Failed);
+        assert!(recorder
+            .finalize(crate::run_journal::RunStatus::Failed, unix_timestamp_ms())
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_run_records_exactly_one_terminal_status() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("agent-successful-run"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let config = AgentConfig {
+            stream: false,
+            ..AgentConfig::default()
+        };
+        let agent = KeruxAgent::new_with_provider(
+            config,
+            Arc::new(StaticProvider),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let result = agent
+            .run_with_cancel(
+                "finish now".to_string(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.content, "done");
+        let events = recorder.events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "run_started",
+                "thinking_metadata",
+                "telemetry",
+                "content_delta",
+                "telemetry",
+                "assistant_message",
+                "run_completed",
+            ]
+        );
+        let manifest: crate::run_journal::RunManifestV1 = serde_json::from_slice(
+            &std::fs::read(runs_root.join("agent-successful-run").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.status, crate::run_journal::RunStatus::Succeeded);
+        assert!(recorder
+            .finalize(
+                crate::run_journal::RunStatus::Succeeded,
+                unix_timestamp_ms()
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn self_healing_finalizes_only_after_the_last_attempt() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("agent-healed-run"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let provider = Arc::new(HealingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let config = AgentConfig {
+            stream: false,
+            max_healing_attempts: 1,
+            ..AgentConfig::default()
+        };
+        let agent = KeruxAgent::new_with_provider(
+            config,
+            provider.clone(),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let result = agent
+            .run_with_healing("heal once".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(result.content, "done");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let events = recorder.events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind.starts_with("run_"))
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run_started", "run_completed"]
+        );
+        let manifest: crate::run_journal::RunManifestV1 = serde_json::from_slice(
+            &std::fs::read(runs_root.join("agent-healed-run").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.status, crate::run_journal::RunStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn provider_failure_is_captured_by_the_terminal_boundary() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("agent-provider-failure"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let config = AgentConfig {
+            stream: false,
+            ..AgentConfig::default()
+        };
+        let agent = KeruxAgent::new_with_provider(
+            config,
+            Arc::new(FailingProvider),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let result = agent
+            .run_with_cancel(
+                "fail at provider".to_string(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::Agent(message)) if message == "provider exploded"));
+        let events = recorder.events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "run_failed")
+                .count(),
+            1
+        );
+        let manifest: crate::run_journal::RunManifestV1 = serde_json::from_slice(
+            &std::fs::read(
+                runs_root
+                    .join("agent-provider-failure")
+                    .join("manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.status, crate::run_journal::RunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn recorder_correlates_tool_start_and_completion_by_call_id() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let manifest = test_run_manifest("agent-tool-correlation");
+        let journal = crate::run_journal::RunJournal::create_in(&runs_root, manifest).unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        agent
+            .emit(AgentEvent::ToolStart {
+                call_id: "call-shared".to_string(),
+                name: "example".to_string(),
+                arguments: "{}".to_string(),
+            })
+            .await
+            .unwrap();
+        agent
+            .emit(AgentEvent::ToolComplete {
+                result: ToolResult::success("call-shared", serde_json::json!({"ok": true})),
+            })
+            .await
+            .unwrap();
+
+        let events = recorder.events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "tool_started");
+        assert_eq!(events[1].kind, "tool_completed");
+        for event in events {
+            let bounded: crate::redaction::BoundedPayload =
+                serde_json::from_value(event.payload).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&bounded.content).unwrap();
+            assert_eq!(payload["call_id"], "call-shared");
+        }
     }
 
     #[tokio::test]

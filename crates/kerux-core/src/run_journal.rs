@@ -87,6 +87,77 @@ pub enum TailState {
     IncompleteTail,
 }
 
+/// Whether recorder I/O failures should fail the agent run or only warn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderFailureMode {
+    Warn,
+    Fail,
+}
+
+/// Thread-safe owner for one active run journal.
+#[derive(Debug)]
+pub struct RunRecorder {
+    journal: std::sync::Mutex<RunJournal>,
+    failure_mode: RecorderFailureMode,
+}
+
+impl RunRecorder {
+    /// Create a recorder that warns and keeps the agent running on I/O failure.
+    pub fn new(journal: RunJournal) -> Self {
+        Self::with_failure_mode(journal, RecorderFailureMode::Warn)
+    }
+
+    pub fn with_failure_mode(journal: RunJournal, failure_mode: RecorderFailureMode) -> Self {
+        Self {
+            journal: std::sync::Mutex::new(journal),
+            failure_mode,
+        }
+    }
+
+    pub fn failure_mode(&self) -> RecorderFailureMode {
+        self.failure_mode
+    }
+
+    pub fn record(
+        &self,
+        timestamp_ms: u64,
+        kind: impl Into<String>,
+        payload: Value,
+    ) -> Result<(), JournalError> {
+        let mut journal = self.lock_journal()?;
+        journal.append(timestamp_ms, kind, payload)?;
+        Ok(())
+    }
+
+    pub fn finalize(&self, status: RunStatus, completed_at_ms: u64) -> Result<(), JournalError> {
+        self.lock_journal()?.finalize(status, completed_at_ms)
+    }
+
+    /// Append one terminal event and finalize its manifest while holding the
+    /// recorder lock for the whole transition.
+    pub fn finish(
+        &self,
+        completed_at_ms: u64,
+        kind: impl Into<String>,
+        payload: Value,
+        status: RunStatus,
+    ) -> Result<(), JournalError> {
+        let mut journal = self.lock_journal()?;
+        journal.append(completed_at_ms, kind, payload)?;
+        journal.finalize(status, completed_at_ms)
+    }
+
+    pub fn events(&self) -> Result<Vec<RunEventEnvelope>, JournalError> {
+        Ok(self.lock_journal()?.events().to_vec())
+    }
+
+    fn lock_journal(&self) -> Result<std::sync::MutexGuard<'_, RunJournal>, JournalError> {
+        self.journal
+            .lock()
+            .map_err(|_| JournalError::InvalidManifest("run recorder lock is poisoned".to_string()))
+    }
+}
+
 /// A filesystem-backed append-only journal.
 #[derive(Debug)]
 pub struct RunJournal {
