@@ -739,11 +739,17 @@ fn lock_event_file(file: &std::fs::File) -> Result<(), JournalError> {
         ) -> i32;
     }
 
+    // Lock a single sentinel byte far beyond any real content instead of the
+    // whole file. Windows byte-range locks are mandatory: locking [0, 2^64)
+    // would make every concurrent read of events.ndjson fail with
+    // ERROR_LOCK_VIOLATION. A sentinel at u64::MAX - 1 preserves the
+    // single-writer guarantee (a second writer contends for the same byte)
+    // while leaving normal reads and appends at low offsets untouched.
     let mut overlapped = Overlapped {
         internal: 0,
         internal_high: 0,
-        offset: 0,
-        offset_high: 0,
+        offset: u32::MAX - 1,
+        offset_high: u32::MAX,
         event: std::ptr::null_mut(),
     };
     // SAFETY: the handle is valid and `overlapped` remains alive until the
@@ -753,8 +759,8 @@ fn lock_event_file(file: &std::fs::File) -> Result<(), JournalError> {
             file.as_raw_handle().cast(),
             LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK,
             0,
-            u32::MAX,
-            u32::MAX,
+            1,
+            0,
             &mut overlapped,
         )
     };
