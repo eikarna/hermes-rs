@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub agent: BehaviorSettings,
     pub autonomous: AutonomousSettings,
     pub logging: LoggingSettings,
+    pub recorder: RecorderSettings,
     pub tui: TuiSettings,
     pub telemetry: TelemetrySettings,
     pub mcp: McpSettings,
@@ -295,6 +296,57 @@ impl Default for LoggingSettings {
             with_file: false,
             with_line_number: false,
         }
+    }
+}
+
+/// Flight-recorder policy.
+///
+/// Bounded by design: no retention policy, remote upload, signing key, or
+/// compression in v1. Payloads are redacted and truncated to
+/// `max_payload_bytes` before they touch disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecorderSettings {
+    /// Whether the flight recorder journals runs at all.
+    pub enabled: bool,
+    /// Maximum bytes of a single redacted event payload.
+    pub max_payload_bytes: usize,
+    /// Record assistant/tool content bodies (still redacted + bounded).
+    pub record_content: bool,
+    /// Record model reasoning/thinking bodies (metadata only when false).
+    pub record_reasoning: bool,
+    /// "warn" (log and continue) or "fail" (abort the run) on journal I/O error.
+    pub failure_mode: String,
+}
+
+impl Default for RecorderSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_payload_bytes: 65536,
+            record_content: true,
+            record_reasoning: false,
+            failure_mode: "warn".to_string(),
+        }
+    }
+}
+
+impl RecorderSettings {
+    /// Map `failure_mode` to the recorder's enum, defaulting to warn.
+    pub fn recorder_failure_mode(&self) -> crate::run_journal::RecorderFailureMode {
+        match self.failure_mode.as_str() {
+            "fail" => crate::run_journal::RecorderFailureMode::Fail,
+            _ => crate::run_journal::RecorderFailureMode::Warn,
+        }
+    }
+
+    /// Serialize this policy into the `recorder_policy` manifest value.
+    pub fn to_policy_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "max_payload_bytes": self.max_payload_bytes,
+            "record_content": self.record_content,
+            "record_reasoning": self.record_reasoning,
+        })
     }
 }
 
@@ -860,6 +912,57 @@ mod tests {
         );
         assert_eq!(config.curator.memory_decay_days, 14);
         assert_eq!(config.curator.skill_distill_min_facts, 3);
+        // Recorder section parses with documented defaults.
+        assert!(config.recorder.enabled);
+        assert_eq!(config.recorder.max_payload_bytes, 65536);
+        assert!(config.recorder.record_content);
+        assert!(!config.recorder.record_reasoning);
+        assert_eq!(config.recorder.failure_mode, "warn");
+    }
+
+    #[test]
+    fn recorder_defaults_are_compatible() {
+        // An existing config with no [recorder] section keeps working.
+        let settings: RecorderSettings = toml::from_str("").unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.max_payload_bytes, 65536);
+        assert!(settings.record_content);
+        assert!(!settings.record_reasoning);
+        assert_eq!(settings.failure_mode, "warn");
+        assert!(matches!(
+            settings.recorder_failure_mode(),
+            crate::run_journal::RecorderFailureMode::Warn
+        ));
+    }
+
+    #[test]
+    fn recorder_failure_mode_maps_warn_and_fail() {
+        let warn: RecorderSettings = toml::from_str("failure_mode = \"warn\"\n").unwrap();
+        assert!(matches!(
+            warn.recorder_failure_mode(),
+            crate::run_journal::RecorderFailureMode::Warn
+        ));
+        let fail: RecorderSettings = toml::from_str("failure_mode = \"fail\"\n").unwrap();
+        assert!(matches!(
+            fail.recorder_failure_mode(),
+            crate::run_journal::RecorderFailureMode::Fail
+        ));
+        // Unknown values fall back to warn rather than aborting runs.
+        let unknown: RecorderSettings = toml::from_str("failure_mode = \"explode\"\n").unwrap();
+        assert!(matches!(
+            unknown.recorder_failure_mode(),
+            crate::run_journal::RecorderFailureMode::Warn
+        ));
+    }
+
+    #[test]
+    fn recorder_policy_value_carries_payload_bounds() {
+        let settings: RecorderSettings =
+            toml::from_str("max_payload_bytes = 1024\nrecord_content = false\n").unwrap();
+        let policy = settings.to_policy_value();
+        assert_eq!(policy["max_payload_bytes"], 1024);
+        assert_eq!(policy["record_content"], false);
+        assert_eq!(policy["record_reasoning"], false);
     }
 
     #[test]

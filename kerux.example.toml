@@ -62,6 +62,19 @@ with_thread_ids = false
 with_file = false
 with_line_number = false
 
+# Flight recorder: journals every agent run to an append-only, hash-chained
+# event log under $KERUX_HOME/runs. Privacy: payloads are recursively redacted
+# (secrets, bearer tokens, API keys) and truncated to max_payload_bytes before
+# they touch disk. Reasoning/thinking bodies are stored as metadata only
+# (byte count + sha256) unless record_reasoning is enabled. No retention
+# policy, remote upload, signing, or compression in v1.
+[recorder]
+enabled = true
+max_payload_bytes = 65536
+record_content = true
+record_reasoning = false
+failure_mode = "warn" # warn | fail
+
 [tui]
 theme = "opencode"
 rich_output = true
