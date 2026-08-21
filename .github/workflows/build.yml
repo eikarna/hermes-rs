@@ -52,7 +52,13 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --workspace --release --target ${{ matrix.target }}
+        run: |
+          # Set target directory to free up storage on Windows runners
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            export CARGO_TARGET_DIR=/tmp/cargo-target
+            mkdir -p /tmp/cargo-target
+          fi
+          cargo build --workspace --release --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'

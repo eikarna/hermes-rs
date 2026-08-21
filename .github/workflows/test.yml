@@ -32,10 +32,28 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: |
+          # Set target directory to free up storage on Windows runners
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            export CARGO_TARGET_DIR=/tmp/cargo-target
+            mkdir -p /tmp/cargo-target
+          fi
+          cargo test --workspace --all-features
 
       - name: Run tests (release)
-        run: cargo test --workspace --all-features --release
+        run: |
+          # Set target directory to free up storage on Windows runners
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            export CARGO_TARGET_DIR=/tmp/cargo-target
+            mkdir -p /tmp/cargo-target
+          fi
+          cargo test --workspace --all-features --release
+
+      - name: Cleanup target directory
+        if: matrix.os == 'windows-latest'
+        run: |
+          # Cleanup temporary target directory to free up space
+          rm -rf /tmp/cargo-target
 
   coverage:
     name: Code Coverage
