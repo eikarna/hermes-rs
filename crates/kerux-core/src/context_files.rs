@@ -7,7 +7,19 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
+
+/// Metadata about a loaded context file for provenance recording.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContextFileMeta {
+    /// Path relative to workspace root (or absolute if outside workspace).
+    pub path: String,
+    /// SHA-256 hex digest of the loaded (post-scan, post-truncation) content.
+    pub sha256: String,
+    /// Byte length of the loaded content.
+    pub bytes: usize,
+}
 
 const MAX_CONTEXT_FILE_CHARS: usize = 20_000;
 const TRUNCATE_HEAD_RATIO: f64 = 0.7;
@@ -210,6 +222,77 @@ fn truncate_context(content: &str, max_chars: usize, filename: &str) -> String {
         "{}\n\n[...truncated {}: {} chars total]\n\n{}",
         head, filename, current_chars, tail
     )
+}
+
+/// Compute provenance metadata for a single context file path.
+fn context_file_meta(path: &Path) -> Option<ContextFileMeta> {
+    let content = read_context_file(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    Some(ContextFileMeta {
+        path: path.display().to_string(),
+        sha256: digest,
+        bytes: content.len(),
+    })
+}
+
+/// Return provenance metadata for every file in a context directory.
+pub fn context_dir_metas(dir: &Path) -> Vec<ContextFileMeta> {
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| matches!(ext, "md" | "txt"))
+            })
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    files.sort();
+    files.iter().filter_map(|p| context_file_meta(p)).collect()
+}
+
+/// Return provenance metadata for the default (`~/.config/kerux/context`) files.
+pub fn default_context_file_metas() -> Vec<ContextFileMeta> {
+    dirs::config_dir()
+        .map(|dir| dir.join("kerux").join("context"))
+        .map(|dir| context_dir_metas(&dir))
+        .unwrap_or_default()
+}
+
+/// Return provenance metadata for the nearest workspace context file,
+/// mirroring the discovery walk in [`load_workspace_context`].
+pub fn workspace_context_file_metas(working_dir: &Path) -> Vec<ContextFileMeta> {
+    let git_root = find_git_root(working_dir);
+    let mut current = working_dir.to_path_buf();
+
+    loop {
+        for name in WORKSPACE_CONTEXT_FILES {
+            let candidate = current.join(name);
+            if let Some(meta) = context_file_meta(&candidate) {
+                return vec![meta];
+            }
+        }
+
+        if git_root.as_ref().is_some_and(|root| current == *root) {
+            break;
+        }
+
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+
+    Vec::new()
 }
 
 #[cfg(test)]

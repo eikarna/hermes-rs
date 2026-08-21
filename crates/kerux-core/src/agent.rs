@@ -371,6 +371,115 @@ impl KeruxAgent {
         Ok(())
     }
 
+    /// Record a `request_prepared` provenance event capturing the exact
+    /// inputs assembled for an LLM request: message digests, context files,
+    /// memory blocks, tool schemas, and provider capabilities.
+    async fn record_request_prepared(
+        &self,
+        iteration: usize,
+        request_messages: &[Message],
+        tools: &[ToolSchema],
+        telemetry: &AgentTelemetry,
+    ) -> Result<()> {
+        let recorder = self
+            .run_recorder
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(recorder) = recorder else {
+            return Ok(());
+        };
+
+        // Per-message digests: role + sha256 of content + token estimate.
+        let message_digests: Vec<serde_json::Value> = request_messages
+            .iter()
+            .map(|msg| {
+                serde_json::json!({
+                    "role": format!("{:?}", msg.role),
+                    "sha256": format!("{:x}", Sha256::digest(msg.content.as_bytes())),
+                    "tokens": estimate_tokens(&msg.content),
+                })
+            })
+            .collect();
+
+        // Context file provenance (default + workspace).
+        let mut context_files: Vec<serde_json::Value> = Vec::new();
+        for meta in crate::context_files::default_context_file_metas() {
+            context_files.push(serde_json::to_value(&meta).unwrap_or_default());
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            for meta in crate::context_files::workspace_context_file_metas(&cwd) {
+                context_files.push(serde_json::to_value(&meta).unwrap_or_default());
+            }
+        }
+
+        // Memory blocks injected into context (importance >= 70).
+        let mut memory_blocks: Vec<serde_json::Value> = Vec::new();
+        if let Some(memory) = &self.memory_manager {
+            for block in memory.get_important(70).await {
+                memory_blocks.push(serde_json::json!({
+                    "id": block.id,
+                    "block_type": block.block_type,
+                    "importance": block.importance,
+                    "sha256": format!("{:x}", Sha256::digest(block.content.as_bytes())),
+                }));
+            }
+        }
+
+        // Tool schema digests.
+        let tool_schemas: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|tool| {
+                let schema_json = serde_json::to_string(tool).unwrap_or_default();
+                serde_json::json!({
+                    "name": tool.name,
+                    "sha256": format!("{:x}", Sha256::digest(schema_json.as_bytes())),
+                })
+            })
+            .collect();
+
+        // Provider capabilities for the active model.
+        let caps = self.client.capabilities(&self.config.model);
+        let capabilities = serde_json::json!({
+            "max_input_tokens": caps.max_input_tokens,
+            "max_output_tokens": caps.max_output_tokens,
+            "edit_format": format!("{:?}", caps.edit_format),
+            "supports_streaming": caps.supports_streaming,
+            "supports_reasoning": caps.supports_reasoning,
+            "supports_vision": caps.supports_vision,
+            "supports_tool_calls": caps.supports_tool_calls,
+        });
+
+        let payload = serde_json::json!({
+            "iteration": iteration,
+            "model": self.config.model,
+            "message_count": request_messages.len(),
+            "message_digests": message_digests,
+            "context_files": context_files,
+            "memory_blocks": memory_blocks,
+            "tool_schemas": tool_schemas,
+            "capabilities": capabilities,
+            "skills": [],
+            "telemetry": {
+                "prompt_tokens": telemetry.prompt_tokens,
+                "context_window": telemetry.context_window,
+                "compacted": telemetry.compacted,
+            },
+        });
+
+        if let Err(error) = recorder.record(unix_timestamp_ms(), "request_prepared", payload) {
+            match recorder.failure_mode() {
+                crate::run_journal::RecorderFailureMode::Warn => {
+                    warn!(error = %error, "Run recorder failed; continuing in warn mode");
+                }
+                crate::run_journal::RecorderFailureMode::Fail => {
+                    return Err(Error::Agent(format!("run recorder failed: {error}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn finish_recording(
         &self,
         status: crate::run_journal::RunStatus,
@@ -696,6 +805,13 @@ impl KeruxAgent {
             self.emit(AgentEvent::Telemetry {
                 telemetry: preflight_telemetry.clone(),
             })
+            .await?;
+            self.record_request_prepared(
+                iteration,
+                &request_messages,
+                &tools,
+                &preflight_telemetry,
+            )
             .await?;
 
             let response = if self.config.stream {
@@ -3089,6 +3205,7 @@ mod tests {
                 "run_started",
                 "thinking_metadata",
                 "telemetry",
+                "request_prepared",
                 "content_delta",
                 "telemetry",
                 "assistant_message",
@@ -3307,5 +3424,100 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("Invalid JSON"));
+    }
+
+    #[tokio::test]
+    async fn request_prepared_records_full_provenance() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("request-prepared-provenance"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+
+        let memory = crate::memory::MemoryManager::new();
+        memory
+            .store(
+                crate::memory::MemoryBlock::new("mem-1", "fact", "important fact")
+                    .importance(80),
+            )
+            .await;
+
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            ToolRegistry::new(Duration::from_secs(1)),
+        )
+        .with_memory_manager(memory);
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let messages = vec![
+            Message::system("You are helpful."),
+            Message::user("Hello"),
+        ];
+        let tools = vec![crate::schema::ToolSchema {
+            name: "test_tool".to_string(),
+            description: "A test tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let telemetry = AgentTelemetry {
+            prompt_tokens: 42,
+            completion_tokens: 0,
+            total_tokens: 42,
+            context_window: 128_000,
+            compacted: false,
+            estimated: true,
+            billable: false,
+        };
+
+        agent
+            .record_request_prepared(0, &messages, &tools, &telemetry)
+            .await
+            .unwrap();
+
+        let events = recorder.events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "request_prepared");
+
+        let bounded: crate::redaction::BoundedPayload =
+            serde_json::from_value(events[0].payload.clone()).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&bounded.content).unwrap();
+
+        // Core fields
+        assert_eq!(payload["iteration"], 0);
+        assert_eq!(payload["message_count"], 2);
+        assert_eq!(payload["model"], "gpt-4");
+
+        // Message digests: one per message, each with role + sha256 + tokens
+        let digests = payload["message_digests"].as_array().unwrap();
+        assert_eq!(digests.len(), 2);
+        assert_eq!(digests[0]["role"], "System");
+        assert_eq!(digests[1]["role"], "User");
+        assert!(digests[0]["sha256"].as_str().unwrap().len() == 64);
+        assert!(digests[0]["tokens"].as_u64().unwrap() > 0);
+
+        // Tool schemas recorded with name + digest
+        let tool_schemas = payload["tool_schemas"].as_array().unwrap();
+        assert_eq!(tool_schemas.len(), 1);
+        assert_eq!(tool_schemas[0]["name"], "test_tool");
+        assert!(tool_schemas[0]["sha256"].as_str().unwrap().len() == 64);
+
+        // Memory blocks: importance >= 70 captured
+        let memory_blocks = payload["memory_blocks"].as_array().unwrap();
+        assert_eq!(memory_blocks.len(), 1);
+        assert_eq!(memory_blocks[0]["id"], "mem-1");
+        assert_eq!(memory_blocks[0]["importance"], 80);
+
+        // Capabilities present
+        assert!(payload["capabilities"]["supports_tool_calls"].is_boolean());
+
+        // Telemetry snapshot
+        assert_eq!(payload["telemetry"]["prompt_tokens"], 42);
+        assert_eq!(payload["telemetry"]["compacted"], false);
+
+        // Skills array present (empty until wired)
+        assert!(payload["skills"].is_array());
     }
 }
