@@ -31,29 +31,48 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      - name: Run tests
+      - name: Run tests (debug/info)
         run: |
-          # Set target directory to free up storage on Windows runners
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            export CARGO_TARGET_DIR=/tmp/cargo-target
-            mkdir -p /tmp/cargo-target
-          fi
+          echo "Running on OS: ${{ matrix.os }}"
+          uname -a || ver
+          whoami || whoami
+
+      - name: Run tests (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = "/tmp/cargo-target"
+          New-Item -ItemType Directory -Force -Path "/tmp/cargo-target" | Out-Null
           cargo test --workspace --all-features
 
-      - name: Run tests (release)
+      - name: Run tests (unix)
+        if: matrix.os != 'windows-latest'
         run: |
-          # Set target directory to free up storage on Windows runners
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            export CARGO_TARGET_DIR=/tmp/cargo-target
-            mkdir -p /tmp/cargo-target
-          fi
+          export CARGO_TARGET_DIR=/tmp/cargo-target
+          mkdir -p /tmp/cargo-target
+          cargo test --workspace --all-features
+
+      - name: Run tests (release windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = "/tmp/cargo-target"
+          New-Item -ItemType Directory -Force -Path "/tmp/cargo-target" | Out-Null
+          cargo test --workspace --all-features --release
+
+      - name: Run tests (release unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          export CARGO_TARGET_DIR=/tmp/cargo-target
+          mkdir -p /tmp/cargo-target
           cargo test --workspace --all-features --release
 
       - name: Cleanup target directory
         if: matrix.os == 'windows-latest'
+        shell: pwsh
         run: |
           # Cleanup temporary target directory to free up space
-          rm -rf /tmp/cargo-target
+          Remove-Item -Recurse -Force -Path "/tmp/cargo-target" -ErrorAction SilentlyContinue
 
   coverage:
     name: Code Coverage
