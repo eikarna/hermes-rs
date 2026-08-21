@@ -169,6 +169,19 @@ impl RunRecorder {
         Ok(self.lock_journal()?.events().to_vec())
     }
 
+    /// Provider kind recorded in the run manifest. Lets per-event payloads
+    /// (e.g. edit-protocol outcomes) carry provider provenance without
+    /// re-deriving it from the client.
+    pub fn provider_kind(&self) -> Result<String, JournalError> {
+        Ok(self.lock_journal()?.manifest.provider_kind.clone())
+    }
+
+    /// Model id recorded in the run manifest (same rationale as
+    /// [`Self::provider_kind`]).
+    pub fn model(&self) -> Result<String, JournalError> {
+        Ok(self.lock_journal()?.manifest.model.clone())
+    }
+
     fn lock_journal(&self) -> Result<std::sync::MutexGuard<'_, RunJournal>, JournalError> {
         self.journal
             .lock()

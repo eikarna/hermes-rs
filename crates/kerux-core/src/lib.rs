@@ -59,6 +59,7 @@ pub mod persist;
 pub mod platform;
 pub mod redaction;
 pub mod repomap;
+pub mod edit_metrics;
 pub mod run_journal;
 pub mod scheduler;
 pub mod schema;

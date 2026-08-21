@@ -225,6 +225,8 @@ pub struct KeruxAgent {
     /// Optional human-approval gate consulted before dangerous tools run.
     /// Swapped per-run by the gateway (like `event_tx`).
     approval_gate: Arc<std::sync::Mutex<Option<Arc<dyn crate::approval::ToolApprovalGate>>>>,
+    /// Per-run edit-protocol outcome tracker (Task 2.4 measurement).
+    edit_metrics: Arc<std::sync::Mutex<crate::edit_metrics::EditMetricsTracker>>,
 }
 
 impl KeruxAgent {
@@ -250,6 +252,9 @@ impl KeruxAgent {
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
             approval_gate: Arc::new(std::sync::Mutex::new(None)),
+            edit_metrics: Arc::new(std::sync::Mutex::new(
+                crate::edit_metrics::EditMetricsTracker::default(),
+            )),
         }
     }
 
@@ -281,6 +286,9 @@ impl KeruxAgent {
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
             approval_gate: Arc::new(std::sync::Mutex::new(None)),
+            edit_metrics: Arc::new(std::sync::Mutex::new(
+                crate::edit_metrics::EditMetricsTracker::default(),
+            )),
         }
     }
 
@@ -537,6 +545,86 @@ impl KeruxAgent {
         Ok(())
     }
 
+    /// Journal one edit-protocol outcome event (Task 2.4). Measurement only:
+    /// never alters tool selection or execution.
+    ///
+    /// Called from [`Self::execute_tools`] after every edit-format tool call
+    /// reaches a terminal state. When no recorder is attached this is a no-op
+    /// apart from tracker bookkeeping.
+    fn record_edit_outcome(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        args_str: &str,
+        parse_status: &'static str,
+        outcome: crate::edit_metrics::EditApplyStatus,
+        result_content: Option<&str>,
+    ) -> Result<()> {
+        use crate::edit_metrics::{
+            extract_target_path, language_for_path, match_type_from_payload, EditFormat,
+        };
+
+        let format = match EditFormat::from_tool_name(tool_name) {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        let path = extract_target_path(args_str);
+        // Repair-relevant failure: an apply error, or a parse failure that
+        // stopped the edit before execution. Cancels/denials are not.
+        let failed = matches!(outcome, crate::edit_metrics::EditApplyStatus::Failed)
+            || (matches!(outcome, crate::edit_metrics::EditApplyStatus::Skipped)
+                && parse_status == "failed");
+        let repair_count = self
+            .edit_metrics
+            .lock()
+            .map(|mut t| t.observe(path.as_deref().unwrap_or(""), failed))
+            .unwrap_or(0);
+
+        let recorder = self
+            .run_recorder
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(recorder) = recorder else {
+            return Ok(());
+        };
+
+        // Parse status comes straight from the call site: only the invalid-
+        // JSON skip reports "failed"; cancels/denials/unknown tools either
+        // parsed fine or were never attempted, which callers state exactly.
+
+        let payload = serde_json::json!({
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "format": format.as_str(),
+            "path": path,
+            "parse_status": parse_status,
+            "apply_status": outcome,
+            "match_type": match (&outcome, result_content) {
+                (crate::edit_metrics::EditApplyStatus::Ok, Some(content)) => {
+                    match_type_from_payload(content)
+                }
+                _ => None,
+            },
+            "language": path.as_deref().map(language_for_path),
+            "repair_count": repair_count,
+            "provider_kind": recorder.provider_kind().ok(),
+            "model": recorder.model().ok(),
+        });
+
+        if let Err(error) = recorder.record(unix_timestamp_ms(), "edit_outcome", payload) {
+            match recorder.failure_mode() {
+                crate::run_journal::RecorderFailureMode::Warn => {
+                    warn!(error = %error, "Run recorder failed; continuing in warn mode");
+                }
+                crate::run_journal::RecorderFailureMode::Fail => {
+                    return Err(Error::Agent(format!("run recorder failed: {error}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn finish_recording(
         &self,
         status: crate::run_journal::RunStatus,
@@ -588,6 +676,12 @@ impl KeruxAgent {
     }
 
     fn start_recording(&self) -> Result<()> {
+        // Fresh run: forget per-path repair counters from any previous run so
+        // `repair_count` never leaks across runs.
+        if let Ok(mut tracker) = self.edit_metrics.lock() {
+            tracker.reset();
+        }
+
         let recorder = self
             .run_recorder
             .lock()
@@ -1409,6 +1503,15 @@ impl KeruxAgent {
                     &tool_call.id,
                     "Tool execution cancelled by user".to_string(),
                 ));
+                // Measurement only: a cancel is a skip, not a parse failure.
+                let _ = self.record_edit_outcome(
+                    &tool_call.id,
+                    &tool_call.function.name,
+                    &tool_call.function.arguments,
+                    "cancelled",
+                    crate::edit_metrics::EditApplyStatus::Skipped,
+                    None,
+                );
                 continue;
             }
 
@@ -1432,6 +1535,14 @@ impl KeruxAgent {
                         &tool_call.id,
                         format!("Invalid JSON: {}", e),
                     ));
+                    let _ = self.record_edit_outcome(
+                        &tool_call.id,
+                        &name,
+                        &args_str,
+                        "failed",
+                        crate::edit_metrics::EditApplyStatus::Skipped,
+                        None,
+                    );
                     continue;
                 }
             };
@@ -1443,6 +1554,14 @@ impl KeruxAgent {
                     &tool_call.id,
                     format!("Tool '{}' not found", name),
                 ));
+                let _ = self.record_edit_outcome(
+                    &tool_call.id,
+                    &name,
+                    &args_str,
+                    "ok",
+                    crate::edit_metrics::EditApplyStatus::Skipped,
+                    None,
+                );
                 continue;
             }
 
@@ -1463,6 +1582,14 @@ impl KeruxAgent {
                     if let crate::approval::ApprovalDecision::Denied { reason, .. } = decision {
                         info!(tool = %name, reason = %reason, "Tool execution denied by approval gate");
                         results.push(ToolResult::error(&tool_call.id, reason));
+                        let _ = self.record_edit_outcome(
+                            &tool_call.id,
+                            &name,
+                            &args_str,
+                            "ok",
+                            crate::edit_metrics::EditApplyStatus::Denied,
+                            None,
+                        );
                         continue;
                     }
                 }
@@ -1479,14 +1606,42 @@ impl KeruxAgent {
             match result {
                 Ok(Ok(r)) => {
                     debug!(tool = %name, success = r.success, "Tool execution completed");
+                    let _ = self.record_edit_outcome(
+                        &tool_call.id,
+                        &name,
+                        &args_str,
+                        "ok",
+                        if r.success {
+                            crate::edit_metrics::EditApplyStatus::Ok
+                        } else {
+                            crate::edit_metrics::EditApplyStatus::Failed
+                        },
+                        Some(&r.content),
+                    );
                     results.push(r);
                 }
                 Ok(Err(e)) => {
                     error!(tool = %name, error = %e, "Tool execution failed");
+                    let _ = self.record_edit_outcome(
+                        &tool_call.id,
+                        &name,
+                        &args_str,
+                        "ok",
+                        crate::edit_metrics::EditApplyStatus::Failed,
+                        None,
+                    );
                     results.push(ToolResult::error(&tool_call.id, e.to_string()));
                 }
                 Err(_) => {
                     error!(tool = %name, "Tool execution timed out");
+                    let _ = self.record_edit_outcome(
+                        &tool_call.id,
+                        &name,
+                        &args_str,
+                        "ok",
+                        crate::edit_metrics::EditApplyStatus::Timeout,
+                        None,
+                    );
                     results.push(ToolResult::error(
                         &tool_call.id,
                         format!("Tool timed out after {:?}", self.config.tool_timeout),
@@ -3503,6 +3658,208 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("Invalid JSON"));
+    }
+
+    /// Decode an event payload through the bounded redaction envelope.
+    fn decode_event_payload(event: &crate::run_journal::RunEventEnvelope) -> serde_json::Value {
+        let bounded: crate::redaction::BoundedPayload =
+            serde_json::from_value(event.payload.clone()).unwrap();
+        serde_json::from_str(&bounded.content).unwrap()
+    }
+
+    #[tokio::test]
+    async fn edit_outcome_recorded_for_successful_search_replace() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("lib.rs");
+        std::fs::write(&target, "fn main() {}\n").unwrap();
+
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("edit-outcome-success"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        registry.register(crate::tools::EditBlockTool).await.unwrap();
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            registry,
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let args = serde_json::json!({
+            "path": target.to_string_lossy(),
+            "edits": [{"search": "fn main() {}", "replace": "fn main() { println!(\"hi\"); }"}]
+        });
+        let results = agent
+            .execute_tools(
+                vec![ToolCall {
+                    id: "call-edit-1".to_string(),
+                    function: crate::client::ToolCallFunction {
+                        name: "edit_block".to_string(),
+                        arguments: args.to_string(),
+                    },
+                }],
+                &no_cancel,
+            )
+            .await
+            .unwrap();
+        assert!(results[0].success, "edit should apply: {:?}", results[0]);
+
+        let events = recorder.events().unwrap();
+        let edit_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "edit_outcome")
+            .collect();
+        assert_eq!(edit_events.len(), 1);
+        let payload = decode_event_payload(edit_events[0]);
+        assert_eq!(payload["call_id"], "call-edit-1");
+        assert_eq!(payload["tool_name"], "edit_block");
+        assert_eq!(payload["format"], "search_replace");
+        assert_eq!(payload["parse_status"], "ok");
+        assert_eq!(payload["apply_status"], "ok");
+        assert_eq!(payload["match_type"], "exact");
+        assert_eq!(payload["language"], "rust");
+        assert_eq!(payload["repair_count"], 0);
+        assert_eq!(payload["provider_kind"], "test-provider");
+        assert_eq!(payload["model"], "test-model");
+        assert_eq!(
+            payload["path"],
+            serde_json::Value::String(target.to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_outcome_tracks_parse_failures_and_repair_counts() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("app.py");
+        std::fs::write(&target, "value = 1\n").unwrap();
+
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("edit-outcome-repair"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        registry.register(crate::tools::EditBlockTool).await.unwrap();
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            registry,
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let call = |id: &str, name: &str, arguments: String| ToolCall {
+            id: id.to_string(),
+            function: crate::client::ToolCallFunction {
+                name: name.to_string(),
+                arguments,
+            },
+        };
+        let path_str = target.to_string_lossy().to_string();
+
+        // 1. Invalid argument JSON → skipped, parse_status failed, and no
+        //    target path could be extracted so the repair counter is untouched.
+        // 2. Valid JSON but missing search text → failed, repair_count 1.
+        // 3. Exact match → ok, repair_count 2 (successes never reset counters).
+        let calls = vec![
+            call("call-bad", "edit_block", "{\"path\":".to_string()),
+            call(
+                "call-miss",
+                "edit_block",
+                serde_json::json!({
+                    "path": path_str,
+                    "edits": [{"search": "text that is not in the file", "replace": "x"}]
+                })
+                .to_string(),
+            ),
+            call(
+                "call-hit",
+                "edit_block",
+                serde_json::json!({
+                    "path": path_str,
+                    "edits": [{"search": "value = 1", "replace": "value = 2"}]
+                })
+                .to_string(),
+            ),
+        ];
+        let results = agent.execute_tools(calls, &no_cancel).await.unwrap();
+        assert!(!results[0].success);
+        assert!(!results[1].success);
+        assert!(results[2].success);
+
+        let events = recorder.events().unwrap();
+        let edit_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "edit_outcome")
+            .collect();
+        assert_eq!(edit_events.len(), 3);
+
+        let first = decode_event_payload(edit_events[0]);
+        assert_eq!(first["apply_status"], "skipped");
+        assert_eq!(first["parse_status"], "failed");
+        assert_eq!(first["repair_count"], 0);
+
+        let second = decode_event_payload(edit_events[1]);
+        assert_eq!(second["apply_status"], "failed");
+        assert_eq!(second["parse_status"], "ok");
+        assert_eq!(second["repair_count"], 0);
+        assert_eq!(second["language"], "python");
+
+        let third = decode_event_payload(edit_events[2]);
+        assert_eq!(third["apply_status"], "ok");
+        assert_eq!(third["repair_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn non_edit_tools_produce_no_edit_outcome() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("edit-outcome-non-edit"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        registry.register(WrongIdTool).await.unwrap();
+        let agent = KeruxAgent::new(
+            AgentConfig::default(),
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            registry,
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let results = agent
+            .execute_tools(
+                vec![ToolCall {
+                    id: "call-non-edit".to_string(),
+                    function: crate::client::ToolCallFunction {
+                        name: "wrong_id".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+                &no_cancel,
+            )
+            .await
+            .unwrap();
+        assert!(results[0].success);
+
+        let events = recorder.events().unwrap();
+        assert!(
+            events.iter().all(|e| e.kind != "edit_outcome"),
+            "non-edit tools must not emit edit_outcome events"
+        );
     }
 
     #[tokio::test]
