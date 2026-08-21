@@ -48,6 +48,15 @@ pub struct RunManifestV1 {
     pub workspace_fingerprint: String,
     pub repository_head: Option<String>,
     pub repository_dirty_hash: Option<String>,
+    /// Branch name at run start (`None` when detached or not a repo).
+    #[serde(default)]
+    pub repository_branch: Option<String>,
+    /// Whether the working tree was clean at run start.
+    #[serde(default)]
+    pub repository_clean: Option<bool>,
+    /// Relative paths of changed files at run start.
+    #[serde(default)]
+    pub repository_changed_files: Vec<String>,
     pub recorder_policy: Value,
     pub last_sequence: Option<u64>,
     pub last_hash: Option<String>,
@@ -131,6 +140,15 @@ impl RunRecorder {
 
     pub fn finalize(&self, status: RunStatus, completed_at_ms: u64) -> Result<(), JournalError> {
         self.lock_journal()?.finalize(status, completed_at_ms)
+    }
+
+    /// Attach git checkpoint evidence to the run manifest while the run is
+    /// still running. See [`RunJournal::attach_git_checkpoint`].
+    pub fn attach_git_checkpoint(
+        &self,
+        checkpoint: &crate::githarness::GitCheckpoint,
+    ) -> Result<(), JournalError> {
+        self.lock_journal()?.attach_git_checkpoint(checkpoint)
     }
 
     /// Append one terminal event and finalize its manifest while holding the
@@ -413,6 +431,39 @@ impl RunJournal {
         write_manifest(&self.run_dir.join("manifest.json"), &self.manifest)
     }
 
+    /// Attach git checkpoint evidence to the run manifest.
+    ///
+    /// Records HEAD, branch, clean/dirty status, the dirty patch SHA-256,
+    /// and the relative changed-file list, then derives `replayability`:
+    /// `Full` when the exact pre-run code state is reconstructable (known
+    /// HEAD + clean tree), `Degraded` otherwise. The raw dirty patch is
+    /// never persisted. Only allowed while the run is still running.
+    pub fn attach_git_checkpoint(
+        &mut self,
+        checkpoint: &crate::githarness::GitCheckpoint,
+    ) -> Result<(), JournalError> {
+        if self.manifest.status != RunStatus::Running {
+            return Err(JournalError::InvalidManifest(
+                "cannot attach git checkpoint to a finalized run".to_string(),
+            ));
+        }
+        if self.tail_state == TailState::IncompleteTail {
+            return Err(JournalError::IncompleteTail);
+        }
+
+        self.manifest.repository_head = checkpoint.head.clone();
+        self.manifest.repository_branch = checkpoint.branch.clone();
+        self.manifest.repository_clean = Some(checkpoint.clean);
+        self.manifest.repository_dirty_hash = checkpoint.dirty_patch_sha256.clone();
+        self.manifest.repository_changed_files = checkpoint.changed_files.clone();
+        self.manifest.replayability = if checkpoint.reconstructable() {
+            Replayability::Full
+        } else {
+            Replayability::Degraded
+        };
+        write_manifest(&self.run_dir.join("manifest.json"), &self.manifest)
+    }
+
     /// Directory containing this run's manifest, events, and artifacts.
     pub fn run_dir(&self) -> &Path {
         &self.run_dir
@@ -474,6 +525,14 @@ fn redact_manifest(mut manifest: RunManifestV1) -> RunManifestV1 {
     manifest.repository_dirty_hash = manifest
         .repository_dirty_hash
         .map(|value| crate::redaction::redact_text(&value));
+    manifest.repository_branch = manifest
+        .repository_branch
+        .map(|value| crate::redaction::redact_text(&value));
+    manifest.repository_changed_files = manifest
+        .repository_changed_files
+        .into_iter()
+        .map(|value| crate::redaction::redact_text(&value))
+        .collect();
     manifest.recorder_policy = crate::redaction::redact_json(&manifest.recorder_policy);
     manifest.warnings = manifest
         .warnings
@@ -991,6 +1050,9 @@ mod tests {
             workspace_fingerprint: "workspace-sha256".to_string(),
             repository_head: None,
             repository_dirty_hash: None,
+            repository_branch: None,
+            repository_clean: None,
+            repository_changed_files: Vec::new(),
             recorder_policy: json!({"max_payload_bytes": 1024}),
             last_sequence: None,
             last_hash: None,
@@ -1673,5 +1735,88 @@ mod tests {
         assert_eq!(decoded[0].kind, "future_event_kind");
         assert_eq!(decoded[0].payload, json!({"future": {"value": 7}}));
         assert_eq!(super::verify_chain(&decoded), Ok(()));
+    }
+
+    #[test]
+    fn attach_git_checkpoint_populates_manifest_and_replayability() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let mut journal =
+            super::RunJournal::create_in(&runs_root, test_manifest("git-checkpoint-clean"))
+                .unwrap();
+
+        let checkpoint = crate::githarness::GitCheckpoint {
+            head: Some("abc123".to_string()),
+            branch: Some("main".to_string()),
+            clean: true,
+            dirty_patch_sha256: None,
+            changed_files: vec![],
+        };
+        journal.attach_git_checkpoint(&checkpoint).unwrap();
+
+        let manifest: super::RunManifestV1 = serde_json::from_slice(
+            &std::fs::read(runs_root.join("git-checkpoint-clean").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.repository_head.as_deref(), Some("abc123"));
+        assert_eq!(manifest.repository_branch.as_deref(), Some("main"));
+        assert_eq!(manifest.repository_clean, Some(true));
+        assert!(manifest.repository_dirty_hash.is_none());
+        assert!(manifest.repository_changed_files.is_empty());
+        assert_eq!(manifest.replayability, super::Replayability::Full);
+    }
+
+    #[test]
+    fn attach_git_checkpoint_dirty_tree_degrades_replayability() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let mut journal =
+            super::RunJournal::create_in(&runs_root, test_manifest("git-checkpoint-dirty"))
+                .unwrap();
+
+        let checkpoint = crate::githarness::GitCheckpoint {
+            head: Some("abc123".to_string()),
+            branch: Some("main".to_string()),
+            clean: false,
+            dirty_patch_sha256: Some("f".repeat(64)),
+            changed_files: vec!["src/lib.rs".to_string()],
+        };
+        journal.attach_git_checkpoint(&checkpoint).unwrap();
+
+        let manifest: super::RunManifestV1 = serde_json::from_slice(
+            &std::fs::read(runs_root.join("git-checkpoint-dirty").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.repository_clean, Some(false));
+        assert_eq!(
+            manifest.repository_dirty_hash.as_deref(),
+            Some("f".repeat(64).as_str())
+        );
+        assert_eq!(
+            manifest.repository_changed_files,
+            vec!["src/lib.rs".to_string()]
+        );
+        assert_eq!(manifest.replayability, super::Replayability::Degraded);
+    }
+
+    #[test]
+    fn attach_git_checkpoint_rejected_after_finalize() {
+        let home = tempfile::tempdir().unwrap();
+        let runs_root = home.path().join("runs");
+        let mut journal =
+            super::RunJournal::create_in(&runs_root, test_manifest("git-checkpoint-final"))
+                .unwrap();
+        journal
+            .finalize(super::RunStatus::Succeeded, 1_725_000_001_000)
+            .unwrap();
+
+        let checkpoint = crate::githarness::GitCheckpoint {
+            head: Some("abc123".to_string()),
+            branch: None,
+            clean: true,
+            dirty_patch_sha256: None,
+            changed_files: vec![],
+        };
+        assert!(journal.attach_git_checkpoint(&checkpoint).is_err());
     }
 }

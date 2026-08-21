@@ -609,6 +609,24 @@ impl KeruxAgent {
                 }
             }
         }
+
+        // Attach git checkpoint evidence to the run manifest. Best-effort:
+        // a missing git binary or a non-repo workspace just skips the
+        // checkpoint rather than failing the run.
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(harness) = crate::githarness::GitHarness::open(&cwd) {
+                match harness.checkpoint() {
+                    Ok(checkpoint) => {
+                        if let Err(error) = recorder.attach_git_checkpoint(&checkpoint) {
+                            warn!(error = %error, "Failed to attach git checkpoint; continuing");
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "Failed to capture git checkpoint; continuing");
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2102,6 +2120,9 @@ mod tests {
             workspace_fingerprint: "test-workspace".to_string(),
             repository_head: None,
             repository_dirty_hash: None,
+            repository_branch: None,
+            repository_clean: None,
+            repository_changed_files: vec![],
             recorder_policy: serde_json::json!({"max_payload_bytes": 1024}),
             last_sequence: None,
             last_hash: None,

@@ -18,6 +18,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 use crate::error::{Error, Result};
 
 /// A recorded pre-run repository state.
@@ -27,6 +29,34 @@ pub struct RepoSnapshot {
     pub head: Option<String>,
     /// Working-tree patch against HEAD (empty if the tree was clean).
     pub dirty_patch: String,
+}
+
+/// Reproducible repository identity for the flight recorder.
+///
+/// Captures HEAD, branch, clean/dirty status, a SHA-256 over any dirty patch,
+/// and the relative changed-file list. The raw dirty patch itself is
+/// deliberately NOT included — journal v1 records enough to *detect* that
+/// exact reconstruction is impossible, not the bytes to perform it.
+#[derive(Debug, Clone)]
+pub struct GitCheckpoint {
+    /// HEAD commit (`None` on an unborn branch).
+    pub head: Option<String>,
+    /// Current branch name (`None` when detached).
+    pub branch: Option<String>,
+    /// True when the working tree has no uncommitted changes.
+    pub clean: bool,
+    /// SHA-256 of the dirty patch against HEAD (`None` when clean).
+    pub dirty_patch_sha256: Option<String>,
+    /// Relative paths of changed files (staged + unstaged + untracked).
+    pub changed_files: Vec<String>,
+}
+
+impl GitCheckpoint {
+    /// True when the recorded identity is enough to reconstruct the exact
+    /// pre-run code state (a known HEAD and a clean tree).
+    pub fn reconstructable(&self) -> bool {
+        self.head.is_some() && self.clean
+    }
 }
 
 /// Transactional wrapper around a git working tree.
@@ -56,6 +86,56 @@ impl GitHarness {
     pub fn has_dirty_tracked_files(&self) -> Result<bool> {
         let status = self.run(&["status", "--porcelain", "--untracked-files=no"])?;
         Ok(!status.trim().is_empty())
+    }
+
+    /// Capture reproducible repository identity for the flight recorder.
+    ///
+    /// Records HEAD, branch, clean/dirty status, a SHA-256 over the dirty
+    /// patch, and the relative changed-file list. The raw dirty patch is
+    /// never persisted into the journal.
+    pub fn checkpoint(&self) -> Result<GitCheckpoint> {
+        let head = self
+            .run(&["rev-parse", "--verify", "HEAD"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        // Branch name; empty when detached HEAD.
+        let branch = self
+            .run(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        // Porcelain status includes untracked files (default).
+        let status = self.run(&["status", "--porcelain"])?;
+        let mut changed_files: Vec<String> = Vec::new();
+        for line in status.lines() {
+            // Porcelain v1: XY <space> path (path starts at byte 3).
+            if line.len() > 3 {
+                changed_files.push(line[3..].trim().to_string());
+            }
+        }
+        let clean = changed_files.is_empty();
+
+        // SHA-256 over the dirty patch (staged + unstaged) when dirty.
+        let dirty_patch_sha256 = if clean {
+            None
+        } else {
+            let mut patch = self.run(&["diff", "HEAD", "--binary"]).unwrap_or_default();
+            if patch.is_empty() {
+                patch = self.run(&["diff", "--binary"]).unwrap_or_default();
+            }
+            Some(format!("{:x}", Sha256::digest(patch.as_bytes())))
+        };
+
+        Ok(GitCheckpoint {
+            head,
+            branch,
+            clean,
+            dirty_patch_sha256,
+            changed_files,
+        })
     }
 
     /// Record HEAD + dirty patch. Fails if the tree already has uncommitted
@@ -395,6 +475,43 @@ mod tests {
         let harness = GitHarness::open(&dir).unwrap();
         let result = harness.commit_transaction("nothing to do").unwrap();
         assert!(result.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_clean_repo_is_reconstructable() {
+        let dir = init_repo();
+        let harness = GitHarness::open(&dir).unwrap();
+        let checkpoint = harness.checkpoint().unwrap();
+
+        assert!(checkpoint.head.is_some());
+        // Branch is either master or main depending on the git default.
+        let branch = checkpoint.branch.as_deref().unwrap();
+        assert!(branch == "master" || branch == "main", "got: {}", branch);
+        assert!(checkpoint.clean);
+        assert!(checkpoint.dirty_patch_sha256.is_none());
+        assert!(checkpoint.changed_files.is_empty());
+        assert!(checkpoint.reconstructable());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_dirty_repo_records_hash_and_changed_files() {
+        let dir = init_repo();
+        let harness = GitHarness::open(&dir).unwrap();
+
+        // Dirty a tracked file and add an untracked one.
+        std::fs::write(dir.join("base.txt"), "base\nmodified\n").unwrap();
+        std::fs::write(dir.join("scratch.txt"), "untracked\n").unwrap();
+
+        let checkpoint = harness.checkpoint().unwrap();
+        assert!(checkpoint.head.is_some());
+        assert!(!checkpoint.clean);
+        let hash = checkpoint.dirty_patch_sha256.as_deref().unwrap();
+        assert_eq!(hash.len(), 64, "sha256 hex must be 64 chars");
+        assert!(checkpoint.changed_files.iter().any(|f| f == "base.txt"));
+        assert!(checkpoint.changed_files.iter().any(|f| f == "scratch.txt"));
+        assert!(!checkpoint.reconstructable());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
