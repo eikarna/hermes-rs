@@ -39,3 +39,4 @@ hermes.toml
 
 # mdBook build output
 docs/book/
+run-smoke-1.capsule.html
