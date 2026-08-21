@@ -75,6 +75,27 @@ record_content = true
 record_reasoning = false
 failure_mode = "warn" # warn | fail
 
+# Deterministic project validators (Task 2.1). Disabled by default;
+# execution + evidence journaling land in Task 2.2.
+[validation]
+enabled = false
+fail_fast = false
+
+# Example validators (uncomment to enable):
+# [[validation.validators]]
+# name = "fmt"
+# command = "cargo fmt --all -- --check"
+# required = true
+# timeout_secs = 120
+#
+# [[validation.validators]]
+# name = "test"
+# command = "cargo test --workspace"
+# required = true
+# timeout_secs = 600
+# workdir = ""            # relative to workspace root; omit for root
+# output_cap_bytes = 16384
+
 [tui]
 theme = "opencode"
 rich_output = true

@@ -522,7 +522,7 @@ fn scrub_prefixes() -> Vec<String> {
         }
     }
     // Longest first so nested prefixes collapse in one pass.
-    prefixes.sort_by(|a, b| b.len().cmp(&a.len()));
+    prefixes.sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
     prefixes.dedup();
     prefixes.retain(|prefix| prefix.len() > 1);
     prefixes

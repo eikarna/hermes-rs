@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub autonomous: AutonomousSettings,
     pub logging: LoggingSettings,
     pub recorder: RecorderSettings,
+    pub validation: crate::validation::ValidationPolicy,
     pub tui: TuiSettings,
     pub telemetry: TelemetrySettings,
     pub mcp: McpSettings,
@@ -918,6 +919,21 @@ mod tests {
         assert!(config.recorder.record_content);
         assert!(!config.recorder.record_reasoning);
         assert_eq!(config.recorder.failure_mode, "warn");
+        // Validation section parses with documented defaults.
+        assert!(!config.validation.enabled);
+        assert!(!config.validation.fail_fast);
+        assert!(config.validation.validators.is_empty());
+        config.validation.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_defaults_are_compatible() {
+        // An existing config with no [validation] section keeps working.
+        let policy: crate::validation::ValidationPolicy = toml::from_str("").unwrap();
+        assert!(!policy.enabled);
+        assert!(policy.validators.is_empty());
+        assert!(!policy.fail_fast);
+        policy.validate().unwrap();
     }
 
     #[test]

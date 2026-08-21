@@ -66,6 +66,7 @@ pub mod session_store;
 pub mod skills;
 pub mod tools;
 pub mod trajectory;
+pub mod validation;
 
 pub use agent::{AgentConfig, AgentEvent, AgentTelemetry, KeruxAgent};
 pub use auth::{
