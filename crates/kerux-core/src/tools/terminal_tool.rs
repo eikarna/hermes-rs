@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -27,6 +28,18 @@ struct TerminalArgs {
     timeout: Option<u64>,
     max_output: Option<usize>,
     use_shell: Option<bool>,
+}
+
+/// Time still left before the command-level `deadline` is reached.
+///
+/// Every phase of command execution (stdout read, stderr read, final wait)
+/// draws from ONE shared deadline instead of getting a fresh timeout window.
+/// Returns `Duration::ZERO` once expired so `tokio::time::timeout` elapses
+/// immediately rather than re-arming the full cap for the next phase.
+fn remaining_budget(deadline: Instant) -> Duration {
+    deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or_default()
 }
 
 #[async_trait]
@@ -105,6 +118,12 @@ impl KeruxTool for TerminalTool {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Single wall-clock deadline for the WHOLE command: stdout read,
+        // stderr read, and final wait all draw from the same budget. The
+        // previous code re-armed the full `timeout` per phase, so a process
+        // that kept emitting output could run for unbounded wall time.
+        let deadline = Instant::now() + timeout;
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -121,7 +140,9 @@ impl KeruxTool for TerminalTool {
         // Read stdout
         if let Some(stdout) = stdout {
             let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Ok(Some(l))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            while let Ok(Ok(Some(l))) =
+                tokio::time::timeout(remaining_budget(deadline), reader.next_line()).await
+            {
                 if stdout_output.len() + l.len() < max_output {
                     stdout_output.push_str(&l);
                     stdout_output.push('\n');
@@ -139,7 +160,9 @@ impl KeruxTool for TerminalTool {
         // Read stderr
         if let Some(stderr) = stderr {
             let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Ok(Some(l))) = tokio::time::timeout(timeout, reader.next_line()).await {
+            while let Ok(Ok(Some(l))) =
+                tokio::time::timeout(remaining_budget(deadline), reader.next_line()).await
+            {
                 if stderr_output.len() + l.len() < max_output / 4 {
                     stderr_output.push_str(&l);
                     stderr_output.push('\n');
@@ -148,7 +171,7 @@ impl KeruxTool for TerminalTool {
         }
 
         // Wait for process to complete
-        let status = match tokio::time::timeout(timeout, child.wait()).await {
+        let status = match tokio::time::timeout(remaining_budget(deadline), child.wait()).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 return ToolResult::error("terminal", format!("Failed to wait for process: {}", e))
@@ -210,5 +233,68 @@ mod tests {
         let result = tool.execute(args, ToolContext::default()).await;
 
         assert!(result.success);
+    }
+
+    #[test]
+    fn test_remaining_budget_counts_down_to_zero() {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let first = remaining_budget(deadline);
+        assert!(first > Duration::ZERO);
+        assert!(first <= Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(80));
+        // Expired deadlines must yield ZERO, not panic or go negative,
+        // so later phases fail immediately instead of re-arming the cap.
+        assert_eq!(remaining_budget(deadline), Duration::ZERO);
+    }
+
+    /// Regression test for audit finding F1: the timeout window used to be
+    /// re-armed for every `next_line()`/`wait()`, so a process emitting one
+    /// line every 500ms kept the tool alive for unbounded wall time. The
+    /// whole command must now be killed near the single shared deadline.
+    ///
+    /// NOTE: against the pre-fix code this test never completes (the read
+    /// loops spin forever), which is exactly the reported bug.
+    #[tokio::test]
+    async fn test_timeout_bounds_endlessly_chatty_process() {
+        let tool = TerminalTool;
+        let command = if cfg!(windows) {
+            "powershell.exe -NoProfile -Command \"while ($true) { Write-Output tick; Start-Sleep -Milliseconds 500 }\""
+        } else {
+            "sh -c 'while true; do echo tick; sleep 0.5; done'"
+        };
+        let args = json!({
+            "command": command,
+            "timeout": 2,
+        });
+
+        let started = Instant::now();
+        let result = tool.execute(args, ToolContext::default()).await;
+        let elapsed = started.elapsed();
+
+        // The command must end via the shared-deadline timeout path...
+        assert!(
+            !result.success,
+            "chatty process finished successfully instead of being killed: {:?}",
+            result
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("timed out"),
+            "expected timeout error, got: {}",
+            err
+        );
+        // ...after genuinely running for a while (the loop emits ~4 lines
+        // before a 2s deadline), not dying instantly on spawn failure.
+        assert!(
+            elapsed >= Duration::from_millis(1500),
+            "killed too early after {:?}; process may never have started",
+            elapsed
+        );
+        // ...and near the configured cap, NOT running unbounded.
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "tool ran {:?} for a 2s cap — timeout still unbounded?",
+            elapsed
+        );
     }
 }
