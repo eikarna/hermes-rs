@@ -29,8 +29,15 @@
 - Optional LLM-assisted skill summarization (`skill_distill_llm_summary` + `curate_with_llm`) rewriting distilled draft skills as prose, and periodic mid-session curator passes via `[curator].interval_secs`
 - Skill approval flow: `[curator].auto_approve_skills = false` (default) routes distilled drafts to `<skills>/_pending/` where they stay unloadable until approved (`a` in the TUI Skills panel; `d` discards pending)
 - Trajectory compression: `[curator].compression_min_age_days` / `compression_max_importance` / `compression_min_count` fold old, low-importance, unpinned facts into one deterministic `session_summary` block per curator pass (no LLM; distilled/pinned facts exempt)
+- Flight recorder: hash-chained append-only run journals under `~/.kerux/runs/` with `[recorder]` bounded policy (`record_content`, `record_reasoning`, payload cap, `warn|fail` failure mode), git checkpoint evidence, and tool approval decisions — read-only inspection via `kerux runs list|inspect|verify`
+- Proof capsules: offline-verifiable, scrubbed HTML export of a recorded run (`f75c0e3`), with Windows-safe journal storage (per-file locking, staging-dir publish)
+- Deterministic project validators (`[validation]`, Task 2.1): declared command validators with `fail_fast` policy
+- Validator execution engine with journal evidence (Task 2.2): `run_validation_pass` executes declared validators workspace-confined (symlink-safe), with bounded/redacted output capture, per-spec timeout, fail-fast semantics, and every outcome journaled as validation evidence (CLI wiring pending)
+- Edit-protocol outcome metrics in the journal (Task 2.4): first-pass vs repaired edit attempts tracked per run
+- Static edit-format fallback ladder (Task 2.5): classified edit-application failures promote a one-way `search_replace → patch → full_file` hint ladder for the rest of the run; `[agent].edit_format_override` always wins
 
 ## Pending
 
-- [Release] Bump to `0.2.0` and tag for the next binary release once Phases 4–5 soak in (repo map + edit blocks + git harness + curator)
+- Runtime fallback provider chain promotion: `[[client.fallback]]` entries exist and are wired via `wrap_with_fallbacks()`, but remain opt-in/unadvertised pending soak testing
+- Webhook transport: `[gateway] webhooks_enabled` config field exists but no HTTP listener is implemented yet
 

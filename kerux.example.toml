@@ -81,7 +81,7 @@ record_reasoning = false
 failure_mode = "warn" # warn | fail
 
 # Deterministic project validators (Task 2.1). Disabled by default;
-# execution + evidence journaling land in Task 2.2.
+# execution + journal evidence live in the validation engine (Task 2.2).
 [validation]
 enabled = false
 fail_fast = false

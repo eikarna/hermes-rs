@@ -1,12 +1,35 @@
 # Development History
 
-**Last Updated:** 2026-08-20
-**Current Version:** v0.2.0 (main branch)
+**Last Updated:** 2026-08-22
+**Current Version:** v0.2.0 (main branch) + post-release hardening on `main`
 **Status:** ✅ Stable — all CI workflows green
 
 ---
 
 ## Timeline
+
+### Post-0.2.0 hardening (2026-08-20 → 2026-08-22)
+
+52 commits since the `v0.2.0` tag, still unreleased:
+
+**Gateway additions**
+- Discord adapter: REST-based (`/users/@me` token verification, `/channels/{id}/messages` send, message-create parsing) — `[gateway] discord_enabled`
+- Slack adapter: REST-based (`slack_api_base`, `send_message`, update parsing) — `[gateway] slack_enabled`
+- Webhook settings fields (`webhooks_enabled`, `webhooks_addr`) exist in config but no listener is implemented yet
+
+**Flight recorder & proof capsules (Tasks 1.x)**
+- Hash-chained append-only run journals with `[recorder]` bounded policy (`record_content`, `record_reasoning`, payload cap, `warn|fail` failure mode)
+- Git checkpoint evidence attached to runs; tool approval decisions journaled
+- Read-only `kerux runs list|inspect|verify` CLI
+- Offline-verifiable, scrubbed HTML proof capsule export
+- Windows storage fixes: per-event-file locking, staging-dir publish, no append-mode event files
+
+**Edit-protocol hardening (Tasks 2.x)**
+- Task 2.1: deterministic project validators (`[validation]` config, `[[validation.validators]]` specs)
+- Task 2.2: validator execution engine (`run_validation_pass`) — workspace-confined, symlink-safe, bounded/redacted output capture, fail-fast, outcomes journaled as evidence (CLI wiring pending)
+- Task 2.3: bounded repair policy (`[agent] max_repair_attempts`), first-pass vs repair outcome tracking
+- Task 2.4: edit-protocol outcome metrics journaled per run
+- Task 2.5: static edit-format fallback ladder — classified edit-application failures promote a one-way `search_replace → patch → full_file` hint; explicit `[agent] edit_format_override` always wins
 
 ### v0.2.0 — Gateway Era (2026-08-18 → 2026-08-20)
 
@@ -65,8 +88,8 @@ Also merged from contributors: Nous Portal OAuth for core (#49) and CLI (#50).
 
 ## Test & CI Status
 
-- **kerux-core:** 318 tests passing
-- **kerux-cli:** 105 tests passing
+- **kerux-core:** 424 tests passing
+- **kerux-cli:** 110 tests passing
 - **CI:** fmt, clippy (`-D warnings`), rustdoc (`-D warnings`), build, test, release, docs — all green on GitHub Actions
 
 ## Known Issues & Debt

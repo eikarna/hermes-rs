@@ -9,7 +9,7 @@
 
 <p align="center">
   <b>κῆρυξ — a fast, self-contained Rust agent for LLM-driven tool execution.</b><br>
-  Streaming-first ReAct loop · ratatui TUI · Telegram &amp; WhatsApp gateway · autonomous coding mode
+  Streaming-first ReAct loop · ratatui TUI · Telegram/WhatsApp/Discord/Slack gateway · autonomous coding mode
 </p>
 
 ---
@@ -20,7 +20,7 @@
 
 - **Streaming-first ReAct loop** — tool calls detected and executed incrementally from partial LLM output, with a tolerant XML parser and self-healing re-prompts on failure
 - **Ratatui TUI** — prompt-first landing screen, responsive workspace panes, reasoning rails, tool activity blocks, MCP/Skills/Behavior management
-- **Messaging gateway** (`kerux serve`) — Telegram long-polling + WhatsApp bridge, MarkdownV2 conversion, live status edits, SSE streaming replies, tool approval via inline keyboard, voice-note STT, cron scheduler, subagent delegation
+- **Messaging gateway** (`kerux serve`) — Telegram long-polling + WhatsApp bridge + Discord/Slack REST adapters, MarkdownV2 conversion, live status edits, SSE streaming replies, tool approval via inline keyboard, voice-note STT, cron scheduler, subagent delegation
 - **Autonomous coding mode** — 24/7 loop that reads `TODO.md`, validates with local tests, and only pushes after success
 - **Persistent state** — sessions, memory, todos, and cron jobs survive restarts (atomic JSON writes under `~/.kerux/`)
 - **Repo-map context** — tree-sitter symbols + personalized PageRank, token-budgeted into the system prompt
@@ -54,7 +54,7 @@ Full docs live at **[kerux.eikarna.dev](https://kerux.eikarna.dev/)** — built 
 | [Quickstart](https://kerux.eikarna.dev/quickstart.html) | Build, configure, first run |
 | [Configuration](https://kerux.eikarna.dev/configuration.html) | TOML schema, env vars, auth profiles |
 | [Architecture](https://kerux.eikarna.dev/architecture/overview.html) | Agent loop, streaming, tools |
-| [Gateway & Adapters](https://kerux.eikarna.dev/architecture/gateway.html) | Telegram & WhatsApp |
+| [Gateway & Adapters](https://kerux.eikarna.dev/architecture/gateway.html) | Telegram, WhatsApp, Discord & Slack |
 | [Features](https://kerux.eikarna.dev/features/tool-approval.html) | Approval, compaction, fallbacks, STT, cron, delegation |
 | [Roadmap](https://kerux.eikarna.dev/development/roadmap.html) | What's next |
 
@@ -64,7 +64,7 @@ Screenshots in this README and the docs are **generated automatically** by CI (`
 
 ```bash
 cargo build --workspace
-cargo test --workspace     # 423 tests
+cargo test --workspace     # 534 tests (424 core + 110 cli)
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 ```
 

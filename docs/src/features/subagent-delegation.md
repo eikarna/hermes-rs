@@ -21,11 +21,12 @@ The agent can delegate focused tasks to isolated child agents.
 ## Config
 
 ```toml
-[delegation]
-provider = "openai"        # optional: separate provider for children
-model = "gpt-4o-mini"      # optional: cheaper model for delegation
-max_concurrent = 3
+[tools.delegation]
+enabled = true           # default: the tool only costs tokens when called
+max_concurrent = 3       # shared semaphore across the process
 ```
+
+Children share the parent's configured provider and model — there is no separate delegation provider setting.
 
 ## Implementation
 

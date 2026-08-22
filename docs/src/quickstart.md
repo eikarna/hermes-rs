@@ -17,18 +17,21 @@ The binary lands at `target/release/kerux`.
 Copy the example config and fill in your provider:
 
 ```bash
-cp kerux.example.toml ~/.config/kerux/kerux.toml
+mkdir -p ~/.config/kerux
+cp kerux.example.toml ~/.config/kerux/config.toml
 ```
+
+Config lookup order: `--config <path>` flag first, then `./kerux.toml`, `./.kerux.toml`, and finally `~/.config/kerux/config.toml` (Unix) / `%APPDATA%\kerux\config.toml` (Windows).
 
 Minimal config:
 
 ```toml
 [client]
 provider = "openai"
-model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
 
-[client.auth]
-api_key_env = "OPENAI_API_KEY"
+[agent]
+model = "gpt-4o"
 ```
 
 Or use environment variables directly:
@@ -39,21 +42,23 @@ export KERUX_MODEL=gpt-4o
 export OPENAI_API_KEY=***
 ```
 
+API keys resolve from `[client] api_key`, the `OPENAI_API_KEY` environment variable, or an OAuth profile (`kerux auth login nous`, referenced via `[client] auth_ref`). Run `kerux --help` for CLI overrides (`--api-key`, `--base-url`, `--model`, ...).
+
 ## Run
 
 Interactive TUI:
 
 ```bash
-kerux
+kerux chat
 ```
 
 Single-shot:
 
 ```bash
-kerux run "explain this codebase"
+kerux run --query "explain this codebase"
 ```
 
-Gateway mode (Telegram + WhatsApp):
+Gateway mode (Telegram + WhatsApp + Discord + Slack):
 
 ```bash
 kerux serve
