@@ -134,10 +134,12 @@ impl GeminiClient {
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(Error::Agent(format!(
-                "Gemini request failed ({}): {}",
-                status, body
-            )));
+            // Typed variant so fallback/retry classifiers can branch on the
+            // status instead of parsing formatted strings.
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body,
+            });
         }
         Self::parse_response(&body, model)
     }
@@ -267,10 +269,12 @@ impl GeminiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await?;
-            return Err(Error::Agent(format!(
-                "Gemini streaming request failed ({}): {}",
-                status, body
-            )));
+            // Same typed variant as non-streaming: 429/5xx must be visible
+            // to the fallback classifier without string sniffing.
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body,
+            });
         }
         // Gemini's SSE frames contain the same JSON as generateContent; the
         // shared SSE parser only understands OpenAI chunks, so wrap the raw
@@ -445,6 +449,8 @@ impl LLMProvider for GeminiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::FallbackChainProvider;
+    use std::time::Duration;
 
     fn tool_schema() -> ToolSchema {
         ToolSchema::new("get_weather", "Get weather", json!({"type": "object"}))
@@ -519,5 +525,141 @@ mod tests {
         assert_eq!(caps.max_output_tokens, 65_536);
         assert_eq!(caps.edit_format, EditFormat::SearchReplace);
         assert!(caps.supports_reasoning);
+    }
+
+    // -- HTTP error typing (fallback integration) ---------------------------
+
+    fn test_client(url: String) -> GeminiClient {
+        GeminiClient::new(ClientConfig {
+            base_url: url,
+            api_key: Some("test-key-redacted".into()),
+            timeout: Duration::from_secs(5),
+            max_context_length: 128_000,
+        })
+        .unwrap()
+    }
+
+    fn messages() -> Vec<Message> {
+        vec![Message::user("hi")]
+    }
+
+    /// 429 must surface as typed `Error::Http` and be classified
+    /// fallback-worthy so the chain retries the next provider.
+    #[tokio::test]
+    async fn chat_rate_limit_is_typed_and_fallback_worthy() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/models/.*generateContent".into()),
+            )
+            .with_status(429)
+            .with_body(r#"{"error":{"code":429,"message":"quota exceeded"}}"#)
+            .create_async()
+            .await;
+
+        let client = test_client(server.url());
+        let err = client
+            .chat("gemini-2.5-flash", &messages(), None)
+            .await
+            .unwrap_err();
+
+        match &err {
+            Error::Http { status, body } => {
+                assert_eq!(*status, 429);
+                assert!(body.contains("quota"));
+            }
+            other => panic!("expected Error::Http, got: {other:?}"),
+        }
+        assert!(FallbackChainProvider::is_fallback_worthy(&err));
+    }
+
+    /// Streaming 5xx must also be typed so an upstream outage triggers
+    /// fallback instead of bubbling as an opaque agent error.
+    #[tokio::test]
+    async fn chat_streaming_server_error_is_typed_and_fallback_worthy() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/models/.*streamGenerateContent".into()),
+            )
+            .with_status(503)
+            .with_body("upstream unavailable")
+            .create_async()
+            .await;
+
+        let client = test_client(server.url());
+        // No unwrap_err(): ChatStreamResponse doesn't implement Debug.
+        let err = match client
+            .chat_streaming("gemini-2.5-flash", &messages(), None)
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("expected chat_streaming to fail with 503"),
+        };
+
+        match &err {
+            Error::Http { status, body } => {
+                assert_eq!(*status, 503);
+                assert!(body.contains("upstream"));
+            }
+            other => panic!("expected Error::Http, got: {other:?}"),
+        }
+        assert!(FallbackChainProvider::is_fallback_worthy(&err));
+    }
+
+    /// Deterministic failures stay non-fallback-worthy: a bad key would
+    /// fail identically on every provider, so the chain returns it as-is.
+    #[tokio::test]
+    async fn chat_auth_error_is_not_fallback_worthy() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/models/.*generateContent".into()),
+            )
+            .with_status(401)
+            .with_body(r#"{"error":{"code":401,"message":"invalid key"}}"#)
+            .create_async()
+            .await;
+
+        let client = test_client(server.url());
+        let err = client
+            .chat("gemini-2.5-flash", &messages(), None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Http { status: 401, .. }));
+        assert!(!FallbackChainProvider::is_fallback_worthy(&err));
+    }
+
+    /// Happy path unchanged by the error-typing refactor.
+    #[tokio::test]
+    async fn chat_success_parses_gemini_response() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", mockito::Matcher::Regex(r"/models/.*generateContent".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "candidates": [{
+                        "finishReason": "STOP",
+                        "content": {"parts": [{"text": "pong"}]}
+                    }],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = test_client(server.url());
+        let resp = client
+            .chat("gemini-2.5-flash", &messages(), None)
+            .await
+            .unwrap();
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("pong"));
+        assert_eq!(resp.usage.total_tokens, 2);
     }
 }

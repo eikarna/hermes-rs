@@ -5,7 +5,6 @@
 
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // 1. Shell detection
@@ -81,26 +80,83 @@ fn detect_shell_unix() -> ShellInfo {
     }
 }
 
-/// Returns `true` if `cmd` can be invoked (very cheap check via `--version`
-/// or `/C ver` on Windows).
+/// Check whether a command is available for execution.
+///
+/// Implemented as a direct PATH scan instead of spawning the candidate
+/// binary with `--version`: fork+exec per probe is orders of magnitude
+/// slower than a stat loop, and an arbitrary candidate could hang or have
+/// side effects. Mirrors the implementation in `skills.rs`.
 fn command_exists(cmd: &str) -> bool {
+    use std::path::Path;
+
+    // Absolute or relative paths are checked as-is, mirroring how exec
+    // would resolve them.
+    if cmd.contains('/') || cmd.contains('\\') {
+        return is_executable_file(Path::new(cmd));
+    }
+
+    let path_var = match env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+
+    #[cfg(target_os = "windows")]
+    let candidates: Vec<String> = {
+        // Windows resolves bare names against PATHEXT (.exe, .bat, ...);
+        // a name that already carries an extension is tried verbatim.
+        let exts: Vec<String> = env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_ascii_lowercase())
+            .collect();
+        let has_ext = Path::new(cmd)
+            .extension()
+            .map(|e| {
+                let e = format!(".{}", e.to_string_lossy().to_ascii_lowercase());
+                exts.iter().any(|x| x == &e)
+            })
+            .unwrap_or(false);
+        if has_ext {
+            vec![cmd.to_string()]
+        } else {
+            exts.iter().map(|e| format!("{}{}", cmd, e)).collect()
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let candidates: Vec<String> = vec![cmd.to_string()];
+
+    for dir in env::split_paths(&path_var) {
+        for cand in &candidates {
+            if is_executable_file(&dir.join(cand)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when `path` is an existing regular file with an execute bit set
+/// (Unix). On Windows mere existence is enough — execute permission is
+/// not a filesystem property there.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !meta.is_file() {
+        return false;
+    }
     #[cfg(target_os = "windows")]
     {
-        Command::new(cmd)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
+        true
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Command::new(cmd)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
+        meta.permissions().mode() & 0o111 != 0
     }
 }
 
@@ -215,15 +271,13 @@ pub fn find_rustc() -> Option<PathBuf> {
     None
 }
 
-/// Returns `true` when `cmd --version` exits successfully.
+/// Returns `true` when an executable `cmd` exists on PATH.
+///
+/// Direct filesystem probe instead of spawning `cmd --version`: a
+/// version banner from an arbitrary binary can be arbitrarily slow (or
+/// interactive), and this runs inside async tool execution paths.
 fn interpreter_works(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    command_exists(cmd)
 }
 
 // ---------------------------------------------------------------------------
