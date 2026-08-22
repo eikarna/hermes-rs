@@ -531,6 +531,10 @@ fn scrub_prefixes() -> Vec<String> {
 fn scrub_text(text: &str, prefixes: &[String]) -> String {
     let mut out = text.to_string();
     for prefix in prefixes {
+        let escaped_prefix = prefix.replace('\\', "\\\\");
+        if escaped_prefix != *prefix && out.contains(&escaped_prefix) {
+            out = out.replace(&escaped_prefix, PATH_REDACTED);
+        }
         if out.contains(prefix) {
             out = out.replace(prefix.as_str(), PATH_REDACTED);
         }
@@ -599,6 +603,16 @@ mod tests {
         journal
             .finalize(RunStatus::Succeeded, 1_725_000_000_300)
             .unwrap();
+    }
+
+    #[test]
+    fn scrub_text_redacts_json_escaped_windows_prefix() {
+        let prefix = r"C:\Users\alice";
+        let text = r#"{"path":"C:\\Users\\alice\\secret-project\\main.rs"}"#;
+
+        let scrubbed = scrub_text(text, &[prefix.to_string()]);
+
+        assert_eq!(scrubbed, r#"{"path":"~\\secret-project\\main.rs"}"#);
     }
 
     #[test]
