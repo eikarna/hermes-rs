@@ -23,6 +23,12 @@ pub enum Error {
     #[error("Missing API key")]
     MissingApiKey,
 
+    /// Non-success HTTP response from a provider endpoint. Typed so
+    /// downstream classifiers (retry, self-healing, fallback chain) can
+    /// branch on the status code instead of parsing formatted strings.
+    #[error("HTTP {status}: {body}")]
+    Http { status: u16, body: String },
+
     // ========== Streaming Errors ==========
     #[error("SSE parse error at position {position}: {message}")]
     SseParse { position: usize, message: String },
@@ -100,13 +106,19 @@ pub enum Error {
 impl Error {
     /// Returns whether this error indicates a transient failure that might succeed on retry
     pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Error::Network(_)
-                | Error::IncompleteSseMessage
-                | Error::ToolTimeout { .. }
-                | Error::IncompleteXml { .. }
-        )
+            | Error::IncompleteSseMessage
+            | Error::ToolTimeout { .. }
+            | Error::IncompleteXml { .. } => return true,
+            // Rate limits (429) and upstream outages (5xx) are transient;
+            // other HTTP statuses (4xx client errors) are not.
+            Error::Http { status, .. } => {
+                return *status == 429 || (500..600).contains(status);
+            }
+            _ => {}
+        }
+        false
     }
 
     /// Returns whether this error should trigger self-healing (re-prompt the LLM)

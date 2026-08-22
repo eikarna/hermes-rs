@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::{BoxFuture, Future};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, RwLock};
@@ -676,47 +677,73 @@ impl KeruxAgent {
         }
     }
 
-    fn start_recording(&self) -> Result<()> {
+    fn start_recording(&self) -> BoxFuture<'_, Result<()>> {
         // Fresh run: forget per-path repair counters from any previous run so
         // `repair_count` never leaks across runs.
         crate::lock_sync(&self.edit_metrics).reset();
 
         let recorder = crate::lock_sync(&self.run_recorder).clone();
         let Some(recorder) = recorder else {
-            return Ok(());
+            return Box::pin(futures::future::ready(Ok(())));
         };
 
-        if let Err(error) =
-            recorder.record(unix_timestamp_ms(), "run_started", serde_json::json!({}))
-        {
-            match recorder.failure_mode() {
-                crate::run_journal::RecorderFailureMode::Warn => {
-                    warn!(error = %error, "Run recorder start failed; continuing in warn mode");
-                }
-                crate::run_journal::RecorderFailureMode::Fail => {
-                    return Err(Error::Agent(format!("run recorder start failed: {error}")));
+        let record_result =
+            recorder.record(unix_timestamp_ms(), "run_started", serde_json::json!({}));
+        let failure_mode = recorder.failure_mode();
+        let checkpoint_fut = Self::capture_start_checkpoint(recorder);
+        Box::pin(async move {
+            if let Err(error) = record_result {
+                match failure_mode {
+                    crate::run_journal::RecorderFailureMode::Warn => {
+                        warn!(error = %error, "Run recorder start failed; continuing in warn mode");
+                    }
+                    crate::run_journal::RecorderFailureMode::Fail => {
+                        return Err(Error::Agent(format!("run recorder start failed: {error}")));
+                    }
                 }
             }
-        }
+            checkpoint_fut.await;
+            Ok(())
+        })
+    }
 
-        // Attach git checkpoint evidence to the run manifest. Best-effort:
-        // a missing git binary or a non-repo workspace just skips the
-        // checkpoint rather than failing the run.
-        if let Ok(cwd) = std::env::current_dir() {
-            if let Ok(harness) = crate::githarness::GitHarness::open(&cwd) {
-                match harness.checkpoint() {
-                    Ok(checkpoint) => {
-                        if let Err(error) = recorder.attach_git_checkpoint(&checkpoint) {
-                            warn!(error = %error, "Failed to attach git checkpoint; continuing");
-                        }
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "Failed to capture git checkpoint; continuing");
-                    }
+    /// Attach git checkpoint evidence to the run manifest. Best-effort:
+    /// a missing git binary or a non-repo workspace just skips the
+    /// checkpoint rather than failing the run.
+    ///
+    /// The git plumbing shells out (`git status` walks the whole tree), so
+    /// it runs on the blocking pool — never inside the async executor,
+    /// where a large/slow repo would stall other timers and streams.
+    fn capture_start_checkpoint(
+        recorder: Arc<crate::run_journal::RunRecorder>,
+    ) -> impl Future<Output = ()> + Send {
+        Box::pin(async move {
+            let dir = match std::env::current_dir() {
+                Ok(d) => d,
+                Err(error) => {
+                    warn!(error = %error, "Cannot resolve cwd for git checkpoint; continuing");
+                    return;
                 }
+            };
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::githarness::GitHarness::open(&dir).and_then(|h| h.checkpoint())
+            })
+            .await;
+            let checkpoint = match outcome {
+                Ok(Ok(cp)) => cp,
+                Ok(Err(error)) => {
+                    warn!(error = %error, "Failed to capture git checkpoint; continuing");
+                    return;
+                }
+                Err(join_error) => {
+                    warn!(error = %join_error, "Git checkpoint task panicked; continuing");
+                    return;
+                }
+            };
+            if let Err(error) = recorder.attach_git_checkpoint(&checkpoint) {
+                warn!(error = %error, "Failed to attach git checkpoint; continuing");
             }
-        }
-        Ok(())
+        })
     }
 
     /// Add a message to the conversation history
@@ -915,7 +942,7 @@ impl KeruxAgent {
         user_query: String,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Message> {
-        self.start_recording()?;
+        self.start_recording().await?;
         let result = self.run_inner(user_query, cancel).await;
         self.finish_run_result(&result)?;
         result
@@ -1711,7 +1738,7 @@ impl KeruxAgent {
 
     /// Run agent and handle self-healing on tool errors
     pub async fn run_with_healing(&self, user_query: String) -> Result<Message> {
-        self.start_recording()?;
+        self.start_recording().await?;
         self.cancel_flag
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let cancel = self.cancel_flag();
