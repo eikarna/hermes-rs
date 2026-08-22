@@ -450,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn failing_required_validator_fails_the_pass_windows() {
         let ws = tempfile::tempdir().unwrap();
-        let p = policy(vec![spec("fail-cmd", win_args("exit 3"))]);
+        let p = policy(vec![spec("fail-cmd", &win_args("exit 3"))]);
         let result = run_validation_pass(&p, ws.path(), None).await.unwrap();
         assert!(!result.passed);
         assert_eq!(result.results[0].outcome, ValidatorOutcome::Failed);

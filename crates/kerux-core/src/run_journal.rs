@@ -1109,7 +1109,7 @@ struct HashMaterial<'a> {
     previous_hash: &'a Option<String>,
 }
 
-/// The canonical JSON bytes that [`calculate_hash`] digests for one event.
+/// The canonical JSON bytes that `calculate_hash` digests for one event.
 ///
 /// Exposed so export formats (such as proof capsules) can embed the exact
 /// hashed material, letting offline verifiers re-check event hashes without
