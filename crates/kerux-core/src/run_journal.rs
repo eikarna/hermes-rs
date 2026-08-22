@@ -199,6 +199,13 @@ pub struct RunJournal {
     event_file: std::fs::File,
 }
 
+impl Drop for RunJournal {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unlock_event_file(&self.event_file);
+    }
+}
+
 impl RunJournal {
     /// Create a run under `$KERUX_HOME/runs/<run_id>`.
     pub fn create(manifest: RunManifestV1) -> Result<Self, JournalError> {
@@ -862,6 +869,20 @@ fn lock_event_file(file: &std::fs::File) -> Result<(), JournalError> {
     } else {
         Err(error.into())
     }
+}
+
+#[cfg(unix)]
+fn unlock_event_file(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+
+    const LOCK_UNLOCK: std::ffi::c_int = 8;
+
+    unsafe extern "C" {
+        fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    // SAFETY: `file` owns a valid descriptor until this `Drop` call returns.
+    let _ = unsafe { flock(file.as_raw_fd(), LOCK_UNLOCK) };
 }
 
 #[cfg(target_os = "windows")]
