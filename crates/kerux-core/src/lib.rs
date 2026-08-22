@@ -61,6 +61,7 @@ pub mod redaction;
 pub mod repomap;
 pub mod edit_metrics;
 pub mod run_journal;
+pub mod validators;
 pub mod scheduler;
 pub mod schema;
 pub mod session_store;
