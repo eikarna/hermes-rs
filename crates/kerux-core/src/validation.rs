@@ -97,7 +97,10 @@ impl ValidatorSpec {
         }
         if let Some(workdir) = &self.workdir {
             let path = Path::new(workdir);
-            if path.is_absolute() {
+            if path
+                .components()
+                .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+            {
                 return Err(Error::Config(format!(
                     "validator '{}' workdir must be relative to the workspace",
                     self.name
