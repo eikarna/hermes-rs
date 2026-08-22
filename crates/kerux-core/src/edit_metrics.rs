@@ -52,6 +52,46 @@ impl EditFormat {
             Self::FullFile => "full_file",
         }
     }
+
+    /// Convert into the client-layer capability enum (same three variants).
+    pub fn into_client(self) -> crate::client::EditFormat {
+        match self {
+            Self::SearchReplace => crate::client::EditFormat::SearchReplace,
+            Self::Patch => crate::client::EditFormat::Patch,
+            Self::FullFile => crate::client::EditFormat::FullFile,
+        }
+    }
+}
+
+/// Task 2.5: static, tested fallback order between edit protocols.
+///
+/// After a *classified* edit-application failure (the edit tool ran and
+/// reported it could not apply the edit), the agent may retry with the next
+/// protocol in this ladder. Semantic test failures never trigger fallback,
+/// and learned/sample-driven routing is deliberately out of scope until
+/// enough local outcomes accumulate.
+pub struct EditFormatFallback;
+
+impl EditFormatFallback {
+    /// Next format to try after `current` failed to apply. `None` means the
+    /// ladder is exhausted (a whole-file rewrite is the terminal rung: it
+    /// always applies by construction).
+    pub fn next_after(current: EditFormat) -> Option<EditFormat> {
+        match current {
+            EditFormat::SearchReplace => Some(EditFormat::Patch),
+            EditFormat::Patch => Some(EditFormat::FullFile),
+            EditFormat::FullFile => None,
+        }
+    }
+
+    /// Position of a format on the ladder; higher = stronger fallback.
+    pub fn rank(format: EditFormat) -> u8 {
+        match format {
+            EditFormat::SearchReplace => 0,
+            EditFormat::Patch => 1,
+            EditFormat::FullFile => 2,
+        }
+    }
 }
 
 /// How the model's search pattern was matched in the target file.
@@ -147,6 +187,9 @@ pub struct EditMetricsTracker {
     /// Attempt 1 is the first generation; higher values are evidence-fed
     /// repair attempts driven by the outer self-healing loop.
     run_attempt: u64,
+    /// Task 2.5 one-way fallback hint promoted by classified edit failures.
+    /// `None` keeps capability-table routing for the current model.
+    format_hint: Option<EditFormat>,
 }
 
 impl EditMetricsTracker {
@@ -217,12 +260,40 @@ impl EditMetricsTracker {
         (prior, pass_kind, repair_allowed)
     }
 
+    /// Task 2.5: after a *classified* edit-application failure on `failed`
+    /// format for `path`, promote the fallback hint to the next ladder rung.
+    ///
+    /// Classification mirrors the journaling rule in the agent: apply
+    /// failures and parse failures that stopped the edit before execution
+    /// qualify; cancels/denials/timeouts and successful edits do not.
+    /// One-way: an existing stronger hint always wins, so a later
+    /// lower-protocol failure never demotes routing mid-run.
+    ///
+    /// `path` is accepted for call-site symmetry and future per-path
+    /// routing; the current ladder is run-global by design.
+    pub fn record_fallback(&mut self, _path: &str, failed: EditFormat) {
+        if let Some(next) = EditFormatFallback::next_after(failed) {
+            let promote = self.format_hint.is_none_or(|current| {
+                EditFormatFallback::rank(current) < EditFormatFallback::rank(next)
+            });
+            if promote {
+                self.format_hint = Some(next);
+            }
+        }
+    }
+
+    /// Current fallback hint (`None` = keep capability-table routing).
+    pub fn format_hint(&self) -> Option<EditFormat> {
+        self.format_hint
+    }
+
     /// Forget all counters. Called when a recorded run starts so counts
     /// never leak across runs.
     pub fn reset(&mut self) {
         self.repairs.clear();
         self.exhausted.clear();
         self.run_attempt = 0;
+        self.format_hint = None;
     }
 }
 
@@ -396,6 +467,45 @@ mod tests {
         let mut zero = EditMetricsTracker::with_repair_budget(0);
         let (_, _, allowed) = zero.observe("z.py", true);
         assert!(!allowed); // zero budget: the first failure already exhausts
+    }
+
+    #[test]
+    fn fallback_ladder_is_static() {
+        assert_eq!(
+            EditFormatFallback::next_after(EditFormat::SearchReplace),
+            Some(EditFormat::Patch)
+        );
+        assert_eq!(
+            EditFormatFallback::next_after(EditFormat::Patch),
+            Some(EditFormat::FullFile)
+        );
+        assert_eq!(EditFormatFallback::next_after(EditFormat::FullFile), None);
+        assert!(
+            EditFormatFallback::rank(EditFormat::SearchReplace)
+                < EditFormatFallback::rank(EditFormat::Patch)
+        );
+        assert!(
+            EditFormatFallback::rank(EditFormat::Patch)
+                < EditFormatFallback::rank(EditFormat::FullFile)
+        );
+    }
+
+    #[test]
+    fn fallback_hint_promotes_one_way_and_never_leaks_across_runs() {
+        let mut state = EditMetricsTracker::new();
+        assert_eq!(state.format_hint(), None);
+        state.record_fallback("a.rs", EditFormat::SearchReplace);
+        assert_eq!(state.format_hint(), Some(EditFormat::Patch));
+        state.record_fallback("b.rs", EditFormat::Patch);
+        assert_eq!(state.format_hint(), Some(EditFormat::FullFile));
+        // Weaker protocols never demote an existing stronger hint...
+        state.record_fallback("c.rs", EditFormat::SearchReplace);
+        assert_eq!(state.format_hint(), Some(EditFormat::FullFile));
+        // ...and the terminal rung leaves the hint unchanged.
+        state.record_fallback("d.rs", EditFormat::FullFile);
+        assert_eq!(state.format_hint(), Some(EditFormat::FullFile));
+        state.reset();
+        assert_eq!(state.format_hint(), None);
     }
 
     #[test]

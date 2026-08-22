@@ -93,10 +93,7 @@ fn confined_workdir(spec: &ValidatorSpec, workspace: &Path) -> Result<PathBuf, S
             (joined.canonicalize(), workspace.canonicalize())
         {
             if !canonical_dir.starts_with(&canonical_ws) {
-                return Err(format!(
-                    "workdir {:?} escapes the workspace",
-                    spec.workdir
-                ));
+                return Err(format!("workdir {:?} escapes the workspace", spec.workdir));
             }
         }
     }
@@ -147,9 +144,7 @@ async fn run_validator(spec: &ValidatorSpec, workspace: &Path) -> ValidatorResul
     if !program_allowed(program) {
         return spawn_error_result(
             &spec.name,
-            format!(
-                "program {program:?} is not a bare name; path separators are not allowed"
-            ),
+            format!("program {program:?} is not a bare name; path separators are not allowed"),
         );
     }
 
@@ -338,8 +333,10 @@ pub async fn run_validation_pass(
                 passed = false;
             }
             if policy.fail_fast && spec.required {
-                stopped_reason =
-                    Some(format!("required validator '{}' failed (fail_fast)", spec.name));
+                stopped_reason = Some(format!(
+                    "required validator '{}' failed (fail_fast)",
+                    spec.name
+                ));
             }
         }
 

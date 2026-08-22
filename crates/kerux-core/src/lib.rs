@@ -49,6 +49,7 @@ pub mod context;
 pub mod context_files;
 pub mod curator;
 pub mod distillation;
+pub mod edit_metrics;
 pub mod error;
 pub mod gateway;
 pub mod githarness;
@@ -59,9 +60,7 @@ pub mod persist;
 pub mod platform;
 pub mod redaction;
 pub mod repomap;
-pub mod edit_metrics;
 pub mod run_journal;
-pub mod validators;
 pub mod scheduler;
 pub mod schema;
 pub mod session_store;
@@ -69,6 +68,7 @@ pub mod skills;
 pub mod tools;
 pub mod trajectory;
 pub mod validation;
+pub mod validators;
 
 pub use agent::{AgentConfig, AgentEvent, AgentTelemetry, KeruxAgent};
 pub use auth::{

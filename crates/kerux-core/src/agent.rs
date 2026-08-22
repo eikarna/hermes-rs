@@ -589,15 +589,22 @@ impl KeruxAgent {
         let failed = matches!(outcome, crate::edit_metrics::EditApplyStatus::Failed)
             || (matches!(outcome, crate::edit_metrics::EditApplyStatus::Skipped)
                 && parse_status == "failed");
+        // Task 2.5: a *classified* edit-application failure promotes the
+        // one-way static fallback ladder so the next iteration prompts for a
+        // stronger protocol. Measurement stays passive; only routing moves.
+        if failed {
+            if let Some(failed_path) = path.as_deref() {
+                self.edit_metrics
+                    .lock()
+                    .map(|mut t| t.record_fallback(failed_path, format))
+                    .ok();
+            }
+        }
         let (repair_count, pass_kind, repair_allowed) = self
             .edit_metrics
             .lock()
             .map(|mut t| t.observe(path.as_deref().unwrap_or(""), failed))
-            .unwrap_or((
-                0,
-                crate::edit_metrics::EditPassKind::FirstPass,
-                true,
-            ));
+            .unwrap_or((0, crate::edit_metrics::EditPassKind::FirstPass, true));
         let run_attempt = self
             .edit_metrics
             .lock()
@@ -621,6 +628,12 @@ impl KeruxAgent {
             "call_id": call_id,
             "tool_name": tool_name,
             "format": format.as_str(),
+            "effective_format": self
+                .edit_metrics
+                .lock()
+                .ok()
+                .and_then(|t| t.format_hint())
+                .map(|h| h.as_str()),
             "path": path,
             "parse_status": parse_status,
             "apply_status": outcome,
@@ -1165,9 +1178,19 @@ impl KeruxAgent {
             }
         }
 
+        // Task 2.5: routing precedence is explicit override > run fallback
+        // hint (learned from this run's classified failures) > capability
+        // table. The hint is one-way and never demotes mid-run.
         let edit_format = self
             .config
             .edit_format_override
+            .or_else(|| {
+                self.edit_metrics
+                    .lock()
+                    .ok()
+                    .and_then(|t| t.format_hint())
+                    .map(crate::edit_metrics::EditFormat::into_client)
+            })
             .unwrap_or_else(|| self.client.capabilities(&self.config.model).edit_format);
         match edit_format {
             crate::client::EditFormat::SearchReplace => system_prompt.push_str(
@@ -3715,7 +3738,10 @@ mod tests {
         let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
 
         let registry = ToolRegistry::new(Duration::from_secs(1));
-        registry.register(crate::tools::EditBlockTool).await.unwrap();
+        registry
+            .register(crate::tools::EditBlockTool)
+            .await
+            .unwrap();
         let agent = KeruxAgent::new(
             AgentConfig::default(),
             OpenAIClient::new(crate::client::ClientConfig::default()),
@@ -3744,10 +3770,7 @@ mod tests {
         assert!(results[0].success, "edit should apply: {:?}", results[0]);
 
         let events = recorder.events().unwrap();
-        let edit_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.kind == "edit_outcome")
-            .collect();
+        let edit_events: Vec<_> = events.iter().filter(|e| e.kind == "edit_outcome").collect();
         assert_eq!(edit_events.len(), 1);
         let payload = decode_event_payload(edit_events[0]);
         assert_eq!(payload["call_id"], "call-edit-1");
@@ -3781,7 +3804,10 @@ mod tests {
         let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
 
         let registry = ToolRegistry::new(Duration::from_secs(1));
-        registry.register(crate::tools::EditBlockTool).await.unwrap();
+        registry
+            .register(crate::tools::EditBlockTool)
+            .await
+            .unwrap();
         let agent = KeruxAgent::new(
             AgentConfig::default(),
             OpenAIClient::new(crate::client::ClientConfig::default()),
@@ -3830,10 +3856,7 @@ mod tests {
         assert!(results[2].success);
 
         let events = recorder.events().unwrap();
-        let edit_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.kind == "edit_outcome")
-            .collect();
+        let edit_events: Vec<_> = events.iter().filter(|e| e.kind == "edit_outcome").collect();
         assert_eq!(edit_events.len(), 3);
 
         let first = decode_event_payload(edit_events[0]);
@@ -3871,7 +3894,10 @@ mod tests {
             ..Default::default()
         };
         let registry = ToolRegistry::new(Duration::from_secs(1));
-        registry.register(crate::tools::EditBlockTool).await.unwrap();
+        registry
+            .register(crate::tools::EditBlockTool)
+            .await
+            .unwrap();
         let agent = KeruxAgent::new(
             config,
             OpenAIClient::new(crate::client::ClientConfig::default()),
@@ -3918,10 +3944,7 @@ mod tests {
             .unwrap();
 
         let events = recorder.events().unwrap();
-        let edit_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.kind == "edit_outcome")
-            .collect();
+        let edit_events: Vec<_> = events.iter().filter(|e| e.kind == "edit_outcome").collect();
         assert_eq!(edit_events.len(), 3);
 
         let first = decode_event_payload(edit_events[0]);
@@ -3938,6 +3961,137 @@ mod tests {
         assert_eq!(third["pass_kind"], "repair_pass");
         assert_eq!(third["repair_count"], 1);
         assert_eq!(third["repair_allowed"], false);
+    }
+
+    #[tokio::test]
+    async fn classified_edit_failure_promotes_fallback_hint() {
+        use crate::edit_metrics::EditFormat as MetricsFormat;
+
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("app.py");
+        std::fs::write(&target, "value = 1\n").unwrap();
+
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("edit-fallback-promote"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        registry
+            .register(crate::tools::EditBlockTool)
+            .await
+            .unwrap();
+        let agent = KeruxAgent::new(
+            AgentConfig::default(), // unknown model → FullFile base routing
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            registry,
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let miss = serde_json::json!({
+            "path": target.to_string_lossy(),
+            "edits": [{"search": "text that is not in the file", "replace": "x"}]
+        })
+        .to_string();
+
+        // A classified edit-application failure must promote the run's
+        // one-way fallback hint (search_replace → patch) ...
+        let results = agent
+            .execute_tools(
+                vec![ToolCall {
+                    id: "call-fb-1".to_string(),
+                    function: crate::client::ToolCallFunction {
+                        name: "edit_block".to_string(),
+                        arguments: miss,
+                    },
+                }],
+                &no_cancel,
+            )
+            .await
+            .unwrap();
+        assert!(!results[0].success);
+        assert_eq!(
+            agent.edit_metrics.lock().unwrap().format_hint(),
+            Some(MetricsFormat::Patch)
+        );
+
+        // ... and build_messages must now route the stronger protocol.
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .iter()
+            .find(|m| matches!(m.role, crate::client::Role::System))
+            .unwrap();
+        assert!(
+            system.content.contains("prefers targeted patches"),
+            "expected patch routing after fallback promotion, got: {}",
+            system.content
+        );
+
+        let events = recorder.events().unwrap();
+        let edit_events: Vec<_> = events.iter().filter(|e| e.kind == "edit_outcome").collect();
+        assert_eq!(edit_events.len(), 1);
+        let payload = decode_event_payload(edit_events[0]);
+        assert_eq!(payload["effective_format"], "patch");
+    }
+
+    #[tokio::test]
+    async fn fallback_hint_never_demotes_and_override_wins() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("app.py");
+        std::fs::write(&target, "value = 1\n").unwrap();
+
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        registry
+            .register(crate::tools::EditBlockTool)
+            .await
+            .unwrap();
+        let config = AgentConfig {
+            edit_format_override: Some(crate::client::EditFormat::SearchReplace),
+            ..Default::default()
+        };
+        let agent = KeruxAgent::new(
+            config,
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            registry,
+        );
+
+        // Drive the tracker straight to the terminal rung.
+        {
+            let mut t = agent.edit_metrics.lock().unwrap();
+            t.record_fallback(
+                target.to_string_lossy().as_ref(),
+                crate::edit_metrics::EditFormat::Patch,
+            );
+            assert_eq!(
+                t.format_hint(),
+                Some(crate::edit_metrics::EditFormat::FullFile)
+            );
+        }
+
+        // Explicit config override always wins over the learned hint.
+        let messages = agent.build_messages().await.unwrap();
+        let system = messages
+            .iter()
+            .find(|m| matches!(m.role, crate::client::Role::System))
+            .unwrap();
+        assert!(system
+            .content
+            .contains("token-efficient search/replace edits"));
+
+        // Weaker-protocol failures never demote the existing stronger hint.
+        agent
+            .edit_metrics
+            .lock()
+            .unwrap()
+            .record_fallback("other.py", crate::edit_metrics::EditFormat::SearchReplace);
+        assert_eq!(
+            agent.edit_metrics.lock().unwrap().format_hint(),
+            Some(crate::edit_metrics::EditFormat::FullFile)
+        );
     }
 
     #[tokio::test]
