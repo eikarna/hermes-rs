@@ -619,22 +619,82 @@ fn current_platform() -> &'static str {
 }
 
 /// Check whether a command is available on the system PATH.
+///
+/// Implemented as a direct filesystem scan instead of shelling out to
+/// `which`/`where`: spawning a process per lookup is orders of magnitude
+/// slower, and a missing/hosed shell turns every skill refresh into an
+/// error path (the TUI calls this on its render thread).
 fn command_exists(cmd: &str) -> bool {
+    use std::path::Path;
+
+    // Absolute or relative paths are checked as-is, mirroring how exec
+    // would resolve them.
+    if cmd.contains('/') || cmd.contains('\\') {
+        return is_executable_file(Path::new(cmd));
+    }
+
+    let path_var = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+
+    #[cfg(target_os = "windows")]
+    let candidates: Vec<String> = {
+        // Windows resolves bare names against PATHEXT (.exe, .bat, ...);
+        // a name that already carries an extension is tried verbatim.
+        let exts: Vec<String> = std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_ascii_lowercase())
+            .collect();
+        let has_ext = Path::new(cmd)
+            .extension()
+            .map(|e| {
+                let e = format!(".{}", e.to_string_lossy().to_ascii_lowercase());
+                exts.iter().any(|x| x == &e)
+            })
+            .unwrap_or(false);
+        if has_ext {
+            vec![cmd.to_string()]
+        } else {
+            exts.iter().map(|e| format!("{}{}", cmd, e)).collect()
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let candidates: Vec<String> = vec![cmd.to_string()];
+
+    for dir in std::env::split_paths(&path_var) {
+        for cand in &candidates {
+            if is_executable_file(&dir.join(cand)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when `path` is an existing regular file with an execute bit set
+/// (Unix). On Windows mere existence is enough — execute permission is
+/// not a filesystem property there.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !meta.is_file() {
+        return false;
+    }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("where")
-            .arg(cmd)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        true
     }
     #[cfg(not(target_os = "windows"))]
     {
-        std::process::Command::new("which")
-            .arg(cmd)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        meta.permissions().mode() & 0o111 != 0
     }
 }
 
@@ -664,6 +724,43 @@ mod tests {
 
     fn cleanup(dir: &Path) {
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn command_exists_finds_real_binary() {
+        // `sh` is guaranteed present on every CI/dev box we target
+        // (Git Bash on Windows provides it too).
+        assert!(command_exists("sh"));
+    }
+
+    #[test]
+    fn command_exists_rejects_missing_and_non_executable() {
+        assert!(!command_exists("definitely-not-a-real-binary-kerux"));
+
+        // Absolute-path branch: existing file WITHOUT exec bit must not
+        // count as an available command.
+        let dir = make_temp_dir();
+        let noexec = dir.join("noexec-binary");
+        fs::write(&noexec, b"#!/bin/sh\n").unwrap();
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&noexec, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!command_exists(noexec.to_str().unwrap()));
+        }
+
+        // ...and WITH the exec bit it must count, even though the file
+        // lives outside PATH.
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exec = dir.join("exec-binary");
+            fs::write(&exec, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&exec, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(command_exists(exec.to_str().unwrap()));
+        }
+
+        cleanup(&dir);
     }
 
     fn sample_skill_md() -> &'static str {

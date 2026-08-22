@@ -216,7 +216,10 @@ impl OpenAIClient {
 
         if !status.is_success() {
             error!(status = %status, body = %body, "Chat request failed");
-            return Err(Error::Agent(format!("HTTP {}: {}", status, body)));
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body,
+            });
         }
 
         let response: ChatResponse = serde_json::from_str(&body)
@@ -251,7 +254,10 @@ impl OpenAIClient {
         if !status.is_success() {
             let body = response.text().await?;
             error!(status = %status, body = %body, "Streaming request failed");
-            return Err(Error::Agent(format!("HTTP {}: {}", status, body)));
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body,
+            });
         }
 
         info!("Streaming connection established");

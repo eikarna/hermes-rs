@@ -44,10 +44,12 @@ impl FallbackChainProvider {
     pub fn is_fallback_worthy(error: &Error) -> bool {
         match error {
             Error::Network(_) | Error::IncompleteSseMessage => true,
-            Error::Agent(msg) => {
-                let rest = msg.strip_prefix("HTTP ");
-                matches!(rest, Some(code) if code.starts_with("429") || code.starts_with('5'))
-            }
+            // Typed status check — never parse Display strings. A provider
+            // that reports failures as unstructured text is treated as a
+            // deterministic failure on purpose: guessing "429-ish" from
+            // free-form prose risks silently downgrading the user to a
+            // worse model.
+            Error::Http { status, .. } => *status == 429 || (500..600).contains(status),
             _ => false,
         }
     }
@@ -129,17 +131,37 @@ mod tests {
     use crate::client::{Choice, MessageDelta, Role, Usage};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Test-local scripted failure. Converted into a real [`Error`] at
+    /// call time (`Error` itself is not `Clone`). Mirrors the typed HTTP
+    /// failures the live client now emits.
+    #[derive(Clone)]
+    enum ScriptedFailure {
+        Http { status: u16, body: String },
+    }
+
+    impl ScriptedFailure {
+        fn http(status: u16, body: &str) -> Self {
+            Self::Http {
+                status,
+                body: body.to_string(),
+            }
+        }
+
+        fn into_error(self) -> Error {
+            let Self::Http { status, body } = self;
+            Error::Http { status, body }
+        }
+    }
+
     struct ScriptedProvider {
         /// Results handed out in order; the last one repeats forever.
-        /// Errors are stored as raw Agent-error strings so the exact
-        /// "HTTP ..." prefix survives (no re-wrapping via Display).
-        results: Vec<std::result::Result<ChatResponse, String>>,
+        results: Vec<std::result::Result<ChatResponse, ScriptedFailure>>,
         calls: Arc<AtomicUsize>,
     }
 
     impl ScriptedProvider {
         fn new(
-            results: Vec<std::result::Result<ChatResponse, String>>,
+            results: Vec<std::result::Result<ChatResponse, ScriptedFailure>>,
         ) -> (Arc<Self>, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
             (
@@ -188,7 +210,7 @@ mod tests {
             let idx = n.min(self.results.len() - 1);
             match &self.results[idx] {
                 Ok(r) => Ok(r.clone()),
-                Err(msg) => Err(Error::Agent(msg.clone())),
+                Err(failure) => Err(failure.clone().into_error()),
             }
         }
 
@@ -208,18 +230,34 @@ mod tests {
 
     #[test]
     fn fallback_worthy_classification() {
-        assert!(FallbackChainProvider::is_fallback_worthy(&Error::Agent(
-            "HTTP 429: rate limited".into()
-        )));
-        assert!(FallbackChainProvider::is_fallback_worthy(&Error::Agent(
-            "HTTP 503: upstream down".into()
-        )));
-        assert!(!FallbackChainProvider::is_fallback_worthy(&Error::Agent(
-            "HTTP 401: unauthorized".into()
-        )));
-        assert!(!FallbackChainProvider::is_fallback_worthy(&Error::Agent(
-            "HTTP 400: bad request".into()
-        )));
+        assert!(FallbackChainProvider::is_fallback_worthy(&Error::Http {
+            status: 429,
+            body: "rate limited".into()
+        }));
+        assert!(FallbackChainProvider::is_fallback_worthy(&Error::Http {
+            status: 503,
+            body: "upstream down".into()
+        }));
+        // Boundary: 500 and 599 both qualify.
+        assert!(FallbackChainProvider::is_fallback_worthy(&Error::Http {
+            status: 500,
+            body: String::new()
+        }));
+        assert!(FallbackChainProvider::is_fallback_worthy(&Error::Http {
+            status: 599,
+            body: String::new()
+        }));
+        assert!(!FallbackChainProvider::is_fallback_worthy(&Error::Http {
+            status: 401,
+            body: "unauthorized".into()
+        }));
+        assert!(!FallbackChainProvider::is_fallback_worthy(&Error::Http {
+            status: 400,
+            body: "bad request".into()
+        }));
+        // Free-form agent text must NOT be sniffed for "HTTP"-like prefixes.
+        let legacy_style = Error::Agent("HTTP 429: rate limited".into());
+        assert!(!FallbackChainProvider::is_fallback_worthy(&legacy_style));
         assert!(!FallbackChainProvider::is_fallback_worthy(
             &Error::MissingApiKey
         ));
@@ -243,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_falls_through_to_fallback() {
         let (primary, _) = ScriptedProvider::new(vec![Err::<ChatResponse, _>(
-            "HTTP 429: slow down".to_string(),
+            ScriptedFailure::http(429, "slow down"),
         )]);
         let (fallback, fallback_calls) = ScriptedProvider::new(vec![Ok(ok_response("fallback"))]);
         let chain = FallbackChainProvider::new(primary, vec![(fallback, None)]);
@@ -256,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn deterministic_error_does_not_fall_back() {
         let (primary, _) = ScriptedProvider::new(vec![Err::<ChatResponse, _>(
-            "HTTP 401: bad key".to_string(),
+            ScriptedFailure::http(401, "bad key"),
         )]);
         let (fallback, fallback_calls) = ScriptedProvider::new(vec![Ok(ok_response("fallback"))]);
         let chain = FallbackChainProvider::new(primary, vec![(fallback, None)]);
@@ -268,13 +306,16 @@ mod tests {
 
     #[tokio::test]
     async fn chain_exhaustion_returns_last_error() {
-        let (primary, _) =
-            ScriptedProvider::new(vec![Err::<ChatResponse, _>("HTTP 503: down".to_string())]);
-        let (fb1, _) = ScriptedProvider::new(vec![Err::<ChatResponse, _>(
-            "HTTP 500: also down".to_string(),
+        let (primary, _) = ScriptedProvider::new(vec![Err::<ChatResponse, _>(
+            ScriptedFailure::http(503, "down"),
         )]);
-        let (fb2, _) =
-            ScriptedProvider::new(vec![Err::<ChatResponse, _>("HTTP 502: nope".to_string())]);
+        let (fb1, _) = ScriptedProvider::new(vec![Err::<ChatResponse, _>(ScriptedFailure::http(
+            500,
+            "also down",
+        ))]);
+        let (fb2, _) = ScriptedProvider::new(vec![Err::<ChatResponse, _>(ScriptedFailure::http(
+            502, "nope",
+        ))]);
         let chain = FallbackChainProvider::new(primary, vec![(fb1, None), (fb2, None)]);
 
         let err = chain.chat("m", &[], None).await.unwrap_err();
@@ -284,10 +325,11 @@ mod tests {
     #[tokio::test]
     async fn second_fallback_wins_when_first_fails() {
         let (primary, _) = ScriptedProvider::new(vec![Err::<ChatResponse, _>(
-            "HTTP 429: limited".to_string(),
+            ScriptedFailure::http(429, "limited"),
         )]);
-        let (fb1, _) =
-            ScriptedProvider::new(vec![Err::<ChatResponse, _>("HTTP 500: down".to_string())]);
+        let (fb1, _) = ScriptedProvider::new(vec![Err::<ChatResponse, _>(ScriptedFailure::http(
+            500, "down",
+        ))]);
         let (fb2, fb2_calls) = ScriptedProvider::new(vec![Ok(ok_response("second"))]);
         let chain = FallbackChainProvider::new(primary, vec![(fb1, None), (fb2, None)]);
 

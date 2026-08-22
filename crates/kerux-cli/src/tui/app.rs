@@ -195,7 +195,7 @@ impl TuiApp {
                     }
                 };
                 if matches!(action, Action::ApplyRunResult(None)) {
-                    self.auto_commit_if_enabled();
+                    self.auto_commit_if_enabled().await;
                 }
                 self.state.reduce(action);
             }
@@ -206,16 +206,27 @@ impl TuiApp {
     /// Commit the run's working-tree changes when `[agent].auto_commit` is on.
     /// Best-effort: committing consumes the `/undo` snapshot, so a successful
     /// commit clears rollback state. Failures are surfaced as footer notices.
-    fn auto_commit_if_enabled(&mut self) {
+    ///
+    /// Git plumbing shells out and can walk large trees, so it runs on the
+    /// blocking pool instead of stalling the UI loop.
+    async fn auto_commit_if_enabled(&mut self) {
         if !self.state.persistent.config.agent.auto_commit {
             return;
         }
         let Some(_snapshot) = self.last_snapshot.take() else {
             return;
         };
-        match kerux_core::githarness::GitHarness::open(std::path::Path::new("."))
-            .and_then(|harness| harness.commit_transaction("apply agent edits"))
-        {
+        let commit = tokio::task::spawn_blocking(|| {
+            kerux_core::githarness::GitHarness::open(std::path::Path::new("."))
+                .and_then(|harness| harness.commit_transaction("apply agent edits"))
+        })
+        .await
+        .unwrap_or_else(|join_error| {
+            Err(kerux_core::Error::Agent(format!(
+                "git commit task failed: {join_error}"
+            )))
+        });
+        match commit {
             Ok(Some(hash)) => {
                 self.state.set_footer_notice(
                     format!("auto-committed run changes ({})", hash),
@@ -473,15 +484,24 @@ impl TuiApp {
                         .set_footer_notice("nothing to undo: no snapshot recorded", Tone::Warning);
                 }
                 Some(snapshot) => {
-                    match kerux_core::githarness::GitHarness::open(std::path::Path::new("."))
-                        .and_then(|harness| harness.undo(snapshot))
+                    let snapshot = snapshot.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        kerux_core::githarness::GitHarness::open(std::path::Path::new("."))
+                            .and_then(|harness| harness.undo(&snapshot))
+                    })
+                    .await
                     {
-                        Ok(()) => {
+                        Ok(Ok(())) => {
                             self.last_snapshot = None;
                             self.state
                                 .set_footer_notice("undid last run's file changes", Tone::Success);
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
+                            self.state
+                                .set_footer_notice(format!("undo failed: {}", error), Tone::Error);
+                        }
+                        Err(join_error) => {
+                            let error = anyhow::anyhow!("git undo task failed: {join_error}");
                             self.state
                                 .set_footer_notice(format!("undo failed: {}", error), Tone::Error);
                         }
@@ -539,10 +559,15 @@ impl TuiApp {
         };
         // Transactional snapshot: capture pre-run git state so `/undo` can
         // roll back whatever this run changes. Best-effort; outside a repo
-        // the snapshot is simply skipped.
-        self.last_snapshot = kerux_core::githarness::GitHarness::open(std::path::Path::new("."))
-            .ok()
-            .and_then(|harness| harness.snapshot(true).ok());
+        // the snapshot is simply skipped. Git plumbing runs on the blocking
+        // pool so a large tree can't stall the UI loop.
+        self.last_snapshot = tokio::task::spawn_blocking(|| {
+            kerux_core::githarness::GitHarness::open(std::path::Path::new("."))
+                .ok()
+                .and_then(|harness| harness.snapshot(true).ok())
+        })
+        .await
+        .unwrap_or(None);
 
         self.state.reduce(Action::StartRun(query.clone()));
         self.state.reduce(Action::ClearPrompt);
