@@ -14,6 +14,12 @@ Scope: all source under `crates/` (66 .rs files, ~42k lines), workspace `Cargo.t
 
 No syntax errors anywhere. Compiler and clippy are completely quiet at `-D warnings`.
 
+> **Integration status (2026-08-22):** The table above records the audit baseline.
+> Findings F1–F4 were subsequently resolved and integrated into the root task branch;
+> see [Resolution status](#resolution-status) below. The integrated branch passes 544
+> tests (110 CLI + 434 core), `cargo fmt --all -- --check`, workspace check, and clippy
+> with `-D warnings`. F5 remains a non-blocking maintainability note.
+
 ## Findings
 
 ### F1 [MEDIUM — logic bug] Terminal tool timeout applies per-line, not per-command
@@ -87,3 +93,13 @@ edit-format logic — prime candidate for module split next time it is touched.
 2. Introduce `Error::Http { status }` and match enum-wise in `fallback.rs` (F2).
 3. Wrap `GitHarness` calls from async paths in `spawn_blocking`; consider caching
    `command_exists` results per session in the TUI (F3).
+
+## Resolution status
+
+| Finding | Status | Integrated resolution |
+|---|---|---|
+| F1 | Resolved | Terminal execution now uses one shared `Instant` deadline across stdout, stderr, and child wait/kill phases, with regression coverage for trickle-output processes. |
+| F2 | Resolved | HTTP failures use the typed `Error::Http { status, body }` variant; fallback classification matches the enum directly. Gemini chat and streaming errors use the same typed path. |
+| F3 | Resolved | Prerequisite and platform command probes scan `PATH` without spawning `which`/`where` or candidate binaries. Blocking `GitHarness` calls from async agent/TUI paths run via `tokio::task::spawn_blocking`. |
+| F4 | Resolved | Poisoned synchronous mutexes are recovered with warnings; approval gates fail closed when no usable gate can be recovered. Regression tests cover approval bypass and pending-request preservation. |
+| F5 | Open (informational) | File-size hotspots remain documented for opportunistic future module extraction; no correctness defect was identified. |
