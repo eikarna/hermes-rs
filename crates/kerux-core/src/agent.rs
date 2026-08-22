@@ -310,24 +310,18 @@ impl KeruxAgent {
     /// Swap the event sink for the next run. Lets a long-lived shared agent
     /// stream events to a fresh per-run consumer (e.g. a gateway turn).
     pub fn set_event_sender(&self, sender: Option<mpsc::Sender<AgentEvent>>) {
-        if let Ok(mut guard) = self.event_tx.lock() {
-            *guard = sender;
-        }
+        *crate::lock_sync(&self.event_tx) = sender;
     }
 
     /// Swap the native run recorder without changing surface event delivery.
     pub fn set_run_recorder(&self, recorder: Option<Arc<crate::run_journal::RunRecorder>>) {
-        if let Ok(mut guard) = self.run_recorder.lock() {
-            *guard = recorder;
-        }
+        *crate::lock_sync(&self.run_recorder) = recorder;
     }
 
     /// Swap the approval gate for the next run. `None` disables approval
     /// prompts (tools run immediately).
     pub fn set_approval_gate(&self, gate: Option<Arc<dyn crate::approval::ToolApprovalGate>>) {
-        if let Ok(mut guard) = self.approval_gate.lock() {
-            *guard = gate;
-        }
+        *crate::lock_sync(&self.approval_gate) = gate;
     }
 
     /// Get a handle to the cancellation flag. Setting it to `true` stops the
@@ -356,7 +350,7 @@ impl KeruxAgent {
 
     /// Send an event to the surface channel and optional native recorder.
     async fn emit(&self, event: AgentEvent) -> Result<()> {
-        let tx = { self.event_tx.lock().ok().and_then(|guard| guard.clone()) };
+        let tx = crate::lock_sync(&self.event_tx).clone();
         if let Some(tx) = tx {
             // Non-blocking send: progress events are decorative. If the
             // consumer (progress pump) is dead or wedged, the bounded
@@ -369,11 +363,7 @@ impl KeruxAgent {
     }
 
     fn record_agent_event(&self, event: &AgentEvent) -> Result<()> {
-        let recorder = self
-            .run_recorder
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let recorder = crate::lock_sync(&self.run_recorder).clone();
         let Some(recorder) = recorder else {
             return Ok(());
         };
@@ -404,11 +394,7 @@ impl KeruxAgent {
         tools: &[ToolSchema],
         telemetry: &AgentTelemetry,
     ) -> Result<()> {
-        let recorder = self
-            .run_recorder
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let recorder = crate::lock_sync(&self.run_recorder).clone();
         let Some(recorder) = recorder else {
             return Ok(());
         };
@@ -515,11 +501,7 @@ impl KeruxAgent {
         tool_name: &str,
         decision: &crate::approval::ApprovalDecision,
     ) -> Result<()> {
-        let recorder = self
-            .run_recorder
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let recorder = crate::lock_sync(&self.run_recorder).clone();
         let Some(recorder) = recorder else {
             return Ok(());
         };
@@ -594,28 +576,14 @@ impl KeruxAgent {
         // stronger protocol. Measurement stays passive; only routing moves.
         if failed {
             if let Some(failed_path) = path.as_deref() {
-                self.edit_metrics
-                    .lock()
-                    .map(|mut t| t.record_fallback(failed_path, format))
-                    .ok();
+                crate::lock_sync(&self.edit_metrics).record_fallback(failed_path, format);
             }
         }
-        let (repair_count, pass_kind, repair_allowed) = self
-            .edit_metrics
-            .lock()
-            .map(|mut t| t.observe(path.as_deref().unwrap_or(""), failed))
-            .unwrap_or((0, crate::edit_metrics::EditPassKind::FirstPass, true));
-        let run_attempt = self
-            .edit_metrics
-            .lock()
-            .map(|t| t.run_attempt())
-            .unwrap_or(1);
+        let (repair_count, pass_kind, repair_allowed) =
+            crate::lock_sync(&self.edit_metrics).observe(path.as_deref().unwrap_or(""), failed);
+        let run_attempt = crate::lock_sync(&self.edit_metrics).run_attempt();
 
-        let recorder = self
-            .run_recorder
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let recorder = crate::lock_sync(&self.run_recorder).clone();
         let Some(recorder) = recorder else {
             return Ok(());
         };
@@ -628,11 +596,8 @@ impl KeruxAgent {
             "call_id": call_id,
             "tool_name": tool_name,
             "format": format.as_str(),
-            "effective_format": self
-                .edit_metrics
-                .lock()
-                .ok()
-                .and_then(|t| t.format_hint())
+            "effective_format": crate::lock_sync(&self.edit_metrics)
+                .format_hint()
                 .map(|h| h.as_str()),
             "path": path,
             "parse_status": parse_status,
@@ -671,11 +636,7 @@ impl KeruxAgent {
         kind: &'static str,
         payload: serde_json::Value,
     ) -> Result<()> {
-        let recorder = self
-            .run_recorder
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let recorder = crate::lock_sync(&self.run_recorder).clone();
         let Some(recorder) = recorder else {
             return Ok(());
         };
@@ -718,15 +679,9 @@ impl KeruxAgent {
     fn start_recording(&self) -> Result<()> {
         // Fresh run: forget per-path repair counters from any previous run so
         // `repair_count` never leaks across runs.
-        if let Ok(mut tracker) = self.edit_metrics.lock() {
-            tracker.reset();
-        }
+        crate::lock_sync(&self.edit_metrics).reset();
 
-        let recorder = self
-            .run_recorder
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let recorder = crate::lock_sync(&self.run_recorder).clone();
         let Some(recorder) = recorder else {
             return Ok(());
         };
@@ -1185,10 +1140,8 @@ impl KeruxAgent {
             .config
             .edit_format_override
             .or_else(|| {
-                self.edit_metrics
-                    .lock()
-                    .ok()
-                    .and_then(|t| t.format_hint())
+                crate::lock_sync(&self.edit_metrics)
+                    .format_hint()
                     .map(crate::edit_metrics::EditFormat::into_client)
             })
             .unwrap_or_else(|| self.client.capabilities(&self.config.model).edit_format);
@@ -1619,15 +1572,32 @@ impl KeruxAgent {
             // per-run by the gateway) presents the request and blocks until
             // the human decides or the gate's own timeout auto-denies.
             if crate::approval::requires_approval(&name) {
-                let gate = self.approval_gate.lock().ok().and_then(|g| g.clone());
-                if let Some(gate) = gate {
+                let (gate, gate_poisoned) = match self.approval_gate.lock() {
+                    Ok(guard) => (guard.clone(), false),
+                    Err(poisoned) => {
+                        warn!(tool = %name, "Approval gate mutex poisoned; recovering state");
+                        (poisoned.into_inner().clone(), true)
+                    }
+                };
+                let decision = if let Some(gate) = gate {
                     let preview: String = args_str.chars().take(300).collect();
-                    let decision = gate
-                        .request_approval(crate::approval::ApprovalRequest {
+                    Some(
+                        gate.request_approval(crate::approval::ApprovalRequest {
                             tool_name: name.clone(),
                             arguments_preview: preview,
                         })
-                        .await;
+                        .await,
+                    )
+                } else if gate_poisoned {
+                    Some(crate::approval::ApprovalDecision::Denied {
+                        reason: "Approval gate state is unavailable; tool execution denied."
+                            .to_string(),
+                        outcome: crate::approval::ApprovalOutcome::PromptFailed,
+                    })
+                } else {
+                    None
+                };
+                if let Some(decision) = decision {
                     self.record_approval_decision(&tool_call.id, &name, &decision)?;
                     if let crate::approval::ApprovalDecision::Denied { reason, .. } = decision {
                         info!(tool = %name, reason = %reason, "Tool execution denied by approval gate");
@@ -1753,9 +1723,7 @@ impl KeruxAgent {
             // Task 2.3: tag the tracker with the top-level attempt identity so
             // every `edit_outcome` event reports which generation produced it
             // (1 = first pass, higher = evidence-fed repair attempt).
-            if let Ok(mut tracker) = self.edit_metrics.lock() {
-                tracker.set_run_attempt(iteration as u64);
-            }
+            crate::lock_sync(&self.edit_metrics).set_run_attempt(iteration as u64);
 
             match self.run_inner(user_query.clone(), cancel.clone()).await {
                 Ok(response) => break Ok(response),
@@ -4388,6 +4356,40 @@ mod tests {
         let reason = payload["reason"].as_str().unwrap();
         assert!(reason.contains("not allowed"));
         assert!(!reason.contains("sk-secret12345678"));
+    }
+
+    #[tokio::test]
+    async fn poisoned_empty_approval_gate_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let manifest = test_run_manifest("approval-poisoned");
+        let journal =
+            crate::run_journal::RunJournal::create_in(home.path().join("runs"), manifest).unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let agent = approval_test_agent(
+            recorder,
+            crate::approval::ApprovalDecision::Denied {
+                reason: "not allowed".to_string(),
+                outcome: crate::approval::ApprovalOutcome::Denied,
+            },
+        )
+        .await;
+        agent.set_approval_gate(None);
+
+        let approval_gate = Arc::clone(&agent.approval_gate);
+        let _ = std::thread::spawn(move || {
+            let _guard = approval_gate.lock().unwrap();
+            panic!("poison approval gate");
+        })
+        .join();
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let results = agent
+            .execute_tools(vec![dangerous_tool_call()], &no_cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
     }
 
     #[tokio::test]

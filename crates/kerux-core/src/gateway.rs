@@ -437,17 +437,14 @@ static NEXT_APPROVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub fn register_pending_approval() -> (u64, tokio::sync::oneshot::Receiver<bool>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let id = NEXT_APPROVAL_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    PENDING_APPROVALS.lock().map(|mut m| m.insert(id, tx)).ok();
+    crate::lock_sync(&PENDING_APPROVALS).insert(id, tx);
     (id, rx)
 }
 
 /// Resolve a pending approval request. Returns `false` when the ID is
 /// unknown (stale/duplicate button press).
 pub(crate) fn resolve_pending_approval(id: u64, approved: bool) -> bool {
-    let tx = PENDING_APPROVALS
-        .lock()
-        .ok()
-        .and_then(|mut m| m.remove(&id));
+    let tx = crate::lock_sync(&PENDING_APPROVALS).remove(&id);
     match tx {
         Some(tx) => tx.send(approved).is_ok(),
         None => false,
@@ -456,7 +453,7 @@ pub(crate) fn resolve_pending_approval(id: u64, approved: bool) -> bool {
 
 /// Drop a pending approval request (e.g. the gate timed out).
 pub(crate) fn drop_pending_approval(id: u64) {
-    PENDING_APPROVALS.lock().map(|mut m| m.remove(&id)).ok();
+    crate::lock_sync(&PENDING_APPROVALS).remove(&id);
 }
 
 /// Gateway for routing messages between platforms and the agent
@@ -2541,6 +2538,21 @@ pub fn markdown_to_markdownv2(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn poisoned_pending_approvals_still_registers_and_resolves() {
+        let _ = std::thread::spawn(|| {
+            let _guard = PENDING_APPROVALS.lock().unwrap();
+            panic!("poison pending approvals");
+        })
+        .join();
+
+        let (id, receiver) = register_pending_approval();
+        assert!(resolve_pending_approval(id, true));
+        assert_eq!(receiver.await, Ok(true));
+    }
 
     #[test]
     fn split_message_short_stays_single() {

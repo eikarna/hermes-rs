@@ -18,6 +18,7 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 ### Fixed
 
 - Windows journal storage: close event files before renaming the staging dir, lock a sentinel byte instead of the whole file, acquire the event-file lock after publishing the run dir, avoid append-mode event files ("Access is denied")
+- Recover poisoned synchronous mutex state instead of silently dropping gateway approval requests, bypassing dangerous-tool approval gates, or resetting agent telemetry/recorder state.
 
 ## [0.2.0] - 2026-08-11
 
