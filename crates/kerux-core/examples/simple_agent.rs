@@ -164,6 +164,7 @@ Use the echo tool to repeat information and the calculate tool for math."
         repo_map_tokens: 0,
         repo_map_max_files: 500,
         edit_format_override: None,
+        max_repair_attempts: None,
     };
 
     let agent = KeruxAgent::new(agent_config, client, registry);

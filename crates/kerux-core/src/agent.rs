@@ -55,6 +55,9 @@ pub struct AgentConfig {
     pub repo_map_max_files: usize,
     /// Override the capability-table edit format hint. `None` = table behavior.
     pub edit_format_override: Option<crate::client::EditFormat>,
+    /// Task 2.3 bounded repair policy: per-path edit repair budget. `None`
+    /// falls back to `max_healing_attempts`.
+    pub max_repair_attempts: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -77,6 +80,7 @@ impl From<&BehaviorSettings> for AgentConfig {
             repo_map_tokens: settings.repo_map_tokens,
             repo_map_max_files: settings.repo_map_max_files,
             edit_format_override: settings.edit_format_override,
+            max_repair_attempts: settings.max_repair_attempts,
         }
     }
 }
@@ -230,6 +234,15 @@ pub struct KeruxAgent {
 }
 
 impl KeruxAgent {
+    /// Per-path edit repair budget (Task 2.3): `behavior.max_repair_attempts`
+    /// when configured, otherwise the healing-attempt bound.
+    fn repair_budget_from(config: &AgentConfig) -> u32 {
+        config
+            .max_repair_attempts
+            .unwrap_or(config.max_healing_attempts)
+            .min(u32::MAX as usize) as u32
+    }
+
     /// Create a new Kerux agent
     pub fn new(config: AgentConfig, client: OpenAIClient, registry: ToolRegistry) -> Self {
         Self::new_with_provider(config, Arc::new(client), registry)
@@ -241,6 +254,9 @@ impl KeruxAgent {
         client: Arc<dyn LLMProvider>,
         registry: ToolRegistry,
     ) -> Self {
+        let edit_tracker = crate::edit_metrics::EditMetricsTracker::with_repair_budget(
+            Self::repair_budget_from(&config),
+        );
         Self {
             config,
             client,
@@ -252,9 +268,7 @@ impl KeruxAgent {
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
             approval_gate: Arc::new(std::sync::Mutex::new(None)),
-            edit_metrics: Arc::new(std::sync::Mutex::new(
-                crate::edit_metrics::EditMetricsTracker::default(),
-            )),
+            edit_metrics: Arc::new(std::sync::Mutex::new(edit_tracker)),
         }
     }
 
@@ -275,6 +289,9 @@ impl KeruxAgent {
         registry: ToolRegistry,
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> Self {
+        let edit_tracker = crate::edit_metrics::EditMetricsTracker::with_repair_budget(
+            Self::repair_budget_from(&config),
+        );
         Self {
             config,
             client,
@@ -286,9 +303,7 @@ impl KeruxAgent {
             memory_manager: None,
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
             approval_gate: Arc::new(std::sync::Mutex::new(None)),
-            edit_metrics: Arc::new(std::sync::Mutex::new(
-                crate::edit_metrics::EditMetricsTracker::default(),
-            )),
+            edit_metrics: Arc::new(std::sync::Mutex::new(edit_tracker)),
         }
     }
 
@@ -574,11 +589,20 @@ impl KeruxAgent {
         let failed = matches!(outcome, crate::edit_metrics::EditApplyStatus::Failed)
             || (matches!(outcome, crate::edit_metrics::EditApplyStatus::Skipped)
                 && parse_status == "failed");
-        let repair_count = self
+        let (repair_count, pass_kind, repair_allowed) = self
             .edit_metrics
             .lock()
             .map(|mut t| t.observe(path.as_deref().unwrap_or(""), failed))
-            .unwrap_or(0);
+            .unwrap_or((
+                0,
+                crate::edit_metrics::EditPassKind::FirstPass,
+                true,
+            ));
+        let run_attempt = self
+            .edit_metrics
+            .lock()
+            .map(|t| t.run_attempt())
+            .unwrap_or(1);
 
         let recorder = self
             .run_recorder
@@ -608,6 +632,9 @@ impl KeruxAgent {
             },
             "language": path.as_deref().map(language_for_path),
             "repair_count": repair_count,
+            "run_attempt": run_attempt,
+            "pass_kind": pass_kind.as_str(),
+            "repair_allowed": repair_allowed,
             "provider_kind": recorder.provider_kind().ok(),
             "model": recorder.model().ok(),
         });
@@ -1700,6 +1727,12 @@ impl KeruxAgent {
 
         let result = loop {
             iteration += 1;
+            // Task 2.3: tag the tracker with the top-level attempt identity so
+            // every `edit_outcome` event reports which generation produced it
+            // (1 = first pass, higher = evidence-fed repair attempt).
+            if let Ok(mut tracker) = self.edit_metrics.lock() {
+                tracker.set_run_attempt(iteration as u64);
+            }
 
             match self.run_inner(user_query.clone(), cancel.clone()).await {
                 Ok(response) => break Ok(response),
@@ -3817,6 +3850,94 @@ mod tests {
         let third = decode_event_payload(edit_events[2]);
         assert_eq!(third["apply_status"], "ok");
         assert_eq!(third["repair_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn edit_outcome_reports_pass_kind_and_repair_budget() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("app.py");
+        std::fs::write(&target, "value = 1\n").unwrap();
+
+        let runs_root = home.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("edit-outcome-pass-kind"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+
+        let config = AgentConfig {
+            max_repair_attempts: Some(1), // bounded repair policy under test
+            ..Default::default()
+        };
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        registry.register(crate::tools::EditBlockTool).await.unwrap();
+        let agent = KeruxAgent::new(
+            config,
+            OpenAIClient::new(crate::client::ClientConfig::default()),
+            registry,
+        );
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let call = |id: &str, arguments: String| ToolCall {
+            id: id.to_string(),
+            function: crate::client::ToolCallFunction {
+                name: "edit_block".to_string(),
+                arguments,
+            },
+        };
+        let path_str = target.to_string_lossy().to_string();
+        let miss = serde_json::json!({
+            "path": path_str,
+            "edits": [{"search": "text that is not in the file", "replace": "x"}]
+        })
+        .to_string();
+
+        // Success, then two failures on the same path. `pass_kind` flips only
+        // after a failure (evidence exists to repair from); with a budget of 1
+        // the second failure exhausts the path, so it reports
+        // `repair_allowed=false` while the counter keeps counting.
+        agent
+            .execute_tools(
+                vec![
+                    call(
+                        "c0",
+                        serde_json::json!({
+                            "path": path_str,
+                            "edits": [{"search": "value = 1", "replace": "value = 2"}]
+                        })
+                        .to_string(),
+                    ),
+                    call("c1", miss.clone()),
+                    call("c2", miss),
+                ],
+                &no_cancel,
+            )
+            .await
+            .unwrap();
+
+        let events = recorder.events().unwrap();
+        let edit_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "edit_outcome")
+            .collect();
+        assert_eq!(edit_events.len(), 3);
+
+        let first = decode_event_payload(edit_events[0]);
+        assert_eq!(first["pass_kind"], "first_pass");
+        assert_eq!(first["repair_allowed"], true);
+        assert_eq!(first["run_attempt"], 1);
+
+        let second = decode_event_payload(edit_events[1]);
+        assert_eq!(second["pass_kind"], "first_pass");
+        assert_eq!(second["repair_count"], 0);
+        assert_eq!(second["repair_allowed"], true);
+
+        let third = decode_event_payload(edit_events[2]);
+        assert_eq!(third["pass_kind"], "repair_pass");
+        assert_eq!(third["repair_count"], 1);
+        assert_eq!(third["repair_allowed"], false);
     }
 
     #[tokio::test]

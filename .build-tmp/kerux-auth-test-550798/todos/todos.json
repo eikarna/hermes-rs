@@ -1,0 +1,29 @@
+{
+  "test-session-1": [
+    {
+      "id": "1",
+      "content": "Write tests",
+      "status": "pending"
+    },
+    {
+      "id": "2",
+      "content": "Review PR",
+      "status": "in_progress"
+    }
+  ],
+  "default": [
+    {
+      "id": "a",
+      "content": "Task A",
+      "status": "completed"
+    }
+  ],
+  "test-empty": [],
+  "test-replace": [
+    {
+      "id": "3",
+      "content": "Third",
+      "status": "completed"
+    }
+  ]
+}

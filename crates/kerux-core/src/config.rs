@@ -222,6 +222,12 @@ pub struct BehaviorSettings {
     /// Default `false`: keep `/undo`-only behavior. Agent-authored edits
     /// inside a transaction are only committed when the run succeeds.
     pub auto_commit: bool,
+    /// Task 2.3 bounded repair policy: after a path exhausts its per-run edit
+    /// repair budget, subsequent failed attempts on it are recorded as
+    /// `repair_allowed=false` instead of feeding another repair round.
+    /// `None` falls back to `max_healing_attempts`.
+    #[serde(default)]
+    pub max_repair_attempts: Option<usize>,
 }
 
 impl Default for BehaviorSettings {
@@ -240,6 +246,7 @@ impl Default for BehaviorSettings {
             repo_map_max_files: 500,
             edit_format_override: None,
             auto_commit: false,
+            max_repair_attempts: None,
         }
     }
 }

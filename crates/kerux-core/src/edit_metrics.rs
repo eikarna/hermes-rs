@@ -100,34 +100,129 @@ pub enum EditParseStatus {
     Failed,
 }
 
-/// Per-run repair tracking. Counts failed edit attempts per normalized
-/// target path so each `edit_outcome` event can report how many prior
-/// failures ("repairs") preceded it within the same run.
+/// Which generation of the run produced an edit outcome (Task 2.3).
+///
+/// A run starts as a *first pass*: the model edits with whatever context it
+/// gathered initially. When an attempt fails and the conversation is repaired
+/// with that failure evidence, subsequent attempts are *repair passes*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditPassKind {
+    /// Produced during the model's first generation, before any repair.
+    FirstPass,
+    /// Produced after failure evidence was fed back into the conversation.
+    RepairPass,
+}
+
+impl EditPassKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FirstPass => "first_pass",
+            Self::RepairPass => "repair_pass",
+        }
+    }
+}
+
+/// Default per-path repair budget ([`EditMetricsTracker`]).
+///
+/// Bounds how many evidence-fed repair rounds are attributed to one target
+/// path within a single run before its repair budget reports as exhausted.
+pub const DEFAULT_REPAIR_BUDGET: u32 = 3;
+
+/// Per-run edit-attempt tracking (Tasks 2.3 + 2.4).
+///
+/// Counts failed edit attempts per normalized target path so each
+/// `edit_outcome` event can report:
+/// - how many prior failures ("repairs") preceded it within the run,
+/// - whether it came from the first generation or an evidence-fed repair,
+/// - whether the path's bounded repair budget still had room.
+///
+/// Measurement only: nothing here gates execution.
 #[derive(Default)]
 pub struct EditMetricsTracker {
     repairs: HashMap<String, u32>,
+    exhausted: std::collections::HashSet<String>,
+    repair_budget: u32,
+    /// 1-based identity of the current top-level run attempt (Task 2.3).
+    /// Attempt 1 is the first generation; higher values are evidence-fed
+    /// repair attempts driven by the outer self-healing loop.
+    run_attempt: u64,
 }
 
 impl EditMetricsTracker {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            repair_budget: DEFAULT_REPAIR_BUDGET,
+            ..Self::default()
+        }
     }
 
-    /// Number of prior failed attempts for `path` in this run, then record
-    /// `outcome` for future lookups. Successful attempts do not reset the
-    /// counter: a later success after two failures reports `repair_count: 2`.
-    pub fn observe(&mut self, path: &str, failed: bool) -> u32 {
+    /// Build a tracker with an explicit per-path repair budget (Task 2.3).
+    pub fn with_repair_budget(budget: u32) -> Self {
+        Self {
+            repair_budget: budget,
+            ..Self::default()
+        }
+    }
+
+    /// Set the per-path repair budget (from `[behavior]` config).
+    /// `0` disables repair attribution headroom: the first failure on a path
+    /// already reports the budget as exhausted.
+    pub fn set_repair_budget(&mut self, budget: u32) {
+        self.repair_budget = budget;
+    }
+
+    pub fn repair_budget(&self) -> u32 {
+        self.repair_budget
+    }
+
+    /// Tag the current top-level run attempt (called by the outer healing
+    /// loop each time it retries the whole run).
+    pub fn set_run_attempt(&mut self, attempt: u64) {
+        self.run_attempt = attempt.max(1);
+    }
+
+    /// Current run attempt identity (defaults to the first attempt).
+    pub fn run_attempt(&self) -> u64 {
+        if self.run_attempt == 0 {
+            1
+        } else {
+            self.run_attempt
+        }
+    }
+
+    /// Observe one edit attempt for `path`.
+    ///
+    /// Returns `(prior_failures, pass_kind, repair_allowed)`:
+    /// - `pass_kind` is [`EditPassKind::FirstPass`] until a failure has been
+    ///   recorded for the path, then [`EditPassKind::RepairPass`].
+    /// - `repair_allowed` reports whether another evidence-fed repair would
+    ///   fit the budget after a failure here. Once a path exceeds the budget
+    ///   it stays exhausted for the rest of the run, so runaway loops stay
+    ///   visible in telemetry instead of silently resetting.
+    pub fn observe(&mut self, path: &str, failed: bool) -> (u32, EditPassKind, bool) {
         let prior = self.repairs.get(path).copied().unwrap_or(0);
+        let pass_kind = if prior == 0 {
+            EditPassKind::FirstPass
+        } else {
+            EditPassKind::RepairPass
+        };
+        if failed && prior + 1 > self.repair_budget {
+            self.exhausted.insert(path.to_string());
+        }
         if failed {
             self.repairs.insert(path.to_string(), prior + 1);
         }
-        prior
+        let repair_allowed = !self.exhausted.contains(path);
+        (prior, pass_kind, repair_allowed)
     }
 
     /// Forget all counters. Called when a recorded run starts so counts
     /// never leak across runs.
     pub fn reset(&mut self) {
         self.repairs.clear();
+        self.exhausted.clear();
+        self.run_attempt = 0;
     }
 }
 
@@ -240,12 +335,12 @@ mod tests {
     #[test]
     fn repair_counts_accumulate_per_path_and_ignore_successes() {
         let mut state = EditMetricsTracker::new();
-        assert_eq!(state.observe("/a.rs", false), 0);
-        assert_eq!(state.observe("/a.rs", true), 0);
-        assert_eq!(state.observe("/a.rs", true), 1);
-        assert_eq!(state.observe("/a.rs", false), 2);
-        assert_eq!(state.observe("/b.rs", true), 0);
-        assert_eq!(state.observe("/a.rs", false), 2);
+        assert_eq!(state.observe("/a.rs", false).0, 0);
+        assert_eq!(state.observe("/a.rs", true).0, 0);
+        assert_eq!(state.observe("/a.rs", true).0, 1);
+        assert_eq!(state.observe("/a.rs", false).0, 2);
+        assert_eq!(state.observe("/b.rs", true).0, 0);
+        assert_eq!(state.observe("/a.rs", false).0, 2);
     }
 
     #[test]
@@ -254,7 +349,53 @@ mod tests {
         state.observe("/a.rs", true);
         state.observe("/a.rs", true);
         state.reset();
-        assert_eq!(state.observe("/a.rs", false), 0);
+        assert_eq!(state.observe("/a.rs", false).0, 0);
+    }
+
+    #[test]
+    fn pass_kind_flips_after_first_failure_per_path() {
+        let mut state = EditMetricsTracker::new();
+        let (_, kind, allowed) = state.observe("src/lib.rs", false);
+        assert_eq!(kind, EditPassKind::FirstPass);
+        assert!(allowed);
+        // The failing attempt itself was still a first-generation one; only
+        // the *next* attempt runs with failure evidence to repair from.
+        let (_, kind, allowed) = state.observe("src/lib.rs", true);
+        assert_eq!(kind, EditPassKind::FirstPass);
+        assert!(allowed); // still within the default budget of 3
+        let (_, kind, allowed) = state.observe("src/lib.rs", false);
+        assert_eq!(kind, EditPassKind::RepairPass);
+        assert!(allowed);
+    }
+
+    #[test]
+    fn run_attempt_defaults_to_one_and_survives_reset() {
+        let mut state = EditMetricsTracker::new();
+        assert_eq!(state.run_attempt(), 1);
+        state.set_run_attempt(3);
+        assert_eq!(state.run_attempt(), 3);
+        state.reset();
+        assert_eq!(state.run_attempt(), 1);
+        state.set_run_attempt(0);
+        assert_eq!(state.run_attempt(), 1); // clamped to first attempt
+    }
+
+    #[test]
+    fn bounded_budget_flags_exhaustion_and_stays_put() {
+        let mut state = EditMetricsTracker::with_repair_budget(1);
+        assert_eq!(state.repair_budget(), 1);
+        let (prior, _, allowed) = state.observe("f.py", true);
+        assert_eq!((prior, allowed), (0, true)); // failure #1 fits the budget
+        let (prior, kind, allowed) = state.observe("f.py", true);
+        assert_eq!((prior, kind), (1, EditPassKind::RepairPass));
+        assert!(!allowed); // failure #2 exceeds the budget
+        let (_, _, allowed) = state.observe("f.py", false);
+        assert!(!allowed); // exhaustion sticks for the rest of the run
+        let (_, _, allowed) = state.observe("g.py", true);
+        assert!(allowed); // other paths are unaffected
+        let mut zero = EditMetricsTracker::with_repair_budget(0);
+        let (_, _, allowed) = zero.observe("z.py", true);
+        assert!(!allowed); // zero budget: the first failure already exhausts
     }
 
     #[test]
