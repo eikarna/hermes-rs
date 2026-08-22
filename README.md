@@ -25,6 +25,7 @@
 - **Persistent state** — sessions, memory, todos, and cron jobs survive restarts (atomic JSON writes under `~/.kerux/`)
 - **Repo-map context** — tree-sitter symbols + personalized PageRank, token-budgeted into the system prompt
 - **Transactional git harness** — pre-run snapshots, Conventional Commits, TUI `/undo`
+- **Flight recorder** — hash-chained run journals with read-only inspection and offline-verifiable proof capsules (see [docs/src/features/flight-recorder.md](docs/src/features/flight-recorder.md))
 
 ## Install
 

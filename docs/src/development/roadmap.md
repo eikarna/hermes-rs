@@ -32,4 +32,5 @@ Stabilization of the gateway era:
 - ✅ Gateway: Telegram long-polling + WhatsApp bridge, MarkdownV2 conversion, streaming replies
 - ✅ Persistence: sessions (v2 + compaction summaries), memory, todos — all atomic JSON
 - ✅ Tool approval, fallback provider chain, voice-note STT, cron scheduler, subagent delegation
+- ✅ **Flight recorder & proof capsules** — hash-chained run journals, read-only inspection (`kerux runs`), offline-verifiable export — see [features/flight-recorder.md](../features/flight-recorder.md)
 - ✅ Rebrand to **kerux** + mdBook docs at [kerux.eikarna.dev](https://kerux.eikarna.dev/)

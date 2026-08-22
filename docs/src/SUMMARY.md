@@ -17,6 +17,7 @@
 # Features
 
 - [Tool Approval](features/tool-approval.md)
+- [Flight Recorder](features/flight-recorder.md)
 - [Context Compaction](features/context-compaction.md)
 - [Fallback Provider Chain](features/fallback-chain.md)
 - [Voice Note STT](features/voice-stt.md)
