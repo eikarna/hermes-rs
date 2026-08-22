@@ -3,6 +3,22 @@ All notable changes to this project will be documented in this file.
 format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this project adheres 
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Discord adapter** (`[gateway] discord_enabled` + `discord_token`): REST integration against `discord_api_base` (default `https://discord.com/api/v10`) — bot-token verification via `/users/@me`, message send via `/channels/{id}/messages`, message-create event parsing
+- **Slack adapter** (`[gateway] slack_enabled` + `slack_token`): REST integration against `slack_api_base` (default `https://slack.com/api`) with token verification, `send_message`, and update-event parsing
+- **Flight recorder** (Tasks 1.x): hash-chained append-only run journals under `~/.kerux/runs/` with a bounded `[recorder]` policy (`record_content`, `record_reasoning`, `max_payload_bytes`, `failure_mode = warn|fail`); git checkpoint evidence and tool-approval decisions journaled per run; read-only `kerux runs list|inspect|verify` CLI; offline-verifiable scrubbed HTML proof-capsule export; Windows-safe journal storage (per-file byte-range locking, staging-dir publish)
+- **Deterministic project validators** (Task 2.1): `[validation]` section with `enabled`, `fail_fast`, and `[[validation.validators]]` command specs (`name`, `command`, `required`, `timeout_secs`)
+- **Validator execution engine** (Task 2.2): `run_validation_pass` executes declared validators workspace-confined (lexical normalize + canonical containment, symlink-safe) with bounded/redacted output capture, per-spec timeout, fail-fast semantics with skipped results, and every outcome journaled as validation evidence (CLI wiring pending)
+- **Edit-protocol metrics** (Task 2.3/2.4): first-pass vs repaired edit outcomes tracked and journaled per run, plus `[agent] max_repair_attempts` bounded repair policy (`None` falls back to `max_healing_attempts`)
+- **Static edit-format fallback ladder** (Task 2.5): classified edit-application failures promote a one-way `search_replace → patch → full_file` hint for the rest of the run; an explicit `[agent] edit_format_override` always wins and the hint never demotes mid-run
+
+### Fixed
+
+- Windows journal storage: close event files before renaming the staging dir, lock a sentinel byte instead of the whole file, acquire the event-file lock after publishing the run dir, avoid append-mode event files ("Access is denied")
+
 ## [0.2.0] - 2026-08-11
 
 ### Added
