@@ -39,6 +39,20 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+use std::sync::{Mutex, MutexGuard};
+
+/// Locks a synchronous mutex and recovers its guarded data after poisoning.
+///
+/// Poisoning records that another thread panicked while holding the mutex; it
+/// does not make the guarded value inaccessible. Recovering here prevents
+/// security-sensitive state from silently becoming `None` or a default value.
+pub(crate) fn lock_sync<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("recovering state from a poisoned mutex");
+        poisoned.into_inner()
+    })
+}
+
 pub mod agent;
 pub mod approval;
 pub mod auth;
