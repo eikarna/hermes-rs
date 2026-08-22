@@ -202,22 +202,39 @@ impl KeruxTool for PatchTool {
 mod tests {
     use super::*;
     use crate::tools::ToolContext;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(timestamp: u128) -> std::path::PathBuf {
+        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "kerux_patch_test_{}_{}_{}.txt",
+            std::process::id(),
+            timestamp,
+            sequence
+        ))
+    }
 
     fn default_context() -> ToolContext {
         ToolContext::default()
     }
 
     fn create_temp_file(content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "kerux_patch_test_{}.txt",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = temp_path(timestamp);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn temp_paths_are_unique_for_identical_timestamps() {
+        let first = temp_path(42);
+        let second = temp_path(42);
+        assert_ne!(first, second);
     }
 
     #[tokio::test]
