@@ -1733,12 +1733,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn resolve_oauth_token_refreshes_when_expired_and_persists() {
         let dir = std::env::temp_dir().join(format!("kerux-auth-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Isolate the default auth store (used by `save_default`/`load_default`
         // inside `resolve_oauth_token`) so the test never writes over the
         // developer's real `~/.kerux/data/auth.json`.
+        let previous_kerux_home = std::env::var_os("KERUX_HOME");
         std::env::set_var("KERUX_HOME", dir.to_str().unwrap());
         let path = dir.join("auth.json");
         let mut server = mockito::Server::new_async().await;
@@ -1790,5 +1792,9 @@ mod tests {
         assert_eq!(stored.refresh_token, "refresh-2");
         _m.assert_async().await;
         server.reset();
+        match previous_kerux_home {
+            Some(value) => std::env::set_var("KERUX_HOME", value),
+            None => std::env::remove_var("KERUX_HOME"),
+        }
     }
 }

@@ -625,6 +625,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn home_paths_are_scrubbed_and_chain_still_verifies() {
         let home = dirs::home_dir().unwrap();
         let leaky = home.join("secret-project/main.rs");
@@ -676,6 +677,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn html_export_is_offline_clean_and_embeds_verifiable_data() {
         let home = dirs::home_dir().unwrap();
         let root = tempfile::tempdir().unwrap();
