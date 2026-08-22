@@ -219,6 +219,19 @@ impl KeruxTool for EditBlockTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(timestamp: u128) -> PathBuf {
+        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "kerux_editblock_test_{}_{}_{}.txt",
+            std::process::id(),
+            timestamp,
+            sequence
+        ))
+    }
 
     #[test]
     fn parses_single_block() {
@@ -275,15 +288,20 @@ mod tests {
     }
 
     fn create_temp_file(content: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "kerux_editblock_test_{}.txt",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = temp_path(timestamp);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn temp_paths_are_unique_for_identical_timestamps() {
+        let first = temp_path(42);
+        let second = temp_path(42);
+        assert_ne!(first, second);
     }
 
     #[tokio::test]
