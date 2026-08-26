@@ -101,8 +101,8 @@ pub use client::{
 pub use config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
     BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings,
-    LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TelemetrySettings,
-    TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
+    LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TasteSettings,
+    TelemetrySettings, TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
 };
 pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use context_files::{
