@@ -122,12 +122,39 @@ Returns `None` when nothing clears the threshold or `max_items == 0` —
 callers omit the block entirely rather than injecting an empty section.
 `retain_confident(min)` prunes weak preferences from a profile outright.
 
+## Extraction engine
+
+`crates/kerux-core/src/taste_extraction.rs` implements
+`PreferenceExtractor` as `TrajectoryPreferenceExtractor`: a deterministic,
+LLM-free miner over recorded `Trajectory` steps (the canonical action
+record; `messages` mirror the same tool calls and are skipped to avoid
+double-counting). It emits `supports = true` evidence only — counter-
+evidence is reserved for explicit/manual signals.
+
+Signals mined per trajectory step:
+
+| Step | Signal | Key → value |
+|------|--------|-------------|
+| `terminal` | toolchain commands (`cargo test/clippy/fmt/build`, `pytest`, `jest`, `eslint`, `prettier`, `go test`, `make`, `tsc`, ...) | `test runner`, `linter`, `formatter`, `build tool` |
+| `terminal` | `git add <path>` vs `git add -A`/`git commit -am` | `commit style` → `staged per-file commits` / `bulk commits` |
+| `terminal` after an edit step | tests run right after `file_write`/`patch`/`edit_block` | `test discipline` → `runs tests after edits` (once per edit cycle) |
+| `file_write`/`patch`/`edit_block` | file extension | `primary language` → `Rust`, `TypeScript`, ... |
+| `file_write`/`patch`/`edit_block` | file-stem casing | `file naming` → `snake_case` / `kebab-case` / `camelCase` / `PascalCase` |
+| `file_write`/`patch`/`edit_block` | shallowest space indent or tab dominance of written content | `indentation` → `2 spaces` / `3 spaces` / `4 spaces` / `tabs` |
+| `file_write` (non-append) vs `patch`/`edit_block` | edit granularity | `edit style` → `full file rewrites` / `targeted patches` |
+
+Retry-loop guard: identical `(key, value)` observations are capped per
+trajectory (`max_repeats_per_trajectory`, default 3), so one stuck session
+cannot saturate a preference. Confidence scoring stays in `taste.rs` —
+the extractor only emits evidence, folded via
+`TasteProfile::apply_observations`.
+
 ## Division of labor
 
 - `taste.rs` (this design): schema, scoring math, storage, merge, prompt
   rendering.
-- Extraction engine (trajectories → observations): implements
-  `PreferenceExtractor`, folds results via
+- `taste_extraction.rs`: `TrajectoryPreferenceExtractor` implements
+  `PreferenceExtractor`; results fold via
   `TasteProfile::apply_observations`.
 - System-prompt wiring and `kerux taste push/pull` CLI: built on
   `TasteStore` + `render_prompt_block` + `project_taste_path`.
