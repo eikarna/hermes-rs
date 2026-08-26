@@ -20,7 +20,7 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 - Windows journal storage: close event files before renaming the staging dir, lock a sentinel byte instead of the whole file, acquire the event-file lock after publishing the run dir, avoid append-mode event files ("Access is denied")
 - Recover poisoned synchronous mutex state instead of silently dropping gateway approval requests, bypassing dangerous-tool approval gates, or resetting agent telemetry/recorder state.
 - Enforce terminal command timeouts as one wall-clock deadline across output reads, process waiting, and termination instead of re-arming the timeout for every output line.
-- Represent OpenAI-compatible and Gemini HTTP failures with typed status/body errors so fallback routing reliably distinguishes transient 429/5xx responses from deterministic client errors.
+- Represent OpenAI-compatible, Anthropic, and Gemini HTTP failures as typed status/body errors so fallback routing reliably distinguishes transient 429/5xx responses from deterministic client errors.
 - Avoid blocking async/TUI workers during executable probes and git checkpoints by using direct `PATH` scans and `spawn_blocking` for synchronous git operations.
 
 ## [0.2.0] - 2026-08-11
