@@ -3,7 +3,7 @@
 //! Implements the ReAct (Reason + Act) pattern for LLM-driven tool execution.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, Future};
 use futures::StreamExt;
@@ -16,7 +16,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::client::AnthropicClient;
 use crate::client::{
     ChatResponse, ChatStreamEvent, ChatStreamResponse, LLMProvider, Message, OpenAIClient, Role,
-    ToolCall,
+    ToolCall, Usage,
 };
 use crate::config::{runtime_config, BehaviorSettings};
 use crate::context::{estimate_message_tokens, estimate_tokens};
@@ -116,7 +116,7 @@ pub enum AgentEvent {
     Error { error: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentTelemetry {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
@@ -125,6 +125,11 @@ pub struct AgentTelemetry {
     pub compacted: bool,
     pub estimated: bool,
     pub billable: bool,
+    pub tokens_per_second: Option<f64>,
+    pub estimated_cost_usd: Option<f64>,
+    pub turns_completed: usize,
+    pub context_window_usage_pct: Option<f64>,
+    pub cached_prompt_tokens: usize,
 }
 
 fn unix_timestamp_ms() -> u64 {
@@ -194,6 +199,11 @@ fn agent_event_record(event: &AgentEvent) -> Option<(&'static str, serde_json::V
                 "compacted": telemetry.compacted,
                 "estimated": telemetry.estimated,
                 "billable": telemetry.billable,
+                "tokens_per_second": telemetry.tokens_per_second,
+                "estimated_cost_usd": telemetry.estimated_cost_usd,
+                "turns_completed": telemetry.turns_completed,
+                "context_window_usage_pct": telemetry.context_window_usage_pct,
+                "cached_prompt_tokens": telemetry.cached_prompt_tokens,
             }),
         )),
         AgentEvent::IterationComplete { iteration } => Some((
@@ -991,8 +1001,9 @@ impl KeruxAgent {
 
             // Get tool schemas
             let tools = self.registry.get_schemas().await;
-            let (request_messages, preflight_telemetry) =
+            let (request_messages, mut preflight_telemetry) =
                 self.prepare_request_messages(&messages, &tools)?;
+            preflight_telemetry.turns_completed = iteration;
             self.emit(AgentEvent::Telemetry {
                 telemetry: preflight_telemetry.clone(),
             })
@@ -1010,16 +1021,19 @@ impl KeruxAgent {
                     .client
                     .chat_streaming(&self.config.model, &request_messages, Some(&tools))
                     .await?;
+                let stream_started = Instant::now();
                 match self
                     .process_stream(stream, &preflight_telemetry, &cancel)
                     .await
                 {
-                    Ok((response_text, reasoning_text, tool_calls)) => {
+                    Ok((response_text, reasoning_text, tool_calls, usage)) => {
                         self.emit_stream_telemetry(
                             &preflight_telemetry,
                             &response_text,
                             &reasoning_text,
                             &tool_calls,
+                            usage.as_ref(),
+                            stream_started.elapsed(),
                         )
                         .await?;
                         Ok((response_text, reasoning_text, tool_calls))
@@ -1027,11 +1041,13 @@ impl KeruxAgent {
                     Err(error) => Err(error),
                 }
             } else {
+                let request_started = Instant::now();
                 let response = self
                     .client
                     .chat(&self.config.model, &request_messages, Some(&tools))
                     .await?;
-                self.process_response(response, &preflight_telemetry).await
+                self.process_response(response, &preflight_telemetry, request_started.elapsed())
+                    .await
             };
 
             match response {
@@ -1249,6 +1265,15 @@ impl KeruxAgent {
                 compacted,
                 estimated: true,
                 billable: false,
+                tokens_per_second: None,
+                estimated_cost_usd: None,
+                turns_completed: 0,
+                context_window_usage_pct: if context_window > 0 {
+                    Some((prompt_tokens as f64 / context_window as f64) * 100.0)
+                } else {
+                    None
+                },
+                cached_prompt_tokens: 0,
             },
         ))
     }
@@ -1259,19 +1284,40 @@ impl KeruxAgent {
         response_text: &str,
         reasoning_text: &str,
         tool_calls: &[ToolCall],
+        usage: Option<&Usage>,
+        elapsed: Duration,
     ) -> Result<()> {
-        let completion_tokens = estimate_tokens(response_text)
+        let estimated_completion_tokens = estimate_tokens(response_text)
             + estimate_tokens(reasoning_text)
             + total_tool_call_tokens(tool_calls);
+        let prompt_tokens = usage
+            .map(|usage| usage.prompt_tokens as usize)
+            .unwrap_or(preflight.prompt_tokens);
+        let completion_tokens = usage
+            .map(|usage| usage.completion_tokens as usize)
+            .unwrap_or(estimated_completion_tokens);
+        let total_tokens = usage
+            .map(|usage| usage.total_tokens as usize)
+            .unwrap_or(prompt_tokens + completion_tokens);
         self.emit(AgentEvent::Telemetry {
             telemetry: AgentTelemetry {
-                prompt_tokens: preflight.prompt_tokens,
+                prompt_tokens,
                 completion_tokens,
-                total_tokens: preflight.prompt_tokens + completion_tokens,
+                total_tokens,
                 context_window: preflight.context_window,
                 compacted: preflight.compacted,
-                estimated: true,
+                estimated: usage.is_none(),
                 billable: true,
+                tokens_per_second: tokens_per_second(completion_tokens, elapsed),
+                estimated_cost_usd: None,
+                turns_completed: preflight.turns_completed,
+                context_window_usage_pct: context_window_usage(
+                    total_tokens,
+                    preflight.context_window,
+                ),
+                cached_prompt_tokens: usage
+                    .map(|usage| usage.cached_prompt_tokens as usize)
+                    .unwrap_or(0),
             },
         })
         .await
@@ -1283,19 +1329,29 @@ impl KeruxAgent {
         response_text: &str,
         reasoning_text: &str,
         tool_calls: &[ToolCall],
+        elapsed: Duration,
     ) -> Result<()> {
         let completion_tokens = estimate_tokens(response_text)
             + estimate_tokens(reasoning_text)
             + total_tool_call_tokens(tool_calls);
+        let total_tokens = preflight.prompt_tokens + completion_tokens;
         self.emit(AgentEvent::Telemetry {
             telemetry: AgentTelemetry {
                 prompt_tokens: preflight.prompt_tokens,
                 completion_tokens,
-                total_tokens: preflight.prompt_tokens + completion_tokens,
+                total_tokens,
                 context_window: preflight.context_window,
                 compacted: preflight.compacted,
                 estimated: true,
                 billable: false,
+                tokens_per_second: tokens_per_second(completion_tokens, elapsed),
+                estimated_cost_usd: None,
+                turns_completed: preflight.turns_completed,
+                context_window_usage_pct: context_window_usage(
+                    total_tokens,
+                    preflight.context_window,
+                ),
+                cached_prompt_tokens: 0,
             },
         })
         .await
@@ -1328,7 +1384,8 @@ impl KeruxAgent {
         mut stream: ChatStreamResponse,
         preflight: &AgentTelemetry,
         cancel: &Arc<std::sync::atomic::AtomicBool>,
-    ) -> Result<(String, String, Vec<ToolCall>)> {
+    ) -> Result<(String, String, Vec<ToolCall>, Option<Usage>)> {
+        let stream_started = Instant::now();
         let mut parser = ToolCallStreamParser::new().on_tool_call(|tc| {
             let tc_id = tc.id.clone();
             debug!(tool_call_id = %tc_id, name = %tc.function.name, "Early tool call detected");
@@ -1338,6 +1395,7 @@ impl KeruxAgent {
         let mut accumulated_text = String::new();
         let mut accumulated_reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut usage = None;
         let mut has_error = false;
 
         while let Some(event_result) = stream.next().await {
@@ -1351,7 +1409,9 @@ impl KeruxAgent {
             }
             match event_result {
                 Ok(event) => {
-                    // Process the event
+                    if event.usage.is_some() {
+                        usage = event.usage.clone();
+                    }
                     if let Some(reasoning) = extract_reasoning_from_event(&event) {
                         let reasoning = strip_reasoning_tags(&reasoning);
                         if !reasoning.is_empty() {
@@ -1362,6 +1422,7 @@ impl KeruxAgent {
                                 &accumulated_text,
                                 &accumulated_reasoning,
                                 &tool_calls,
+                                stream_started.elapsed(),
                             )
                             .await?;
                         }
@@ -1388,6 +1449,7 @@ impl KeruxAgent {
                                     &accumulated_text,
                                     &accumulated_reasoning,
                                     &tool_calls,
+                                    stream_started.elapsed(),
                                 )
                                 .await?;
                             }
@@ -1404,6 +1466,7 @@ impl KeruxAgent {
                                 &accumulated_text,
                                 &accumulated_reasoning,
                                 &tool_calls,
+                                stream_started.elapsed(),
                             )
                             .await?;
                         }
@@ -1421,6 +1484,7 @@ impl KeruxAgent {
                             &accumulated_text,
                             &accumulated_reasoning,
                             &tool_calls,
+                            stream_started.elapsed(),
                         )
                         .await?;
                     }
@@ -1457,13 +1521,14 @@ impl KeruxAgent {
             merge_stream_tool_call(&mut tool_calls, tc);
         }
 
-        Ok((accumulated_text, accumulated_reasoning, tool_calls))
+        Ok((accumulated_text, accumulated_reasoning, tool_calls, usage))
     }
 
     async fn process_response(
         &self,
         response: ChatResponse,
         preflight: &AgentTelemetry,
+        elapsed: Duration,
     ) -> Result<(String, String, Vec<ToolCall>)> {
         let usage = response.usage.clone();
         let choice = response
@@ -1508,6 +1573,11 @@ impl KeruxAgent {
                 compacted: preflight.compacted,
                 estimated: false,
                 billable: true,
+                tokens_per_second: tokens_per_second(usage.completion_tokens as usize, elapsed),
+                estimated_cost_usd: preflight.estimated_cost_usd,
+                turns_completed: preflight.turns_completed,
+                context_window_usage_pct: preflight.context_window_usage_pct,
+                cached_prompt_tokens: usage.cached_prompt_tokens as usize,
             },
         })
         .await?;
@@ -1802,6 +1872,17 @@ fn total_tool_call_tokens(tool_calls: &[ToolCall]) -> usize {
                 .unwrap_or_default()
         })
         .sum()
+}
+
+fn tokens_per_second(completion_tokens: usize, elapsed: Duration) -> Option<f64> {
+    if completion_tokens == 0 || elapsed.is_zero() {
+        return None;
+    }
+    Some(completion_tokens as f64 / elapsed.as_secs_f64())
+}
+
+fn context_window_usage(total_tokens: usize, context_window: usize) -> Option<f64> {
+    (context_window > 0).then_some(total_tokens as f64 / context_window as f64 * 100.0)
 }
 
 fn compact_request_messages(messages: &[Message], max_tokens: usize) -> Vec<Message> {
@@ -2368,6 +2449,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
+                    cached_prompt_tokens: 0,
                 },
             })
         }
@@ -2716,6 +2798,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
 
         let text = extract_text_from_event(&event);
@@ -2892,6 +2975,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                cached_prompt_tokens: 0,
             },
         };
 
@@ -2903,9 +2987,12 @@ mod tests {
             compacted: false,
             estimated: true,
             billable: false,
+            ..AgentTelemetry::default()
         };
-        let (content, reasoning, tool_calls) =
-            agent.process_response(response, &telemetry).await.unwrap();
+        let (content, reasoning, tool_calls) = agent
+            .process_response(response, &telemetry, Duration::from_secs(1))
+            .await
+            .unwrap();
 
         assert_eq!(content, "");
         assert_eq!(reasoning, "need tool");
@@ -2989,6 +3076,9 @@ mod tests {
             Ok(bytes::Bytes::from_static(
                 b"data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"demo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Second streamed chunk for telemetry.\"},\"finish_reason\":null}]}\n\n",
             )),
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"demo\",\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":20,\"total_tokens\":60,\"prompt_tokens_details\":{\"cached_tokens\":16}}}\n\n",
+            )),
         ];
         let stream = ChatStreamResponse::new(futures::stream::iter(chunks));
         let preflight = AgentTelemetry {
@@ -2999,22 +3089,45 @@ mod tests {
             compacted: false,
             estimated: true,
             billable: false,
+            turns_completed: 2,
+            ..AgentTelemetry::default()
         };
 
         let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (content, _, _) = agent
+        let (content, reasoning, tool_calls, usage) = agent
             .process_stream(stream, &preflight, &no_cancel)
+            .await
+            .unwrap();
+        agent
+            .emit_stream_telemetry(
+                &preflight,
+                &content,
+                &reasoning,
+                &tool_calls,
+                usage.as_ref(),
+                Duration::from_secs(2),
+            )
             .await
             .unwrap();
 
         assert!(content.contains("Second streamed chunk"));
         let mut telemetry_events = 0;
+        let mut final_telemetry = None;
         while let Ok(event) = rx.try_recv() {
-            if matches!(event, AgentEvent::Telemetry { .. }) {
+            if let AgentEvent::Telemetry { telemetry } = event {
                 telemetry_events += 1;
+                if telemetry.billable {
+                    final_telemetry = Some(telemetry);
+                }
             }
         }
-        assert!(telemetry_events >= 2);
+        assert!(telemetry_events >= 3);
+        let final_telemetry = final_telemetry.unwrap();
+        assert!(!final_telemetry.estimated);
+        assert_eq!(final_telemetry.total_tokens, 60);
+        assert_eq!(final_telemetry.cached_prompt_tokens, 16);
+        assert_eq!(final_telemetry.turns_completed, 2);
+        assert_eq!(final_telemetry.tokens_per_second, Some(10.0));
     }
 
     #[tokio::test]
@@ -3040,10 +3153,11 @@ mod tests {
             compacted: false,
             estimated: true,
             billable: false,
+            ..AgentTelemetry::default()
         };
 
         let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (_, _, tool_calls) = agent
+        let (_, _, tool_calls, _) = agent
             .process_stream(stream, &preflight, &no_cancel)
             .await
             .unwrap();
@@ -3088,10 +3202,11 @@ mod tests {
             compacted: false,
             estimated: true,
             billable: false,
+            ..AgentTelemetry::default()
         };
 
         let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (content, reasoning, tool_calls) = agent
+        let (content, reasoning, tool_calls, _) = agent
             .process_stream(stream, &preflight, &no_cancel)
             .await
             .unwrap();
@@ -3125,10 +3240,11 @@ mod tests {
             compacted: false,
             estimated: true,
             billable: false,
+            ..AgentTelemetry::default()
         };
 
         let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (_, _, tool_calls) = agent
+        let (_, _, tool_calls, _) = agent
             .process_stream(stream, &preflight, &no_cancel)
             .await
             .unwrap();
@@ -4172,6 +4288,7 @@ mod tests {
             compacted: false,
             estimated: true,
             billable: false,
+            ..AgentTelemetry::default()
         };
 
         agent
