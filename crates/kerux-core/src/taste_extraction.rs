@@ -886,4 +886,60 @@ mod tests {
         assert!(block.contains("targeted patches"));
         assert!(!block.contains("full file rewrites"));
     }
+
+    #[test]
+    fn semicolon_and_pipe_separators_split_segments() {
+        let observations = extract(vec![term_step("cargo fmt; cargo clippy | tee out.txt")]);
+        assert_eq!(count_key(&observations, "formatter"), 1);
+        assert_eq!(count_key(&observations, "linter"), 1);
+    }
+
+    #[test]
+    fn git_add_all_variants_and_commit_a_are_bulk() {
+        let all = extract(vec![term_step("git add --all && git commit -m 'x'")]);
+        assert_eq!(find(&all, "commit style")[0].value, "bulk commits");
+
+        let dot = extract(vec![term_step("git add . && git commit -m 'x'")]);
+        assert_eq!(find(&dot, "commit style")[0].value, "bulk commits");
+
+        let commit_a = extract(vec![term_step("git commit -a -m 'x'")]);
+        assert_eq!(find(&commit_a, "commit style")[0].value, "bulk commits");
+
+        // Flag-only add (e.g. `git add -p`) carries no staging signal.
+        let flag_add = extract(vec![term_step("git add -p")]);
+        assert_eq!(count_key(&flag_add, "commit style"), 0);
+    }
+
+    #[test]
+    fn indentation_three_spaces_tab_majority_and_single_space() {
+        assert_eq!(detect_indentation("def f():\n   x = 1\n"), Some("3 spaces"));
+        // More tab-leading lines than space-indented lines -> tabs win.
+        assert_eq!(detect_indentation("a\n\tb\n\tc\n  d\n"), Some("tabs"));
+        // Single-space indent is ambiguous.
+        assert_eq!(detect_indentation("a\n b\n"), None);
+    }
+
+    #[test]
+    fn identifier_edge_cases() {
+        assert_eq!(classify_identifier("Foo_Bar"), None);
+        assert_eq!(classify_identifier("a1_b2"), Some("snake_case"));
+        assert_eq!(classify_identifier("AB"), None);
+        assert_eq!(classify_identifier("a-b"), Some("kebab-case"));
+    }
+
+    #[test]
+    fn language_mapping_is_case_insensitive() {
+        assert_eq!(language_from_path("src/LIB.RS"), Some("Rust"));
+        assert_eq!(language_from_path("app/Main.Py"), Some("Python"));
+    }
+
+    #[test]
+    fn file_tools_without_path_emit_nothing() {
+        let observations = extract(vec![
+            step("file_write", json!({ "content": "fn main() {}" })),
+            step("patch", json!({ "find": "a", "replace": "b" })),
+            step("edit_block", json!({ "edits": [] })),
+        ]);
+        assert!(observations.is_empty());
+    }
 }

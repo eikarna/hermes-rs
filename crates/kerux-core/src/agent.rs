@@ -2580,6 +2580,70 @@ mod tests {
         assert!(prompt.contains("confidence 0.80"));
     }
 
+    fn taste_settings(enabled: bool, min_confidence: f32) -> crate::config::TasteSettings {
+        crate::config::TasteSettings {
+            enabled,
+            min_confidence,
+            max_items: 10,
+        }
+    }
+
+    fn write_confident_profile(dir: &std::path::Path, confidence: f32) {
+        let mut profile = crate::taste::TasteProfile::new("project");
+        profile.preferences.push(crate::taste::TastePreference {
+            key: "test runner".to_string(),
+            category: crate::taste::PreferenceCategory::Testing,
+            value: "cargo nextest".to_string(),
+            positive: 20,
+            negative: 0,
+            confidence,
+            source: crate::taste::PreferenceSource::Extracted,
+            first_observed_at: 1,
+            last_observed_at: 2,
+        });
+        crate::persist::write_json(&crate::taste::project_taste_path(dir), &profile).unwrap();
+    }
+
+    #[test]
+    fn append_taste_profile_prompt_disabled_leaves_prompt_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        write_confident_profile(dir.path(), 0.8);
+
+        let mut prompt = "base prompt".to_string();
+        append_taste_profile_prompt(&mut prompt, dir.path(), &taste_settings(false, 0.5));
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[test]
+    fn append_taste_profile_prompt_missing_file_leaves_prompt_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prompt = "base prompt".to_string();
+        append_taste_profile_prompt(&mut prompt, dir.path(), &taste_settings(true, 0.5));
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[test]
+    fn append_taste_profile_prompt_corrupt_file_leaves_prompt_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::taste::project_taste_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+
+        let mut prompt = "base prompt".to_string();
+        append_taste_profile_prompt(&mut prompt, dir.path(), &taste_settings(true, 0.5));
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[test]
+    fn append_taste_profile_prompt_below_threshold_renders_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_confident_profile(dir.path(), 0.2);
+
+        let mut prompt = "base prompt".to_string();
+        append_taste_profile_prompt(&mut prompt, dir.path(), &taste_settings(true, 0.5));
+        assert_eq!(prompt, "base prompt");
+    }
+
     #[tokio::test]
     async fn build_messages_injects_long_term_memory() {
         let memory_manager = MemoryManager::new();
