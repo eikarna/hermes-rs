@@ -19,7 +19,9 @@ futures-util = { workspace = true }
 pin-project = { workspace = true }
 
 # Networking
-reqwest = { workspace = true }
+reqwest.workspace = true
+axum.workspace = true
+tower = { version = "0.5", features = ["util"] }
 
 # Serialization
 serde = { workspace = true }
