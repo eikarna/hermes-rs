@@ -79,6 +79,7 @@ pub mod scheduler;
 pub mod schema;
 pub mod session_store;
 pub mod skills;
+pub mod taste;
 pub mod tools;
 pub mod trajectory;
 pub mod validation;
@@ -123,6 +124,11 @@ pub use repomap::{
     MinimalRepoMap, RepoMapRenderer, RepoTag, TagKind,
 };
 pub use skills::{write_skill_metadata, Skill, SkillManager, SkillOrigin, ARCHIVE_DIR_NAME};
+pub use taste::{
+    compute_confidence, project_taste_path, FileTasteStore, PreferenceCategory,
+    PreferenceExtractor, PreferenceObservation, PreferenceSource, TastePreference, TasteProfile,
+    TasteStore, HALF_SATURATION, TASTE_SCHEMA_VERSION,
+};
 pub use tools::{
     register_builtin_tools, register_builtin_tools_with_provider_sub_agent,
     register_builtin_tools_with_sub_agent, KeruxTool, ToolRegistry, ToolResult,
