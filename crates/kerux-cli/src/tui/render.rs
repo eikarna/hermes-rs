@@ -866,6 +866,18 @@ fn session_summary_widget(state: &AppState) -> Paragraph<'_> {
             Span::styled(context_usage_summary(state), Style::default().fg(TEXT)),
         ]),
         Line::from(vec![
+            Span::styled("tokens/sec ", Style::default().fg(MUTED)),
+            Span::styled(tokens_per_second_summary(state), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("cache ", Style::default().fg(MUTED)),
+            Span::styled(cache_hit_summary(state), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("hud ", Style::default().fg(MUTED)),
+            Span::styled(telemetry_hud_summary(state), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
             Span::styled("auto compaction ", Style::default().fg(MUTED)),
             Span::styled(compaction_summary(state), Style::default().fg(TEXT)),
         ]),
@@ -902,6 +914,31 @@ fn context_usage_summary(state: &AppState) -> String {
     format!("{used}/{window} tokens ({percent:.1}% full, {remaining:.1}% before full){source}")
 }
 
+fn tokens_per_second_summary(state: &AppState) -> String {
+    let telemetry = &state.session.telemetry;
+    if !state.persistent.config.telemetry.enabled {
+        return "disabled".to_string();
+    }
+    match telemetry.tokens_per_second {
+        Some(tps) => format!("{tps:.1} tok/s"),
+        None => "waiting".to_string(),
+    }
+}
+
+fn cache_hit_summary(state: &AppState) -> String {
+    let telemetry = &state.session.telemetry;
+    if !state.persistent.config.telemetry.enabled {
+        return "disabled".to_string();
+    }
+    if telemetry.prompt_tokens == 0 {
+        return "waiting".to_string();
+    }
+    let cached = telemetry.cached_prompt_tokens;
+    let total_prompt = telemetry.prompt_tokens;
+    let pct = (cached as f64 / total_prompt as f64 * 100.0).min(100.0);
+    format!("{cached} tok ({pct:.1}%)")
+}
+
 fn compaction_summary(state: &AppState) -> String {
     let telemetry = &state.session.telemetry;
     if !state.persistent.config.telemetry.enabled {
@@ -917,18 +954,61 @@ fn compaction_summary(state: &AppState) -> String {
     }
 }
 
+fn telemetry_hud_summary(state: &AppState) -> String {
+    let telemetry = &state.session.telemetry;
+    if !state.persistent.config.telemetry.enabled {
+        return "disabled".to_string();
+    }
+    if telemetry.total_tokens == 0 {
+        return "waiting for live metrics".to_string();
+    }
+
+    let context_pct = telemetry.context_window_usage_pct.unwrap_or_else(|| {
+        if telemetry.context_window == 0 {
+            0.0
+        } else {
+            telemetry.total_tokens as f64 / telemetry.context_window as f64 * 100.0
+        }
+    });
+    format!(
+        "{} tok · {context_pct:.1}% ctx · turn {} · {}",
+        compact_token_count(telemetry.total_tokens),
+        telemetry.turns_completed,
+        cost_summary(state),
+    )
+}
+
+fn compact_token_count(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 fn cost_summary(state: &AppState) -> String {
     let settings = &state.persistent.config.telemetry;
     if !settings.enabled {
         return "disabled".to_string();
     }
-    if settings.input_cost_per_million == 0.0 && settings.output_cost_per_million == 0.0 {
+    let cost = state.session.telemetry.total_cost;
+    let rates_unset =
+        settings.input_cost_per_million == 0.0 && settings.output_cost_per_million == 0.0;
+    if rates_unset && cost <= 0.0 {
         return format!("{} rates not configured", settings.currency);
     }
-    format!(
-        "{} {:.4}",
-        settings.currency, state.session.telemetry.total_cost
-    )
+    format!("{}{:.4}", currency_symbol(&settings.currency), cost)
+}
+
+fn currency_symbol(currency: &str) -> &str {
+    match currency {
+        "USD" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        other => other,
+    }
 }
 
 fn render_session_compact_widget(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
@@ -1640,7 +1720,7 @@ mod tests {
     use kerux_core::config::AppConfig;
 
     use super::*;
-    use crate::tui::state::{AppState, ViewMode};
+    use crate::tui::state::{AppState, TelemetryState, ViewMode};
 
     fn buffer_text(state: &AppState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -1920,5 +2000,33 @@ mod tests {
         assert!(text.contains("╭─ Tool file_read"));
         assert!(text.contains("│ {\"path\":\"README.md\"}"));
         assert!(text.contains("╰─"));
+    }
+
+    #[test]
+    fn live_telemetry_hud_renders_metrics_and_indicators() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.telemetry = TelemetryState {
+            prompt_tokens: 1200,
+            completion_tokens: 300,
+            total_tokens: 1500,
+            context_window: 12400,
+            compacted: false,
+            estimated: false,
+            total_cost: 0.0045,
+            tokens_per_second: Some(42.5),
+            turns_completed: 3,
+            context_window_usage_pct: Some(12.5),
+            cached_prompt_tokens: 400,
+        };
+
+        let text = buffer_text(&state, 160, 40);
+
+        assert!(text.contains("42.5 tok/s"));
+        assert!(text.contains("cache 400"));
+        assert!(text.contains("$0.0045"));
+        assert!(text.contains("1.5k tok"));
+        assert!(text.contains("12.5% ctx"));
     }
 }
