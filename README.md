@@ -19,7 +19,7 @@
 ## Highlights
 
 - **Streaming-first ReAct loop** — tool calls detected and executed incrementally from partial LLM output, with a tolerant XML parser and self-healing re-prompts on failure
-- **Ratatui TUI** — prompt-first landing screen, responsive workspace panes, reasoning rails, tool activity blocks, MCP/Skills/Behavior management
+- **Ratatui TUI** — prompt-first landing screen, responsive workspace panes, reasoning rails, tool activity blocks, MCP/Skills/Behavior management, live telemetry HUD (tok/s, cache hits, context %, cost)
 - **Messaging gateway** (`kerux serve`) — Telegram long-polling + WhatsApp bridge + Discord/Slack REST adapters, MarkdownV2 conversion, live status edits, SSE streaming replies, tool approval via inline keyboard, voice-note STT, cron scheduler, subagent delegation
 - **Autonomous coding mode** — 24/7 loop that reads `TODO.md`, validates with local tests, and only pushes after success
 - **Persistent state** — sessions, memory, todos, and cron jobs survive restarts (atomic JSON writes under `~/.kerux/`)
