@@ -128,6 +128,11 @@ enum Commands {
         #[command(subcommand)]
         command: AuthCommands,
     },
+    /// Share learned coding-style profiles between projects.
+    Taste {
+        #[command(subcommand)]
+        command: TasteCommands,
+    },
     /// Inspect recorded run journals (read-only; never executes anything)
     Runs {
         #[command(subcommand)]
@@ -177,6 +182,20 @@ enum AuthCommands {
     },
     List,
     Logout {
+        #[arg()]
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TasteCommands {
+    /// Save this project's profile into the portable registry.
+    Push {
+        #[arg()]
+        name: String,
+    },
+    /// Merge a registry profile into this project.
+    Pull {
         #[arg()]
         name: String,
     },
@@ -462,6 +481,39 @@ fn apply_auth_profile_to_client(
     }
     client.base_url = trusted_base_url;
     Ok(client)
+}
+
+fn push_taste_profile(
+    project_root: &std::path::Path,
+    store: &dyn kerux_core::taste::TasteStore,
+    name: &str,
+) -> Result<()> {
+    let path = kerux_core::taste::project_taste_path(project_root);
+    let profile = kerux_core::persist::read_json::<kerux_core::taste::TasteProfile>(&path)
+        .with_context(|| format!("No readable project taste profile at {}", path.display()))?;
+    store
+        .save(name, &profile)
+        .with_context(|| format!("Failed to save taste profile '{name}'"))
+}
+
+fn pull_taste_profile(
+    project_root: &std::path::Path,
+    store: &dyn kerux_core::taste::TasteStore,
+    name: &str,
+) -> Result<()> {
+    let remote = store
+        .load(name)
+        .with_context(|| format!("Taste profile '{name}' was not found or is unreadable"))?;
+    let path = kerux_core::taste::project_taste_path(project_root);
+    let mut local = kerux_core::persist::read_json::<kerux_core::taste::TasteProfile>(&path)
+        .unwrap_or_else(|| kerux_core::taste::TasteProfile::new(name));
+    local.merge(&remote);
+    kerux_core::persist::write_json(&path, &local).with_context(|| {
+        format!(
+            "Failed to write project taste profile at {}",
+            path.display()
+        )
+    })
 }
 
 fn agent_config(
@@ -2008,6 +2060,21 @@ async fn main() -> Result<()> {
         Commands::Auth { command } => {
             handle_auth_command(command).await?;
         }
+        Commands::Taste { command } => {
+            let project_root =
+                std::env::current_dir().context("Failed to determine current project directory")?;
+            let store = kerux_core::taste::FileTasteStore::at_default_root();
+            match command {
+                TasteCommands::Push { name } => {
+                    push_taste_profile(&project_root, &store, name)?;
+                    println!("Pushed project taste profile as '{name}'.");
+                }
+                TasteCommands::Pull { name } => {
+                    pull_taste_profile(&project_root, &store, name)?;
+                    println!("Pulled taste profile '{name}' into this project.");
+                }
+            }
+        }
         Commands::Runs { command } => {
             runs::handle(command)?;
         }
@@ -2023,6 +2090,103 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use kerux_core::auth::AuthProfile;
+
+    #[test]
+    fn cli_parses_taste_push_and_pull() {
+        let push = Cli::try_parse_from(["kerux", "taste", "push", "team"]).unwrap();
+        assert!(matches!(
+            push.command,
+            Commands::Taste {
+                command: TasteCommands::Push { ref name }
+            } if name == "team"
+        ));
+
+        let pull = Cli::try_parse_from(["kerux", "taste", "pull", "team"]).unwrap();
+        assert!(matches!(
+            pull.command,
+            Commands::Taste {
+                command: TasteCommands::Pull { ref name }
+            } if name == "team"
+        ));
+    }
+
+    #[test]
+    fn taste_push_saves_project_profile_to_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let store = kerux_core::taste::FileTasteStore::new(dir.path().join("registry"));
+        let mut profile = kerux_core::taste::TasteProfile::new("project");
+        profile
+            .preferences
+            .push(kerux_core::taste::TastePreference {
+                key: "formatter".to_string(),
+                category: kerux_core::taste::PreferenceCategory::Tooling,
+                value: "rustfmt".to_string(),
+                positive: 10,
+                negative: 0,
+                confidence: 2.0 / 3.0,
+                source: kerux_core::taste::PreferenceSource::Extracted,
+                first_observed_at: 1,
+                last_observed_at: 2,
+            });
+        kerux_core::persist::write_json(&kerux_core::taste::project_taste_path(&project), &profile)
+            .unwrap();
+
+        push_taste_profile(&project, &store, "team").unwrap();
+
+        assert_eq!(
+            kerux_core::taste::TasteStore::load(&store, "team"),
+            Some(profile)
+        );
+    }
+
+    #[test]
+    fn taste_pull_merges_registry_profile_into_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let store = kerux_core::taste::FileTasteStore::new(dir.path().join("registry"));
+        let mut local = kerux_core::taste::TasteProfile::new("project");
+        local.apply_observation(&kerux_core::taste::PreferenceObservation {
+            key: "formatter".to_string(),
+            category: kerux_core::taste::PreferenceCategory::Tooling,
+            value: "rustfmt".to_string(),
+            supports: true,
+            weight: 2,
+            source: kerux_core::taste::PreferenceSource::Extracted,
+            observed_at: 1,
+        });
+        kerux_core::persist::write_json(&kerux_core::taste::project_taste_path(&project), &local)
+            .unwrap();
+
+        let mut remote = kerux_core::taste::TasteProfile::new("team");
+        remote.apply_observation(&kerux_core::taste::PreferenceObservation {
+            key: "formatter".to_string(),
+            category: kerux_core::taste::PreferenceCategory::Tooling,
+            value: "rustfmt".to_string(),
+            supports: true,
+            weight: 3,
+            source: kerux_core::taste::PreferenceSource::Extracted,
+            observed_at: 2,
+        });
+        remote.apply_observation(&kerux_core::taste::PreferenceObservation {
+            key: "test runner".to_string(),
+            category: kerux_core::taste::PreferenceCategory::Testing,
+            value: "cargo nextest".to_string(),
+            supports: true,
+            weight: 1,
+            source: kerux_core::taste::PreferenceSource::Extracted,
+            observed_at: 2,
+        });
+        kerux_core::taste::TasteStore::save(&store, "team", &remote).unwrap();
+
+        pull_taste_profile(&project, &store, "team").unwrap();
+
+        let merged: kerux_core::taste::TasteProfile =
+            kerux_core::persist::read_json(&kerux_core::taste::project_taste_path(&project))
+                .unwrap();
+        assert_eq!(merged.find("formatter").unwrap().positive, 5);
+        assert_eq!(merged.find("test runner").unwrap().value, "cargo nextest");
+    }
 
     #[test]
     fn infers_provider_wire_format_from_auth_profile_endpoint() {
