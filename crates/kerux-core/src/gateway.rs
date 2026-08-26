@@ -29,6 +29,8 @@ pub struct GatewayConfig {
     pub slack_enabled: bool,
     /// Slack bot token
     pub slack_token: Option<String>,
+    /// Slack signing secret used to verify Events API requests
+    pub slack_signing_secret: Option<String>,
     /// Enable WhatsApp via the Baileys bridge
     pub whatsapp_enabled: bool,
     /// Base URL of the Baileys WhatsApp bridge
@@ -61,6 +63,7 @@ impl Default for GatewayConfig {
             discord_token: settings.discord_token,
             slack_enabled: settings.slack_enabled,
             slack_token: settings.slack_token,
+            slack_signing_secret: settings.slack_signing_secret,
             whatsapp_enabled: settings.whatsapp_enabled,
             whatsapp_bridge_url: settings.whatsapp_bridge_url,
             webhooks_enabled: settings.webhooks_enabled,
@@ -592,8 +595,6 @@ impl Gateway {
     /// this is what makes mid-run interrupts possible. Blocks until `stop()`
     /// is called (e.g. from a signal handler).
     pub async fn run(&self) -> Result<()> {
-        self.start().await?;
-
         let enabled: Vec<(String, Arc<dyn PlatformAdapter>)> = self
             .adapters
             .iter()
@@ -601,11 +602,32 @@ impl Gateway {
             .map(|(name, a)| (name.clone(), a.clone()))
             .collect();
 
-        if enabled.is_empty() {
+        if enabled.is_empty() && !self.config.webhooks_enabled {
             return Err(crate::error::Error::Agent(
-                "No enabled platform adapters to run".to_string(),
+                "No enabled platform adapters or webhook listener to run".to_string(),
             ));
         }
+
+        let webhook_listener = if self.config.webhooks_enabled {
+            let address = self.config.webhooks_addr.as_deref().ok_or_else(|| {
+                crate::error::Error::MissingConfig {
+                    key: "webhooks_addr".to_string(),
+                }
+            })?;
+            Some(
+                tokio::net::TcpListener::bind(address)
+                    .await
+                    .map_err(|error| {
+                        crate::error::Error::Agent(format!(
+                            "Failed to bind webhook listener at {address}: {error}"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        self.start().await?;
 
         info!(
             platforms = ?enabled.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
@@ -618,6 +640,59 @@ impl Gateway {
         // slowest adapter starve the rest. Each task owns its own loop and
         // dispatches into the shared gateway.
         let mut handles = Vec::new();
+
+        if let Some(listener) = webhook_listener {
+            let address = listener.local_addr().map_err(|error| {
+                crate::error::Error::Agent(format!(
+                    "Failed to inspect webhook listener address: {error}"
+                ))
+            })?;
+            let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel(100);
+            let state = WebhookServerState {
+                incoming_tx: Some(incoming_tx),
+                slack_signing_secret: self.config.slack_signing_secret.clone(),
+            };
+            let running = self.running.clone();
+            handles.push(tokio::spawn(async move {
+                info!(%address, "Webhook listener started");
+                let shutdown = async move {
+                    while *running.read().await {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                };
+                if let Err(error) = serve_webhook_listener(listener, state, shutdown).await {
+                    error!(%error, "Webhook listener stopped with an error");
+                }
+            }));
+
+            let adapters = self.adapters.clone();
+            let webhook_adapter: Arc<dyn PlatformAdapter> = Arc::new(WebhookAdapter);
+            let message_handler = self.message_handler.clone();
+            let active_runs = self.active_runs.clone();
+            let admins = self.config.admins.clone();
+            handles.push(tokio::spawn(async move {
+                while let Some(incoming) = incoming_rx.recv().await {
+                    let platform = incoming.platform.clone();
+                    let adapter = if platform == "webhook" {
+                        webhook_adapter.clone()
+                    } else if let Some(adapter) = adapters.get(&platform) {
+                        adapter.clone()
+                    } else {
+                        warn!(%platform, "Webhook target platform is not registered");
+                        continue;
+                    };
+                    dispatch_message(
+                        &adapter,
+                        &platform,
+                        incoming,
+                        &admins,
+                        message_handler.clone(),
+                        active_runs.clone(),
+                    )
+                    .await;
+                }
+            }));
+        }
         for (platform, adapter) in enabled {
             let running = self.running.clone();
             let message_handler = self.message_handler.clone();
@@ -2149,6 +2224,167 @@ impl PlatformAdapter for SlackAdapter {
     }
 }
 
+// ========== Webhooks & Signature Verification ==========
+
+/// Generic inbound webhook payload
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct GenericWebhookPayload {
+    pub message: String,
+    pub target: Option<String>,
+    pub source: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// Slack inbound webhook event types
+#[derive(Debug, Clone)]
+pub enum SlackWebhookEvent {
+    UrlVerification {
+        challenge: String,
+    },
+    EventCallback {
+        channel: String,
+        user: String,
+        text: String,
+        thread_ts: Option<String>,
+        event_ts: String,
+    },
+    Other(serde_json::Value),
+}
+
+/// Compute HMAC-SHA256 hex digest for signature verification.
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    use sha2::Digest;
+    // Standard HMAC RFC 2104 implementation using sha2::Sha256
+    let block_size = 64;
+    let mut k = [0u8; 64];
+    if key.len() > block_size {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(key);
+        let hashed_key = hasher.finalize();
+        k[..hashed_key.len()].copy_from_slice(&hashed_key);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+
+    let mut o_key_pad = [0x5cu8; 64];
+    let mut i_key_pad = [0x36u8; 64];
+    for i in 0..64 {
+        o_key_pad[i] ^= k[i];
+        i_key_pad[i] ^= k[i];
+    }
+
+    let mut inner_hasher = sha2::Sha256::new();
+    inner_hasher.update(i_key_pad);
+    inner_hasher.update(data);
+    let inner_hash = inner_hasher.finalize();
+
+    let mut outer_hasher = sha2::Sha256::new();
+    outer_hasher.update(o_key_pad);
+    outer_hasher.update(inner_hash);
+    let outer_hash = outer_hasher.finalize();
+
+    let mut hex = String::with_capacity(64);
+    for b in outer_hash {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{:02x}", b);
+    }
+    hex
+}
+
+/// Verify Slack webhook signature `X-Slack-Signature` using `X-Slack-Request-Timestamp`
+/// and signing secret. Rejects if timestamp skew is greater than 300 seconds (5 mins).
+pub fn verify_slack_signature(
+    signing_secret: &str,
+    timestamp: i64,
+    body: &[u8],
+    signature_header: &str,
+    now_secs: i64,
+) -> bool {
+    if (now_secs - timestamp).abs() > 300 {
+        return false;
+    }
+
+    let sig_base = format!("v0:{}:", timestamp);
+    let mut sig_base_bytes = sig_base.into_bytes();
+    sig_base_bytes.extend_from_slice(body);
+
+    let computed_hex = hmac_sha256_hex(signing_secret.as_bytes(), &sig_base_bytes);
+    let expected = format!("v0={}", computed_hex);
+
+    // Constant-time-like comparison
+    if signature_header.len() != expected.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (a, b) in signature_header.bytes().zip(expected.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Parse generic webhook JSON payload
+pub fn parse_generic_webhook(body: &[u8]) -> Result<GenericWebhookPayload> {
+    serde_json::from_slice(body)
+        .map_err(|e| crate::error::Error::Agent(format!("Invalid webhook payload: {}", e)))
+}
+
+/// Parse Slack event / challenge from webhook body
+pub fn parse_slack_webhook_event(body: &[u8]) -> Result<SlackWebhookEvent> {
+    let json: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| crate::error::Error::Agent(format!("Invalid Slack event JSON: {}", e)))?;
+
+    if let Some(t) = json.get("type").and_then(|v| v.as_str()) {
+        if t == "url_verification" {
+            let challenge = json
+                .get("challenge")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Ok(SlackWebhookEvent::UrlVerification { challenge });
+        }
+        if t == "event_callback" {
+            if let Some(ev) = json.get("event") {
+                let channel = ev
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let user = ev
+                    .get("user")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let text = ev
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let thread_ts = ev
+                    .get("thread_ts")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let event_ts = ev
+                    .get("ts")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+
+                return Ok(SlackWebhookEvent::EventCallback {
+                    channel,
+                    user,
+                    text,
+                    thread_ts,
+                    event_ts,
+                });
+            }
+        }
+    }
+
+    Ok(SlackWebhookEvent::Other(json))
+}
+
 // ========== Message splitting ==========
 
 /// Split a long message into chunks of at most `max_chars` characters,
@@ -2204,6 +2440,205 @@ pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
     }
 
     chunks
+}
+
+// ========== Webhook HTTP Server & Routing ==========
+
+struct WebhookAdapter;
+
+#[async_trait]
+impl PlatformAdapter for WebhookAdapter {
+    fn name(&self) -> &str {
+        "webhook"
+    }
+
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    async fn start(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn send_message(&self, message: OutgoingMessage) -> Result<()> {
+        debug!(channel = %message.channel_id, "Discarding fire-and-forget webhook reply");
+        Ok(())
+    }
+
+    async fn handle_update(&self, _update: serde_json::Value) -> Result<Option<IncomingMessage>> {
+        Ok(None)
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({ "platform": "webhook", "enabled": true })
+    }
+}
+
+#[derive(Clone)]
+pub struct WebhookServerState {
+    pub incoming_tx: Option<tokio::sync::mpsc::Sender<IncomingMessage>>,
+    pub slack_signing_secret: Option<String>,
+}
+
+pub fn create_webhook_router(state: WebhookServerState) -> axum::Router {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/health", get(webhook_health_handler))
+        .route("/webhook", post(webhook_generic_handler))
+        .route("/webhook/generic", post(webhook_generic_handler))
+        .route("/webhook/slack", post(webhook_slack_handler))
+        .with_state(state)
+}
+
+pub async fn serve_webhook_listener<F>(
+    listener: tokio::net::TcpListener,
+    state: WebhookServerState,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    axum::serve(listener, create_webhook_router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|error| crate::error::Error::Agent(format!("Webhook server failed: {error}")))
+}
+
+async fn webhook_health_handler() -> axum::http::StatusCode {
+    axum::http::StatusCode::OK
+}
+
+async fn webhook_generic_handler(
+    axum::extract::State(state): axum::extract::State<WebhookServerState>,
+    body: axum::body::Bytes,
+) -> std::result::Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    let payload = parse_generic_webhook(&body).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("Invalid generic webhook payload: {e}"),
+        )
+    })?;
+
+    let (platform, channel) = match payload.target.as_deref() {
+        Some(target) => {
+            let (platform, channel) = target.split_once(':').ok_or_else(|| {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "Webhook target must use platform:channel format".to_string(),
+                )
+            })?;
+            if platform.is_empty() || channel.is_empty() {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "Webhook target must use platform:channel format".to_string(),
+                ));
+            }
+            (platform, channel)
+        }
+        None => ("webhook", "default"),
+    };
+
+    if let Some(tx) = &state.incoming_tx {
+        let user_name = payload
+            .source
+            .unwrap_or_else(|| "webhook_sender".to_string());
+        let msg = IncomingMessage::new(
+            platform,
+            user_name.clone(),
+            user_name,
+            channel,
+            payload.message,
+        );
+        tx.send(msg).await.map_err(|_| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Gateway is shutting down".to_string(),
+            )
+        })?;
+    }
+
+    Ok(axum::http::StatusCode::ACCEPTED)
+}
+
+async fn webhook_slack_handler(
+    axum::extract::State(state): axum::extract::State<WebhookServerState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> std::result::Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    use axum::response::IntoResponse;
+    let secret = state.slack_signing_secret.as_deref().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Slack signing secret is not configured".to_string(),
+        )
+    })?;
+    let timestamp_str = headers
+        .get("x-slack-request-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Missing X-Slack-Request-Timestamp header".to_string(),
+            )
+        })?;
+    let timestamp: i64 = timestamp_str.parse().map_err(|_| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "Invalid X-Slack-Request-Timestamp header".to_string(),
+        )
+    })?;
+    let signature = headers
+        .get("x-slack-signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Missing X-Slack-Signature header".to_string(),
+            )
+        })?;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    if !verify_slack_signature(secret, timestamp, &body, signature, now_secs) {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            "Slack signature verification failed".to_string(),
+        ));
+    }
+
+    let event = parse_slack_webhook_event(&body).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("Invalid Slack event payload: {e}"),
+        )
+    })?;
+
+    match event {
+        SlackWebhookEvent::UrlVerification { challenge } => {
+            let json = serde_json::json!({ "challenge": challenge });
+            Ok(axum::Json(json).into_response())
+        }
+        SlackWebhookEvent::EventCallback {
+            channel,
+            user,
+            text,
+            ..
+        } => {
+            if let Some(tx) = &state.incoming_tx {
+                let msg = IncomingMessage::new("slack", user.clone(), user, channel, text);
+                let _ = tx.send(msg).await;
+            }
+            Ok(axum::http::StatusCode::OK.into_response())
+        }
+        SlackWebhookEvent::Other(_) => Ok(axum::http::StatusCode::OK.into_response()),
+    }
 }
 
 // ========== Markdown → Telegram MarkdownV2 conversion ==========
@@ -2538,7 +2973,10 @@ pub fn markdown_to_markdownv2(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
     use serial_test::serial;
+    use tower::ServiceExt;
 
     #[tokio::test]
     #[serial]
@@ -2799,6 +3237,77 @@ mod tests {
         assert!(result.is_err());
     }
 
+    struct CapturingHandler {
+        incoming_tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+    }
+
+    #[async_trait]
+    impl MessageHandler for CapturingHandler {
+        async fn handle(
+            &self,
+            message: IncomingMessage,
+            _sink: Arc<dyn MessageSink>,
+            _cancel: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Result<()> {
+            self.incoming_tx
+                .send(message)
+                .await
+                .map_err(|_| crate::error::Error::Agent("test receiver dropped".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_run_accepts_webhook_only_triggers() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve address");
+        let address = probe.local_addr().expect("reserved address");
+        drop(probe);
+
+        let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel(1);
+        let config = GatewayConfig {
+            webhooks_enabled: true,
+            webhooks_addr: Some(address.to_string()),
+            ..Default::default()
+        };
+        let gateway =
+            Arc::new(Gateway::new(config).with_handler(Arc::new(CapturingHandler { incoming_tx })));
+        let running_gateway = gateway.clone();
+        let run_task = tokio::spawn(async move { running_gateway.run().await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !gateway.is_running().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("gateway started");
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/webhook/generic"))
+            .json(&serde_json::json!({
+                "message": "Run CI diagnostics",
+                "source": "ci"
+            }))
+            .send()
+            .await
+            .expect("post webhook");
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), incoming_rx.recv())
+            .await
+            .expect("handler invoked")
+            .expect("handler message");
+        assert_eq!(received.content, "Run CI diagnostics");
+
+        gateway.stop().await.expect("stop gateway");
+        tokio::time::timeout(std::time::Duration::from_secs(2), run_task)
+            .await
+            .expect("gateway run stopped")
+            .expect("gateway task joined")
+            .expect("gateway run succeeded");
+    }
+
     #[tokio::test]
     async fn telegram_poll_updates_disabled_returns_empty() {
         let adapter = TelegramAdapter::new(None);
@@ -2944,5 +3453,325 @@ mod tests {
     fn whatsapp_markdown_list_bullet_not_italic() {
         // "* item" is a list bullet, not italic.
         assert_eq!(markdown_to_whatsapp("* item one"), "* item one");
+    }
+
+    #[test]
+    fn hmac_sha256_hex_computes_expected_digest() {
+        let key = b"secret";
+        let message = b"hello world";
+        let computed = hmac_sha256_hex(key, message);
+        // Computed known test vector for HMAC-SHA256("secret", "hello world")
+        assert_eq!(
+            computed,
+            "734cc62f32841568f45715aeb9f4d7891324e6d948e4c6c60c0621cdac48623a"
+        );
+    }
+
+    #[test]
+    fn verify_slack_signature_validates_and_rejects() {
+        let secret = "8f742231b10e8888abcd99yyzz";
+        let timestamp = 1700000000;
+        let body = r#"{"type":"url_verification","challenge":"test_challenge"}"#;
+        let sig_base = format!("v0:{}:{}", timestamp, body);
+        let expected_hash = hmac_sha256_hex(secret.as_bytes(), sig_base.as_bytes());
+        let valid_header = format!("v0={}", expected_hash);
+
+        // Valid signature within timestamp window
+        assert!(verify_slack_signature(
+            secret,
+            timestamp,
+            body.as_bytes(),
+            &valid_header,
+            timestamp + 30
+        ));
+
+        // Invalid signature header
+        assert!(!verify_slack_signature(
+            secret,
+            timestamp,
+            body.as_bytes(),
+            "v0=invalidhash",
+            timestamp + 30
+        ));
+
+        // Timestamp too old (skew > 300s)
+        assert!(!verify_slack_signature(
+            secret,
+            timestamp,
+            body.as_bytes(),
+            &valid_header,
+            timestamp + 400
+        ));
+    }
+
+    #[test]
+    fn parse_webhook_payload_generic() {
+        let raw = r#"{
+            "event": "alert",
+            "message": "Disk space low on srv-1",
+            "source": "monitoring",
+            "target": "telegram:12345"
+        }"#;
+        let parsed = parse_generic_webhook(raw.as_bytes()).expect("parse generic webhook");
+        assert_eq!(parsed.message, "Disk space low on srv-1");
+        assert_eq!(parsed.target.as_deref(), Some("telegram:12345"));
+        assert_eq!(parsed.source.as_deref(), Some("monitoring"));
+    }
+
+    #[test]
+    fn parse_slack_url_verification_event() {
+        let raw = r#"{
+            "type": "url_verification",
+            "token": "Jhj5dZrVaK7ZwHHjRyZWjbDl",
+            "challenge": "3eZbrw1aBm2rZgRNFDxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P"
+        }"#;
+        let event =
+            parse_slack_webhook_event(raw.as_bytes()).expect("parse slack url verification");
+        match event {
+            SlackWebhookEvent::UrlVerification { challenge } => {
+                assert_eq!(
+                    challenge,
+                    "3eZbrw1aBm2rZgRNFDxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P"
+                );
+            }
+            _ => panic!("expected UrlVerification event"),
+        }
+    }
+
+    #[test]
+    fn parse_slack_app_mention_event() {
+        let raw = r#"{
+            "type": "event_callback",
+            "event_id": "Ev123456",
+            "event_time": 1700000000,
+            "event": {
+                "type": "app_mention",
+                "user": "U123456",
+                "text": "<@U999999> run check status",
+                "ts": "1700000000.000200",
+                "channel": "C123456"
+            }
+        }"#;
+        let event = parse_slack_webhook_event(raw.as_bytes()).expect("parse slack app mention");
+        match event {
+            SlackWebhookEvent::EventCallback {
+                channel,
+                user,
+                text,
+                thread_ts,
+                event_ts,
+            } => {
+                assert_eq!(channel, "C123456");
+                assert_eq!(user, "U123456");
+                assert_eq!(text, "<@U999999> run check status");
+                assert_eq!(event_ts, "1700000000.000200");
+                assert_eq!(thread_ts, None);
+            }
+            _ => panic!("expected EventCallback event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_listener_receives_generic_trigger_and_shuts_down() {
+        let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let state = WebhookServerState {
+            incoming_tx: Some(incoming_tx),
+            slack_signing_secret: None,
+        };
+
+        let server = tokio::spawn(serve_webhook_listener(listener, state, async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/webhook/generic"))
+            .json(&serde_json::json!({
+                "message": "Run CI diagnostics",
+                "source": "ci"
+            }))
+            .send()
+            .await
+            .expect("post webhook");
+
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        let received = incoming_rx.recv().await.expect("receive trigger");
+        assert_eq!(received.platform, "webhook");
+        assert_eq!(received.channel_id, "default");
+        assert_eq!(received.content, "Run CI diagnostics");
+
+        shutdown_tx.send(()).expect("request shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("listener stopped")
+            .expect("listener task joined")
+            .expect("listener succeeded");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_router_health_endpoint() {
+        let state = WebhookServerState {
+            incoming_tx: None,
+            slack_signing_secret: Some("test_secret".to_string()),
+        };
+        let app = create_webhook_router(state);
+
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_router_generic_post() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let state = WebhookServerState {
+            incoming_tx: Some(tx),
+            slack_signing_secret: None,
+        };
+        let app = create_webhook_router(state);
+
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let body_json = serde_json::json!({
+            "message": "Alert triggered",
+            "target": "telegram:12345",
+            "source": "prometheus"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhook/generic")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body_json).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let received = rx.recv().await.expect("message received in channel");
+        assert_eq!(received.platform, "telegram");
+        assert_eq!(received.content, "Alert triggered");
+        assert_eq!(received.channel_id, "12345");
+        assert_eq!(received.username, "prometheus");
+    }
+
+    #[tokio::test]
+    async fn webhook_router_rejects_malformed_target() {
+        let state = WebhookServerState {
+            incoming_tx: None,
+            slack_signing_secret: None,
+        };
+        let response = create_webhook_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhook/generic")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"message":"run","target":"telegram"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn webhook_router_rejects_slack_without_signing_secret() {
+        let state = WebhookServerState {
+            incoming_tx: None,
+            slack_signing_secret: None,
+        };
+        let response = create_webhook_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhook/slack")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"type":"url_verification","challenge":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_router_slack_signature_and_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let secret = "test_signing_secret";
+        let state = WebhookServerState {
+            incoming_tx: Some(tx),
+            slack_signing_secret: Some(secret.to_string()),
+        };
+        let app = create_webhook_router(state);
+
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let body_json = serde_json::json!({
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "user": "UUSER99",
+                "text": "help status",
+                "channel": "C999"
+            }
+        });
+        let body_bytes = serde_json::to_vec(&body_json).unwrap();
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let sig_base = format!("v0:{}:", now_secs);
+        let mut sig_base_bytes = sig_base.into_bytes();
+        sig_base_bytes.extend_from_slice(&body_bytes);
+        let computed_hex = hmac_sha256_hex(secret.as_bytes(), &sig_base_bytes);
+        let sig_header = format!("v0={}", computed_hex);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhook/slack")
+                    .header("content-type", "application/json")
+                    .header("x-slack-request-timestamp", now_secs.to_string())
+                    .header("x-slack-signature", sig_header)
+                    .body(Body::from(body_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let received = rx.recv().await.expect("slack message received in channel");
+        assert_eq!(received.platform, "slack");
+        assert_eq!(received.content, "help status");
+        assert_eq!(received.channel_id, "C999");
+        assert_eq!(received.username, "UUSER99");
     }
 }
