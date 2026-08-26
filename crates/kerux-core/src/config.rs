@@ -18,6 +18,7 @@ pub struct AppConfig {
     pub validation: crate::validation::ValidationPolicy,
     pub tui: TuiSettings,
     pub telemetry: TelemetrySettings,
+    pub budget: BudgetSettings,
     pub mcp: McpSettings,
     pub skills: SkillsSettings,
     pub gateway: GatewaySettings,
@@ -42,6 +43,78 @@ impl Default for TelemetrySettings {
             input_cost_per_million: 0.0,
             output_cost_per_million: 0.0,
         }
+    }
+}
+
+/// Cost guardrails: estimated-spend ceilings applied on top of the
+/// `[telemetry]` cost rates. Off by default. Enforcement (auto-pause,
+/// gateway notification, model downgrade) consumes this surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BudgetSettings {
+    /// Master switch for the cost guardrails. Default `false`: no ceiling
+    /// is applied regardless of the limits below.
+    pub enabled: bool,
+    /// Estimated-spend ceiling for a single agent run, in the telemetry
+    /// currency. `0.0` disables the per-run ceiling.
+    pub per_run_limit: f64,
+    /// Estimated-spend ceiling across all runs in a rolling day, in the
+    /// telemetry currency. `0.0` disables the daily ceiling.
+    pub daily_limit: f64,
+    /// Emit a gateway warning once estimated spend crosses this percentage
+    /// of a configured limit, before the hard ceiling trips.
+    pub warn_threshold_pct: u8,
+    /// Action taken when a limit is hit: `pause` (halt and await the
+    /// operator), `downgrade` (switch to `downgrade_model`), or `stop`
+    /// (end the run).
+    pub on_limit: String,
+    /// Cheaper model to switch to when `on_limit = "downgrade"`.
+    pub downgrade_model: Option<String>,
+}
+
+impl Default for BudgetSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            per_run_limit: 0.0,
+            daily_limit: 0.0,
+            warn_threshold_pct: 80,
+            on_limit: "pause".to_string(),
+            downgrade_model: None,
+        }
+    }
+}
+
+impl BudgetSettings {
+    /// Validate the guardrail policy. Called at config load so a
+    /// misconfigured ceiling fails fast instead of silently doing nothing.
+    pub fn validate(&self) -> Result<()> {
+        if self.warn_threshold_pct > 100 {
+            return Err(Error::Config(format!(
+                "[budget] warn_threshold_pct must be <= 100 (got {})",
+                self.warn_threshold_pct
+            )));
+        }
+        if self.per_run_limit < 0.0 || self.daily_limit < 0.0 {
+            return Err(Error::Config(
+                "[budget] limits must be non-negative".to_string(),
+            ));
+        }
+        match self.on_limit.as_str() {
+            "pause" | "downgrade" | "stop" => {}
+            other => {
+                return Err(Error::Config(format!(
+                    "[budget] on_limit must be one of pause|downgrade|stop (got '{}')",
+                    other
+                )))
+            }
+        }
+        if self.on_limit == "downgrade" && self.downgrade_model.is_none() {
+            return Err(Error::Config(
+                "[budget] on_limit = \"downgrade\" requires downgrade_model".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -714,7 +787,7 @@ pub fn parse_config_file(path: &Path) -> Result<AppConfig> {
 }
 
 pub fn parse_config_str(raw: &str, source: &Path) -> Result<AppConfig> {
-    toml::from_str(raw).map_err(|error| {
+    let config: AppConfig = toml::from_str(raw).map_err(|error| {
         let message = match error.span() {
             Some(span) => format!(
                 "Invalid TOML in '{}': {} (bytes {}..{})",
@@ -727,7 +800,9 @@ pub fn parse_config_str(raw: &str, source: &Path) -> Result<AppConfig> {
         };
 
         Error::Config(message)
-    })
+    })?;
+    config.budget.validate()?;
+    Ok(config)
 }
 
 impl AppConfig {
@@ -931,6 +1006,55 @@ mod tests {
         assert!(!config.validation.fail_fast);
         assert!(config.validation.validators.is_empty());
         config.validation.validate().unwrap();
+        // Budget guardrails parse with documented defaults.
+        assert!(!config.budget.enabled);
+        assert_eq!(config.budget.per_run_limit, 0.0);
+        assert_eq!(config.budget.daily_limit, 0.0);
+        assert_eq!(config.budget.warn_threshold_pct, 80);
+        assert_eq!(config.budget.on_limit, "pause");
+        assert!(config.budget.downgrade_model.is_none());
+        config.budget.validate().unwrap();
+    }
+
+    #[test]
+    fn budget_defaults_are_compatible() {
+        // An existing config with no [budget] section keeps working.
+        let settings: BudgetSettings = toml::from_str("").unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.per_run_limit, 0.0);
+        assert_eq!(settings.daily_limit, 0.0);
+        assert_eq!(settings.warn_threshold_pct, 80);
+        assert_eq!(settings.on_limit, "pause");
+        assert!(settings.downgrade_model.is_none());
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn budget_validation_rejects_bad_policies() {
+        let path = Path::new("test.toml");
+        let error = parse_config_str("[budget]\nwarn_threshold_pct = 150\n", path).unwrap_err();
+        assert!(error.to_string().contains("warn_threshold_pct"));
+
+        let error = parse_config_str("[budget]\nper_run_limit = -1.0\n", path).unwrap_err();
+        assert!(error.to_string().contains("non-negative"));
+
+        let error = parse_config_str("[budget]\non_limit = \"explode\"\n", path).unwrap_err();
+        assert!(error.to_string().contains("on_limit"));
+
+        let error = parse_config_str("[budget]\non_limit = \"downgrade\"\n", path).unwrap_err();
+        assert!(error.to_string().contains("downgrade_model"));
+
+        // A complete downgrade policy passes.
+        let config = parse_config_str(
+            "[budget]\nenabled = true\nper_run_limit = 2.5\ndaily_limit = 10.0\non_limit = \"downgrade\"\ndowngrade_model = \"gpt-4o-mini\"\n",
+            path,
+        )
+        .unwrap();
+        assert!(config.budget.enabled);
+        assert_eq!(
+            config.budget.downgrade_model.as_deref(),
+            Some("gpt-4o-mini")
+        );
     }
 
     #[test]

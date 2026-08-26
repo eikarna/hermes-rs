@@ -27,6 +27,22 @@ max_context_length = 128000
 # api_key = "or set GEMINI_API_KEY"
 # base_url = "https://generativelanguage.googleapis.com/v1beta"
 
+# Fallback provider chain (default OFF). Entries are tried in order when
+# the primary provider fails with a transient error (network failure,
+# interrupted stream, HTTP 429 rate limit, or 5xx outage). Deterministic
+# failures (401 auth, 400 bad request, context overflow) propagate
+# immediately — no pointless retries, no silent model downgrade.
+# Each entry takes the same shape as the primary [client] block minus the
+# top-level-only fields: provider (required), base_url, api_key, model
+# (defaults to the primary model), timeout_secs.
+# [[client.fallback]]
+# provider = "openrouter"
+# model = "anthropic/claude-sonnet-4"
+#
+# [[client.fallback]]
+# provider = "gemini"
+# model = "gemini-2.5-pro"
+
 [agent]
 model = "gpt-4"
 max_iterations = 20
@@ -118,6 +134,16 @@ currency = "USD"
 # Set these to your provider/model prices to show estimated spend.
 input_cost_per_million = 0.0
 output_cost_per_million = 0.0
+
+# Cost guardrails: estimated-spend ceilings on top of the [telemetry] cost
+# rates. Disabled by default; limits of 0.0 disable that ceiling.
+[budget]
+enabled = false
+per_run_limit = 0.0        # estimated-spend ceiling per agent run (0 = off)
+daily_limit = 0.0          # estimated-spend ceiling per rolling day (0 = off)
+warn_threshold_pct = 80    # gateway warning at this % of a configured limit
+on_limit = "pause"         # pause | downgrade | stop
+# downgrade_model = "gpt-4o-mini" # required when on_limit = "downgrade"
 
 [mcp]
 autoload = true
