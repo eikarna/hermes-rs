@@ -31,8 +31,11 @@ Messaging gateway settings:
 | `telegram_token` | — | Bot token |
 | `discord_enabled` | `false` | Enable Discord REST adapter (`discord_token`) |
 | `slack_enabled` | `false` | Enable Slack REST adapter (`slack_token`) |
+| `slack_signing_secret` | — | Verify Slack Events API signatures; required by `/webhook/slack` |
 | `whatsapp_enabled` | `false` | Enable WhatsApp adapter (Baileys bridge) |
 | `whatsapp_bridge_url` | — | Bridge endpoint (e.g. `http://127.0.0.1:3000`) |
+| `webhooks_enabled` | `false` | Start the inbound HTTP listener |
+| `webhooks_addr` | — | Listener address (e.g. `127.0.0.1:8080`) |
 | `streaming_replies` | `false` | Live-edit token streaming with `▌` cursor |
 | `tool_approval` | `true` | Require inline-keyboard approval before dangerous tool execution |
 | `tool_approval_timeout_secs` | `300` | Auto-deny approval requests after this long |

@@ -16,6 +16,7 @@
 - State distillation with long-term memory injection and async session fact extraction into `MEMORY.md`
 - Workspace context-file auto-loading with prompt-injection scanning for agent guidance files
 - Sub-agent delegation as an opt-in built-in tool through `delegate_to_sub_agent`
+- Inbound webhook gateway: axum HTTP listener with generic JSON triggers, target-adapter routing, Slack Events API handling and signature verification, health checks, and graceful shutdown
 
 - Model-agnostic provider routing with an internal `LLMProvider` trait, provider capability metadata, `[client].provider` selection, and native adapters for OpenAI, Anthropic, Ollama, OpenRouter, and Gemini
 - Tree-sitter AST symbol extraction (C, Python, Rust, TypeScript) with personalized PageRank repository mapping and token-budgeted `<repo_map>` rendering
@@ -39,5 +40,3 @@
 ## Pending
 
 - Runtime fallback provider chain promotion: `[[client.fallback]]` entries exist and are wired via `wrap_with_fallbacks()`, but remain opt-in/unadvertised pending soak testing
-- Webhook transport: `[gateway] webhooks_enabled` config field exists but no HTTP listener is implemented yet
-
