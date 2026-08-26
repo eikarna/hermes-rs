@@ -80,6 +80,7 @@ pub mod schema;
 pub mod session_store;
 pub mod skills;
 pub mod taste;
+pub mod taste_extraction;
 pub mod tools;
 pub mod trajectory;
 pub mod validation;
@@ -129,6 +130,7 @@ pub use taste::{
     PreferenceExtractor, PreferenceObservation, PreferenceSource, TastePreference, TasteProfile,
     TasteStore, HALF_SATURATION, TASTE_SCHEMA_VERSION,
 };
+pub use taste_extraction::{TrajectoryPreferenceExtractor, DEFAULT_MAX_REPEATS};
 pub use tools::{
     register_builtin_tools, register_builtin_tools_with_provider_sub_agent,
     register_builtin_tools_with_sub_agent, KeruxTool, ToolRegistry, ToolResult,
