@@ -48,6 +48,12 @@ repo_map_max_files = 500    # max files discovered for repo map scoring; cap hug
 auto_commit = false          # true: auto-commit a successful run's changes (Conventional Commit)
 # system_prompt = "You are Kerux."
 
+# Project-local learned style preferences from .kerux/taste.json.
+[taste]
+enabled = true
+min_confidence = 0.5
+max_items = 10
+
 [autonomous]
 interval_secs = 300
 todo_path = "TODO.md"

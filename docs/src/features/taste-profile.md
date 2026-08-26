@@ -94,6 +94,15 @@ Push = load the project profile, save it into a `TasteStore` under a
 name. Pull = load from the store, `TasteProfile::merge` into the project
 profile. Merge rules, per matching `key`:
 
+```bash
+kerux taste push team
+kerux taste pull team
+```
+
+Both commands use the current directory as the project root. Push requires
+an existing `.kerux/taste.json`; pull creates it when absent and atomically
+writes the merged profile.
+
 - **Same value**: evidence counters add, the observation window widens
   (min first / max last), confidence recomputed.
 - **Conflicting values**: the side with more total evidence wins (ties go
@@ -121,6 +130,10 @@ Learned from past sessions. Follow these unless the user instructs otherwise.
 Returns `None` when nothing clears the threshold or `max_items == 0` —
 callers omit the block entirely rather than injecting an empty section.
 `retain_confident(min)` prunes weak preferences from a profile outright.
+
+At runtime, `[taste] enabled = true` injects this block from the current
+project's `.kerux/taste.json`. `min_confidence` defaults to `0.5` and
+`max_items` defaults to `10`; setting `enabled = false` disables injection.
 
 ## Extraction engine
 
