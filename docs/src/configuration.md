@@ -41,7 +41,11 @@ Messaging gateway settings:
 
 ### `[[client.fallback]]`
 
-Fallback provider chain (default OFF): array-of-tables entries (`provider`, optional `base_url`, `api_key`, `model`, `timeout_secs`) tried in order when the primary provider hits transient failures (network errors, 429, 5xx). Auth failures and bad requests propagate immediately.
+Fallback provider chain (default OFF): array-of-tables entries (`provider`, optional `base_url`, `api_key`, `model`, `timeout_secs`) tried in order when the primary provider hits transient failures (network errors, interrupted streams, 429, 5xx). Auth failures and bad requests propagate immediately. See [Fallback Provider Chain](features/fallback-chain.md) for operational guidelines.
+
+### `[budget]`
+
+Cost guardrails (default disabled): estimated-spend ceilings computed from the `[telemetry]` cost rates. `enabled` (false), `per_run_limit` (0 = off), `daily_limit` (0 = off), `warn_threshold_pct` (80), `on_limit` (`pause` | `downgrade` | `stop`), `downgrade_model` (required when `on_limit = "downgrade"`). Invalid policies fail config load.
 
 ### `[validation]`
 

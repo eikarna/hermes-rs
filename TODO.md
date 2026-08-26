@@ -35,9 +35,11 @@
 - Validator execution engine with journal evidence (Task 2.2): `run_validation_pass` executes declared validators workspace-confined (symlink-safe), with bounded/redacted output capture, per-spec timeout, fail-fast semantics, and every outcome journaled as validation evidence (CLI wiring pending)
 - Edit-protocol outcome metrics in the journal (Task 2.4): first-pass vs repaired edit attempts tracked per run
 - Static edit-format fallback ladder (Task 2.5): classified edit-application failures promote a one-way `search_replace → patch → full_file` hint ladder for the rest of the run; `[agent].edit_format_override` always wins
+- Runtime fallback provider chain: opt-in `[[client.fallback]]` entries wired via `wrap_with_fallbacks()`, typed 429/5xx/network failover classification, and a soak/integration test suite (`kerux-core/tests/fallback_chain.rs`) covering cross-provider fallthrough, streaming fallthrough, chain exhaustion, and concurrent bursts; documented in `docs/src/features/fallback-chain.md`
+- Cost guardrail configuration surface: `[budget]` section (`enabled`, `per_run_limit`, `daily_limit`, `warn_threshold_pct`, `on_limit = pause|downgrade|stop`, `downgrade_model`) with load-time validation; enforcement (auto-pause, gateway notification, model downgrade) pending
 
 ## Pending
 
-- Runtime fallback provider chain promotion: `[[client.fallback]]` entries exist and are wired via `wrap_with_fallbacks()`, but remain opt-in/unadvertised pending soak testing
+- Cost guardrail enforcement: consume the `[budget]` surface with per-run/daily spend tracking, auto-pause + gateway notification at the warn threshold, and auto-downgrade to `downgrade_model`
 - Webhook transport: `[gateway] webhooks_enabled` config field exists but no HTTP listener is implemented yet
 

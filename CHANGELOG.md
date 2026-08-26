@@ -14,6 +14,8 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 - **Validator execution engine** (Task 2.2): `run_validation_pass` executes declared validators workspace-confined (lexical normalize + canonical containment, symlink-safe) with bounded/redacted output capture, per-spec timeout, fail-fast semantics with skipped results, and every outcome journaled as validation evidence (CLI wiring pending)
 - **Edit-protocol metrics** (Task 2.3/2.4): first-pass vs repaired edit outcomes tracked and journaled per run, plus `[agent] max_repair_attempts` bounded repair policy (`None` falls back to `max_healing_attempts`)
 - **Static edit-format fallback ladder** (Task 2.5): classified edit-application failures promote a one-way `search_replace → patch → full_file` hint for the rest of the run; an explicit `[agent] edit_format_override` always wins and the hint never demotes mid-run
+- **Cost guardrail configuration** (`[budget]`): estimated-spend ceilings (`per_run_limit`, `daily_limit`) on top of the `[telemetry]` cost rates with `warn_threshold_pct`, `on_limit = pause|downgrade|stop`, and `downgrade_model`; invalid policies fail config load. Enforcement (auto-pause, gateway notification, auto-downgrade) follows
+- **Fallback provider chain documentation**: `[[client.fallback]]` is now advertised in `kerux.example.toml` and `docs/src/features/fallback-chain.md` with configuration parameters and operational guidelines, backed by the soak/integration suite in `kerux-core/tests/fallback_chain.rs`
 
 ### Fixed
 
