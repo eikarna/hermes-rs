@@ -75,6 +75,10 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and the PR process.
 
+## Contributors
+
+- [Alxy Savin (@xsa-dev)](https://github.com/xsa-dev) — v0.3.0
+
 ## Credits
 
 A pure-Rust rewrite of the [Hermes-Agent](https://github.com/nousresearch/hermes-agent) orchestration loop by [Nous Research](https://nousresearch.com). Unofficial community port — not affiliated with or endorsed by Nous Research.
