@@ -6,6 +6,8 @@ base_url = "https://api.openai.com/v1"
 # api_key = "set me or use OPENAI_API_KEY"
 # auth_ref = "openai-default" # optional profile from `kerux auth set-api-key openai`
 timeout_secs = 60
+# Timeout for model-list discovery (list_models); gateways can be slow.
+model_list_timeout_secs = 60
 max_context_length = 128000
 
 # Nous Portal (OAuth device-code login):

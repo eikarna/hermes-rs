@@ -144,6 +144,9 @@ pub struct ClientSettings {
     pub api_key: Option<String>,
     pub auth_ref: Option<String>,
     pub timeout_secs: u64,
+    /// Timeout for model-list discovery requests (`list_models`).
+    /// Gateways can return 1000+ models slowly; default 60s.
+    pub model_list_timeout_secs: u64,
     pub max_context_length: usize,
     /// LLM provider backend: "openai" (default), "anthropic", "ollama", "openrouter", "gemini"
     pub provider: String,
@@ -191,6 +194,7 @@ impl Default for ClientSettings {
             // Per-read deadline (see client builders): reasoning models can
             // take minutes before the first token, so keep this generous.
             timeout_secs: 300,
+            model_list_timeout_secs: 60,
             max_context_length: 128_000,
             provider: "openai".to_string(),
             fallback: Vec::new(),
@@ -1048,6 +1052,15 @@ mod tests {
         assert_eq!(settings.on_limit, "pause");
         assert!(settings.downgrade_model.is_none());
         settings.validate().unwrap();
+    }
+
+    #[test]
+    fn client_model_list_timeout_defaults_and_parses() {
+        let settings: ClientSettings = toml::from_str("").unwrap();
+        assert_eq!(settings.model_list_timeout_secs, 60);
+
+        let settings: ClientSettings = toml::from_str("model_list_timeout_secs = 120").unwrap();
+        assert_eq!(settings.model_list_timeout_secs, 120);
     }
 
     #[test]
