@@ -23,6 +23,7 @@
 - [Voice Note STT](features/voice-stt.md)
 - [Cron Scheduler](features/cron-scheduler.md)
 - [Subagent Delegation](features/subagent-delegation.md)
+- [Taste/Style Profile Learning](features/taste-profile.md)
 
 # Development
 

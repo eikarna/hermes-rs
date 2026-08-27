@@ -24,6 +24,7 @@
 - **Autonomous coding mode** — 24/7 loop that reads `TODO.md`, validates with local tests, and only pushes after success
 - **Persistent state** — sessions, memory, todos, and cron jobs survive restarts (atomic JSON writes under `~/.kerux/`)
 - **Repo-map context** — tree-sitter symbols + personalized PageRank, token-budgeted into the system prompt
+- **Taste profiles** — confidence-scored coding preferences injected from `.kerux/taste.json`, portable through `kerux taste push|pull`
 - **Transactional git harness** — pre-run snapshots, Conventional Commits, TUI `/undo`
 - **Flight recorder** — hash-chained run journals with read-only inspection and offline-verifiable proof capsules (see [docs/src/features/flight-recorder.md](docs/src/features/flight-recorder.md))
 
@@ -43,6 +44,8 @@ kerux chat                        # prompt-first TUI
 kerux run --query "What is 2+2?"  # one-shot
 kerux serve                       # Telegram/WhatsApp gateway
 kerux autonomous                  # 24/7 coding loop
+kerux taste push team             # publish this project's learned style
+kerux taste pull team             # merge that style into this project
 ```
 
 ## Documentation

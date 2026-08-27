@@ -417,6 +417,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_kerux_subdirs_are_children_of_home() {
         let home = kerux_home();
         assert!(kerux_config_dir().starts_with(&home));
@@ -427,6 +428,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_kerux_subdir_names() {
         // Verify suffix only — avoids race with tests that modify KERUX_HOME.
         assert!(kerux_config_dir().ends_with("config"));

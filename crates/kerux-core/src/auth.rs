@@ -193,12 +193,27 @@ impl LoopbackOAuthReceiver {
                 Error::Config(format!("Failed to accept OAuth callback: {}", error))
             })?;
 
-        let mut buffer = [0_u8; 8192];
-        let bytes_read = timeout(timeout_duration, stream.read(&mut buffer))
-            .await
-            .map_err(|_| Error::Config("Timed out reading OAuth callback".to_string()))?
-            .map_err(|error| Error::Config(format!("Failed to read OAuth callback: {}", error)))?;
-        let request = std::str::from_utf8(&buffer[..bytes_read])
+        let mut buffer = Vec::with_capacity(8192);
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let bytes_read = timeout(timeout_duration, stream.read(&mut chunk))
+                .await
+                .map_err(|_| Error::Config("Timed out reading OAuth callback".to_string()))?
+                .map_err(|error| {
+                    Error::Config(format!("Failed to read OAuth callback: {}", error))
+                })?;
+            if bytes_read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..bytes_read]);
+            // Drain to the header terminator so a fragmented request is fully
+            // consumed before the socket closes; leftover unread bytes would
+            // turn the close into a RST and destroy the outgoing response.
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") || buffer.len() > 65_536 {
+                break;
+            }
+        }
+        let request = std::str::from_utf8(&buffer)
             .map_err(|_| Error::Config("OAuth callback was not valid UTF-8".to_string()))?;
 
         let result = parse_http_callback_request(
@@ -208,6 +223,11 @@ impl LoopbackOAuthReceiver {
             expected_state,
         );
         let _ = write_oauth_callback_response(&mut stream, result.is_ok()).await;
+        // Gracefully close the write half so the peer observes the response
+        // followed by a clean FIN/EOF. Dropping the socket without this can
+        // emit a RST on Windows, which the client surfaces as
+        // ConnectionReset before it finishes reading the response.
+        let _ = stream.shutdown().await;
         result
     }
 }

@@ -21,6 +21,10 @@ LLM provider settings: `provider`, `base_url`, `api_key`, `auth_ref`, per-provid
 
 Agent behavior: `model` (default `gpt-4`), `max_iterations` (20), `context_window` (128000), `stream` (true), `repo_map_tokens` (0 = off), `repo_map_max_files` (500), `edit_format_override`, `max_repair_attempts`, `auto_commit` (false).
 
+### `[taste]`
+
+Learned coding-style prompt injection: `enabled` (default `true`), `min_confidence` (0.5), and `max_items` (10). Kerux reads the project profile from `.kerux/taste.json`; `kerux taste push <name>` saves it under the `KERUX_HOME`-aware portable registry, while `kerux taste pull <name>` merges a registry profile back into the project.
+
 ### `[gateway]`
 
 Messaging gateway settings:

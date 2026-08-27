@@ -7,6 +7,7 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 
 ### Added
 
+- **Taste profile injection and portability**: project-local `.kerux/taste.json` preferences are confidence-filtered into agent system prompts through `[taste]` (`enabled`, `min_confidence`, `max_items`); `kerux taste push <name>` and `kerux taste pull <name>` share and merge profiles through the `KERUX_HOME`-aware registry
 - **Discord adapter** (`[gateway] discord_enabled` + `discord_token`): REST integration against `discord_api_base` (default `https://discord.com/api/v10`) — bot-token verification via `/users/@me`, message send via `/channels/{id}/messages`, message-create event parsing
 - **Slack adapter** (`[gateway] slack_enabled` + `slack_token`): REST integration against `slack_api_base` (default `https://slack.com/api`) with token verification, `send_message`, and update-event parsing
 - **Flight recorder** (Tasks 1.x): hash-chained append-only run journals under `~/.kerux/runs/` with a bounded `[recorder]` policy (`record_content`, `record_reasoning`, `max_payload_bytes`, `failure_mode = warn|fail`); git checkpoint evidence and tool-approval decisions journaled per run; read-only `kerux runs list|inspect|verify` CLI; offline-verifiable scrubbed HTML proof-capsule export; Windows-safe journal storage (per-file byte-range locking, staging-dir publish)

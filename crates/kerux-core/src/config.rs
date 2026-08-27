@@ -20,9 +20,28 @@ pub struct AppConfig {
     pub telemetry: TelemetrySettings,
     pub mcp: McpSettings,
     pub skills: SkillsSettings,
+    pub taste: TasteSettings,
     pub gateway: GatewaySettings,
     pub tools: ToolSettings,
     pub curator: crate::curator::CurationPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TasteSettings {
+    pub enabled: bool,
+    pub min_confidence: f32,
+    pub max_items: usize,
+}
+
+impl Default for TasteSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_confidence: 0.5,
+            max_items: 10,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -931,6 +950,20 @@ mod tests {
         assert!(!config.validation.fail_fast);
         assert!(config.validation.validators.is_empty());
         config.validation.validate().unwrap();
+    }
+
+    #[test]
+    fn taste_defaults_are_compatible_and_overridable() {
+        let defaults: TasteSettings = toml::from_str("").unwrap();
+        assert!(defaults.enabled);
+        assert_eq!(defaults.min_confidence, 0.5);
+        assert_eq!(defaults.max_items, 10);
+
+        let configured: TasteSettings =
+            toml::from_str("enabled = false\nmin_confidence = 0.75\nmax_items = 4\n").unwrap();
+        assert!(!configured.enabled);
+        assert_eq!(configured.min_confidence, 0.75);
+        assert_eq!(configured.max_items, 4);
     }
 
     #[test]

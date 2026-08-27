@@ -18,7 +18,7 @@ use crate::client::{
     ChatResponse, ChatStreamEvent, ChatStreamResponse, LLMProvider, Message, OpenAIClient, Role,
     ToolCall,
 };
-use crate::config::{runtime_config, BehaviorSettings};
+use crate::config::{runtime_config, BehaviorSettings, TasteSettings};
 use crate::context::{estimate_message_tokens, estimate_tokens};
 use crate::context_files::{load_default_context_files, load_workspace_context};
 use crate::error::{Error, Result};
@@ -30,6 +30,25 @@ use crate::tools::{ToolContext, ToolRegistry, ToolResult};
 /// Prefix marking the rolling context-summary system message that
 /// [`KeruxAgent::compact_history`] embeds as the first conversation entry.
 pub const CONTEXT_SUMMARY_MARKER: &str = "[CONTEXT SUMMARY]";
+
+fn append_taste_profile_prompt(
+    system_prompt: &mut String,
+    project_root: &std::path::Path,
+    settings: &TasteSettings,
+) {
+    if !settings.enabled {
+        return;
+    }
+    let Some(profile) = crate::persist::read_json::<crate::taste::TasteProfile>(
+        &crate::taste::project_taste_path(project_root),
+    ) else {
+        return;
+    };
+    if let Some(block) = profile.render_prompt_block(settings.min_confidence, settings.max_items) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&block);
+    }
+}
 
 /// Configuration for the Kerux agent
 #[derive(Debug, Clone)]
@@ -1118,6 +1137,11 @@ impl KeruxAgent {
                 After receiving tool results, continue reasoning and either call more tools or provide your final response."
                 .to_string()
         };
+
+        let runtime = runtime_config();
+        if let Ok(project_root) = std::env::current_dir() {
+            append_taste_profile_prompt(&mut system_prompt, &project_root, &runtime.taste);
+        }
 
         if let Some(memory_manager) = &self.memory_manager {
             let memory_context = memory_manager.build_memory_context(2048).await;
@@ -2523,6 +2547,101 @@ mod tests {
         } else {
             std::env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn append_taste_profile_prompt_loads_project_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::taste::project_taste_path(dir.path());
+        let mut profile = crate::taste::TasteProfile::new("project");
+        profile.preferences.push(crate::taste::TastePreference {
+            key: "test runner".to_string(),
+            category: crate::taste::PreferenceCategory::Testing,
+            value: "cargo nextest".to_string(),
+            positive: 20,
+            negative: 0,
+            confidence: 0.8,
+            source: crate::taste::PreferenceSource::Extracted,
+            first_observed_at: 1,
+            last_observed_at: 2,
+        });
+        crate::persist::write_json(&path, &profile).unwrap();
+
+        let settings = crate::config::TasteSettings {
+            enabled: true,
+            min_confidence: 0.5,
+            max_items: 10,
+        };
+        let mut prompt = "base prompt".to_string();
+        append_taste_profile_prompt(&mut prompt, dir.path(), &settings);
+
+        assert!(prompt.starts_with("base prompt\n\n## Learned Coding Style Preferences"));
+        assert!(prompt.contains("test runner: cargo nextest"));
+        assert!(prompt.contains("confidence 0.80"));
+    }
+
+    fn taste_settings(enabled: bool, min_confidence: f32) -> crate::config::TasteSettings {
+        crate::config::TasteSettings {
+            enabled,
+            min_confidence,
+            max_items: 10,
+        }
+    }
+
+    fn write_confident_profile(dir: &std::path::Path, confidence: f32) {
+        let mut profile = crate::taste::TasteProfile::new("project");
+        profile.preferences.push(crate::taste::TastePreference {
+            key: "test runner".to_string(),
+            category: crate::taste::PreferenceCategory::Testing,
+            value: "cargo nextest".to_string(),
+            positive: 20,
+            negative: 0,
+            confidence,
+            source: crate::taste::PreferenceSource::Extracted,
+            first_observed_at: 1,
+            last_observed_at: 2,
+        });
+        crate::persist::write_json(&crate::taste::project_taste_path(dir), &profile).unwrap();
+    }
+
+    #[test]
+    fn append_taste_profile_prompt_disabled_leaves_prompt_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        write_confident_profile(dir.path(), 0.8);
+
+        let mut prompt = "base prompt".to_string();
+        append_taste_profile_prompt(&mut prompt, dir.path(), &taste_settings(false, 0.5));
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[test]
+    fn append_taste_profile_prompt_missing_file_leaves_prompt_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prompt = "base prompt".to_string();
+        append_taste_profile_prompt(&mut prompt, dir.path(), &taste_settings(true, 0.5));
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[test]
+    fn append_taste_profile_prompt_corrupt_file_leaves_prompt_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::taste::project_taste_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+
+        let mut prompt = "base prompt".to_string();
+        append_taste_profile_prompt(&mut prompt, dir.path(), &taste_settings(true, 0.5));
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[test]
+    fn append_taste_profile_prompt_below_threshold_renders_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_confident_profile(dir.path(), 0.2);
+
+        let mut prompt = "base prompt".to_string();
+        append_taste_profile_prompt(&mut prompt, dir.path(), &taste_settings(true, 0.5));
+        assert_eq!(prompt, "base prompt");
     }
 
     #[tokio::test]

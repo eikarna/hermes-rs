@@ -79,6 +79,8 @@ pub mod scheduler;
 pub mod schema;
 pub mod session_store;
 pub mod skills;
+pub mod taste;
+pub mod taste_extraction;
 pub mod tools;
 pub mod trajectory;
 pub mod validation;
@@ -99,8 +101,8 @@ pub use client::{
 pub use config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
     BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings,
-    LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TelemetrySettings,
-    TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
+    LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TasteSettings,
+    TelemetrySettings, TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
 };
 pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use context_files::{
@@ -123,6 +125,12 @@ pub use repomap::{
     MinimalRepoMap, RepoMapRenderer, RepoTag, TagKind,
 };
 pub use skills::{write_skill_metadata, Skill, SkillManager, SkillOrigin, ARCHIVE_DIR_NAME};
+pub use taste::{
+    compute_confidence, project_taste_path, FileTasteStore, PreferenceCategory,
+    PreferenceExtractor, PreferenceObservation, PreferenceSource, TastePreference, TasteProfile,
+    TasteStore, HALF_SATURATION, TASTE_SCHEMA_VERSION,
+};
+pub use taste_extraction::{TrajectoryPreferenceExtractor, DEFAULT_MAX_REPEATS};
 pub use tools::{
     register_builtin_tools, register_builtin_tools_with_provider_sub_agent,
     register_builtin_tools_with_sub_agent, KeruxTool, ToolRegistry, ToolResult,
