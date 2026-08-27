@@ -48,6 +48,12 @@ pub struct CostGuardrail {
     pub current_run_cost: f64,
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
+    /// Set once a soft warning has been emitted for the current run, so the
+    /// warn threshold notifies exactly once instead of every turn.
+    pub warn_emitted: bool,
+    /// Set once a downgrade has been applied for the current run, so the
+    /// downgrade action fires exactly once instead of every turn.
+    pub downgrade_applied: bool,
 }
 
 impl CostGuardrail {
@@ -64,6 +70,8 @@ impl CostGuardrail {
             current_run_cost: 0.0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            warn_emitted: false,
+            downgrade_applied: false,
         }
     }
 
@@ -172,6 +180,8 @@ impl CostGuardrail {
     /// Reset run cost for a new iteration/run while preserving daily cost.
     pub fn reset_run(&mut self) {
         self.current_run_cost = 0.0;
+        self.warn_emitted = false;
+        self.downgrade_applied = false;
     }
 }
 

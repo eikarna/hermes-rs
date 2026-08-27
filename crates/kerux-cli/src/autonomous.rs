@@ -3,12 +3,14 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use kerux_core::config::AppConfig;
+use kerux_core::cost::CostGuardrail;
 use kerux_core::platform::detect_shell;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -216,6 +218,10 @@ impl CommandExecutor for RealCommandExecutor {
 struct RealAutonomousAgentExecutor {
     config: AppConfig,
     system_prompt: Option<String>,
+    /// Shared cost guardrail state: carries the accumulated daily spend
+    /// across the fresh agent built for each autonomous tick, so the
+    /// `[budget]` daily ceiling spans ticks instead of resetting per tick.
+    guardrail: Arc<std::sync::Mutex<CostGuardrail>>,
 }
 
 #[async_trait(?Send)]
@@ -228,16 +234,36 @@ impl AutonomousAgentExecutor for RealAutonomousAgentExecutor {
             &mut mcp_manager,
         )
         .await?;
-        agent.run(query).await?;
+        // Seed this tick's agent with the accumulated daily cost, then
+        // snapshot the updated totals back after the run (even a halted
+        // run spent its tokens).
+        agent.set_guardrail(
+            self.guardrail
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        );
+        let result = agent.run(query).await;
+        *self
+            .guardrail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = agent.guardrail_snapshot();
+        result?;
         Ok(())
     }
 }
 
 pub async fn run_autonomous(config: AppConfig, system_prompt: Option<String>) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory")?;
+    let guardrail = Arc::new(std::sync::Mutex::new(CostGuardrail::new(
+        config.budget.clone(),
+        config.telemetry.input_cost_per_million,
+        config.telemetry.output_cost_per_million,
+    )));
     let agent_executor = RealAutonomousAgentExecutor {
         config: config.clone(),
         system_prompt,
+        guardrail,
     };
     let mut runner = AutonomousRunner::new(config, repo_root, RealCommandExecutor, agent_executor);
     runner.run_loop().await

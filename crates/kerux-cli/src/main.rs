@@ -1166,6 +1166,14 @@ impl RunProgress {
                     }
                 }
             }
+            AgentEvent::BudgetAlert { reason, .. } => {
+                self.phase = "budget alert".to_string();
+                let text = format!("⚠️ Budget: {}", reason);
+                let msg =
+                    kerux_core::gateway::OutgoingMessage::new(&self.channel_id, text).no_markdown();
+                let _ = self.sink.send(msg).await;
+                self.refresh_status().await;
+            }
             AgentEvent::Done { .. } | AgentEvent::Error { .. } => {
                 // Terminal / metadata events are handled by the run loop.
             }

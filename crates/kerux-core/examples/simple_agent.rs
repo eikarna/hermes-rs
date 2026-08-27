@@ -165,6 +165,9 @@ Use the echo tool to repeat information and the calculate tool for math."
         repo_map_max_files: 500,
         edit_format_override: None,
         max_repair_attempts: None,
+        budget: Default::default(),
+        input_cost_per_million: 0.0,
+        output_cost_per_million: 0.0,
     };
 
     let agent = KeruxAgent::new(agent_config, client, registry);

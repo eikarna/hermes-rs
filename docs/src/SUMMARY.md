@@ -20,6 +20,7 @@
 - [Flight Recorder](features/flight-recorder.md)
 - [Context Compaction](features/context-compaction.md)
 - [Fallback Provider Chain](features/fallback-chain.md)
+- [Cost Guardrails](features/cost-guardrails.md)
 - [Voice Note STT](features/voice-stt.md)
 - [Cron Scheduler](features/cron-scheduler.md)
 - [Subagent Delegation](features/subagent-delegation.md)
