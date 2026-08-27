@@ -33,8 +33,11 @@ anyhow = "1.0"
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
 config = { version = "0.14", default-features = false, features = ["toml"] }
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+indicatif = "0.17"
 dirs = "5.0"
 toml = "0.8"
+toml_edit = "0.22"
 
 # Logging
 tracing = "0.1"
