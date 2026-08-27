@@ -5,6 +5,10 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 
 ## [Unreleased]
 
+### Added
+
+- **Live capability probes** (`kerux_core::probe`): opt-in per-model verification for wizard-selected models — a mini streaming completion (verifies SSE flow + measures TTFT), a trivial `get_time` tool-call request, and a 1px base64 PNG vision payload; verdicts are `Some(true)`/`Some(false)` (verified/rejected) vs `None` (untested or inconclusive network/timeout), and `ProbeResult::to_capability_updates()` feeds `CapabilityReport::merge_probe` so probed verdicts override catalog/heuristic ones. Messages can now carry base64 images (`Message::with_images`), serialized as OpenAI `image_url` data-URL parts, Anthropic `image` blocks, and Gemini `inlineData` parts
+
 ## [0.3.0] - 2026-08-27
 
 ### Added

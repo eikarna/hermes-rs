@@ -74,6 +74,7 @@ pub mod memory;
 pub mod parser;
 pub mod persist;
 pub mod platform;
+pub mod probe;
 pub mod redaction;
 pub mod repomap;
 pub mod run_journal;
@@ -100,8 +101,8 @@ pub use capability::{
 pub use client::{
     build_provider_client, build_provider_for_kind, chat_streaming_with_provider,
     chat_with_provider, discover_models, discover_models_or_empty, resolve_provider_settings,
-    AnthropicClient, ClientConfig, EditFormat, LLMProvider, Message, ModelCache, ModelInfo,
-    OpenAIClient, ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind,
+    AnthropicClient, ClientConfig, EditFormat, ImageContent, LLMProvider, Message, ModelCache,
+    ModelInfo, OpenAIClient, ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind,
     ProviderSettings,
 };
 pub use config::{
@@ -127,6 +128,7 @@ pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};
 pub use memory::{MemoryBlock, MemoryManager, Session, UserProfile};
 pub use parser::ToolCallParser;
 pub use platform::PlatformInfo;
+pub use probe::{probe_model, probe_streaming, probe_tools, probe_vision, ProbeResult};
 pub use repomap::{
     discover_source_files, extract_file_tags, rank_and_render, Language as RepoMapLanguage,
     MinimalRepoMap, RepoMapRenderer, RepoTag, TagKind,
