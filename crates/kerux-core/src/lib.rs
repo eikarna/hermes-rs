@@ -56,6 +56,7 @@ pub(crate) fn lock_sync<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub mod agent;
 pub mod approval;
 pub mod auth;
+pub mod capability;
 pub mod capsule;
 pub mod client;
 pub mod config;
@@ -92,6 +93,9 @@ pub use auth::{
     build_oauth_authorization_url, default_auth_store_path, exchange_oauth_authorization_code,
     generate_oauth_state, generate_pkce_challenge, parse_loopback_authorization_code, AuthMethod,
     AuthProfile, AuthStore, LoopbackOAuthReceiver, OAuthTokenResponse, PkceChallenge,
+};
+pub use capability::{
+    classify, Capability, CapabilityEntry, CapabilityReport, CapabilitySource, CapabilityStatus,
 };
 pub use client::{
     build_provider_client, build_provider_for_kind, chat_streaming_with_provider,
