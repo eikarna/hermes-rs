@@ -52,7 +52,7 @@ Fallback provider chain (default OFF): array-of-tables entries (`provider`, opti
 
 ### `[budget]`
 
-Cost guardrails (default disabled): estimated-spend ceilings computed from the `[telemetry]` cost rates. `enabled` (false), `per_run_limit` (0 = off), `daily_limit` (0 = off), `warn_threshold_pct` (80), `on_limit` (`pause` | `downgrade` | `stop`), `downgrade_model` (required when `on_limit = "downgrade"`). Invalid policies fail config load.
+Cost guardrails (default disabled): estimated-spend ceilings computed from the `[telemetry]` cost rates, enforced in the agent loop after every LLM response. `enabled` (false), `per_run_limit` (0 = off), `daily_limit` (0 = off), `warn_threshold_pct` (80), `on_limit` (`pause` | `downgrade` | `stop`), `downgrade_model` (required when `on_limit = "downgrade"`). Invalid policies fail config load. See [Cost Guardrails](features/cost-guardrails.md) for enforcement semantics.
 
 ### `[validation]`
 

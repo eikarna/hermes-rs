@@ -37,7 +37,7 @@
 - Edit-protocol outcome metrics in the journal (Task 2.4): first-pass vs repaired edit attempts tracked per run
 - Static edit-format fallback ladder (Task 2.5): classified edit-application failures promote a one-way `search_replace → patch → full_file` hint ladder for the rest of the run; `[agent].edit_format_override` always wins
 - Runtime fallback provider chain: opt-in `[[client.fallback]]` entries wired via `wrap_with_fallbacks()`, typed 429/5xx/network failover classification, and a soak/integration test suite (`kerux-core/tests/fallback_chain.rs`) covering cross-provider fallthrough, streaming fallthrough, chain exhaustion, and concurrent bursts; documented in `docs/src/features/fallback-chain.md`
-- Cost guardrail surface: `[budget]` section (`enabled`, `per_run_limit`, `daily_limit`, `warn_threshold_pct`, `on_limit = pause|downgrade|stop`, `downgrade_model`) with load-time validation, plus a standalone `CostGuardrail` module (token recording, cost calculation, verdict evaluation); enforcement wiring into the agent loop (auto-pause, gateway alerts, model auto-downgrade) pending
+- Cost guardrail surface: `[budget]` section (`enabled`, `per_run_limit`, `daily_limit`, `warn_threshold_pct`, `on_limit = pause|downgrade|stop`, `downgrade_model`) with load-time validation, plus a `CostGuardrail` module (token recording, cost calculation, verdict evaluation) enforced in the agent loop: per-turn usage recording, one-time threshold warnings, `pause`/`stop` halts with `BudgetExceeded`, one-time `downgrade` model switch for the rest of the run, per-turn cost in `AgentTelemetry`, `BudgetAlert` events surfaced in the gateway and TUI, and a shared daily accumulator across autonomous ticks
 
 ## Pending
 

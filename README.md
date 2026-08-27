@@ -19,13 +19,8 @@
 ## Highlights
 
 - **Streaming-first ReAct loop** — tool calls detected and executed incrementally from partial LLM output, with a tolerant XML parser and self-healing re-prompts on failure
-<<<<<<< HEAD
-- **Ratatui TUI** — prompt-first landing screen, responsive workspace panes, reasoning rails, tool activity blocks, MCP/Skills/Behavior management
-- **Messaging gateway** (`kerux serve`) — Telegram long-polling, WhatsApp bridge, Discord/Slack adapters, inbound HTTP webhooks for Slack and external automation, live status edits, streaming replies, tool approval, voice-note STT, cron scheduling, and subagent delegation
-=======
 - **Ratatui TUI** — prompt-first landing screen, responsive workspace panes, reasoning rails, tool activity blocks, MCP/Skills/Behavior management, live telemetry HUD (tok/s, cache hits, context %, cost)
-- **Messaging gateway** (`kerux serve`) — Telegram long-polling + WhatsApp bridge + Discord/Slack REST adapters, MarkdownV2 conversion, live status edits, SSE streaming replies, tool approval via inline keyboard, voice-note STT, cron scheduler, subagent delegation
->>>>>>> wt/telemetry-hud
+- **Messaging gateway** (`kerux serve`) — Telegram long-polling, WhatsApp bridge, Discord/Slack adapters, inbound HTTP webhooks for Slack and external automation, live status edits, streaming replies, tool approval, voice-note STT, cron scheduling, and subagent delegation
 - **Autonomous coding mode** — 24/7 loop that reads `TODO.md`, validates with local tests, and only pushes after success
 - **Persistent state** — sessions, memory, todos, and cron jobs survive restarts (atomic JSON writes under `~/.kerux/`)
 - **Repo-map context** — tree-sitter symbols + personalized PageRank, token-budgeted into the system prompt
@@ -33,6 +28,7 @@
 - **Transactional git harness** — pre-run snapshots, Conventional Commits, TUI `/undo`
 - **Flight recorder** — hash-chained run journals with read-only inspection and offline-verifiable proof capsules (see [docs/src/features/flight-recorder.md](docs/src/features/flight-recorder.md))
 - **Fallback provider chain** — opt-in `[[client.fallback]]` failover across providers on 429/5xx/network errors, soak-tested and documented (see [docs/src/features/fallback-chain.md](docs/src/features/fallback-chain.md))
+- **Cost guardrails** — `[budget]` spend ceilings enforced in the agent loop: one-time threshold warnings, pause/stop halts, one-time model downgrade, per-turn cost telemetry (see [docs/src/features/cost-guardrails.md](docs/src/features/cost-guardrails.md))
 
 ## Install
 
