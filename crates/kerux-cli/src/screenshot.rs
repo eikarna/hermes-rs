@@ -126,6 +126,10 @@ fn build_workspace(config: &AppConfig) -> AppState {
         compacted: false,
         estimated: false,
         total_cost: 0.0,
+        tokens_per_second: Some(42.5),
+        turns_completed: 1,
+        context_window_usage_pct: Some(3.1),
+        cached_prompt_tokens: 512,
     };
     state
 }

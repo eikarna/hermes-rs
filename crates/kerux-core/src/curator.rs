@@ -820,6 +820,7 @@ mod tests {
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     total_tokens: 0,
+                    cached_prompt_tokens: 0,
                 },
             })
         }

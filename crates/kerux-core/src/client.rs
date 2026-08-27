@@ -279,6 +279,10 @@ impl OpenAIClient {
             "stream": stream,
         });
 
+        if stream {
+            request["stream_options"] = json!({"include_usage": true});
+        }
+
         if let Some(tools) = tools {
             if !tools.is_empty() {
                 let tools_array: Vec<Value> = tools
@@ -521,19 +525,22 @@ impl AnthropicClient {
 
         let usage = value
             .get("usage")
-            .map(|u| Usage {
-                prompt_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-                completion_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
-                    as u32,
-                total_tokens: (u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0)
-                    + u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0))
-                    as u32,
+            .map(|u| {
+                let prompt_tokens =
+                    u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let completion_tokens =
+                    u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+                Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                    cached_prompt_tokens: u
+                        .get("cache_read_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as u32,
+                }
             })
-            .unwrap_or(Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            });
+            .unwrap_or_default();
 
         let content_blocks = value
             .get("content")
@@ -910,11 +917,57 @@ pub struct ToolCallDelta {
 }
 
 /// API usage statistics
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    pub cached_prompt_tokens: u32,
+}
+
+#[derive(Deserialize)]
+struct UsageWire {
+    #[serde(default, alias = "input_tokens")]
+    prompt_tokens: u32,
+    #[serde(default, alias = "output_tokens")]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
+    cached_prompt_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: PromptTokensDetails,
+}
+
+#[derive(Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = UsageWire::deserialize(deserializer)?;
+        let total_tokens = if wire.total_tokens == 0 {
+            wire.prompt_tokens.saturating_add(wire.completion_tokens)
+        } else {
+            wire.total_tokens
+        };
+        Ok(Self {
+            prompt_tokens: wire.prompt_tokens,
+            completion_tokens: wire.completion_tokens,
+            total_tokens,
+            cached_prompt_tokens: wire
+                .cached_prompt_tokens
+                .max(wire.cache_read_input_tokens)
+                .max(wire.prompt_tokens_details.cached_tokens),
+        })
+    }
 }
 
 /// SSE streaming event from the OpenAI API
@@ -925,6 +978,8 @@ pub struct ChatStreamEvent {
     pub created: u64,
     pub model: String,
     pub choices: Vec<StreamChoice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 /// A streaming choice
@@ -1222,6 +1277,7 @@ fn normalized_stream_event(
             delta,
             finish_reason,
         }],
+        usage: None,
     }
 }
 
@@ -1317,6 +1373,29 @@ mod tests {
     use super::*;
     use crate::auth::AuthStore;
     use serial_test::serial;
+
+    #[test]
+    fn openai_usage_reports_cached_prompt_tokens() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1_000,
+            "completion_tokens": 250,
+            "total_tokens": 1_250,
+            "prompt_tokens_details": {"cached_tokens": 400}
+        }))
+        .unwrap();
+
+        assert_eq!(usage.cached_prompt_tokens, 400);
+    }
+
+    #[test]
+    fn streaming_request_asks_provider_for_usage() {
+        let client = OpenAIClient::new(ClientConfig::default());
+        let request = client
+            .build_chat_request("gpt-4o", &[Message::user("hello")], None, true)
+            .unwrap();
+
+        assert_eq!(request["stream_options"]["include_usage"], true);
+    }
 
     fn temp_auth_store_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir()

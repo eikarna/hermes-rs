@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
-use kerux_core::agent::{AgentConfig, AgentEvent, KeruxAgent};
+use kerux_core::agent::{AgentConfig, AgentEvent, AgentTelemetry, KeruxAgent};
 use kerux_core::auth::{default_auth_store_path, AuthMethod, AuthStore};
 use kerux_core::client::{build_provider_for_kind, ClientConfig, LLMProvider, ProviderKind};
 use kerux_core::config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, BehaviorSettings,
-    LoggingSettings, McpServerConfig, McpTransportKind,
+    LoggingSettings, McpServerConfig, McpTransportKind, TelemetrySettings,
 };
 use kerux_core::mcp::McpManager;
 use kerux_core::memory::MemoryManager;
@@ -766,6 +766,50 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
+fn compact_token_count(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn telemetry_cost(telemetry: &AgentTelemetry, settings: &TelemetrySettings) -> f64 {
+    telemetry.estimated_cost_usd.unwrap_or_else(|| {
+        (telemetry.prompt_tokens as f64 / 1_000_000.0) * settings.input_cost_per_million
+            + (telemetry.completion_tokens as f64 / 1_000_000.0) * settings.output_cost_per_million
+    })
+}
+
+fn currency_symbol(currency: &str) -> &str {
+    match currency {
+        "USD" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        other => other,
+    }
+}
+
+fn format_gateway_telemetry(telemetry: &AgentTelemetry, total_cost: f64, currency: &str) -> String {
+    let throughput = telemetry
+        .tokens_per_second
+        .map(|value| format!("{value:.1} tok/s"))
+        .unwrap_or_else(|| "measuring tok/s".to_string());
+    let cache_rate = if telemetry.prompt_tokens == 0 {
+        0.0
+    } else {
+        telemetry.cached_prompt_tokens as f64 / telemetry.prompt_tokens as f64 * 100.0
+    };
+    format!(
+        "{throughput} · {} tok · {cache_rate:.1}% cache · {}{total_cost:.4} · turn {}",
+        compact_token_count(telemetry.total_tokens),
+        currency_symbol(currency),
+        telemetry.turns_completed,
+    )
+}
+
 /// Final outcome of a run, handed to the progress pump so it can replace
 /// the live status message with the model's actual reply.
 struct RunOutcome {
@@ -810,6 +854,9 @@ struct RunProgress {
     stream_msg_id: Option<String>,
     /// When the live message was last edited (Telegram rate-limit throttle).
     last_stream_edit: Instant,
+    telemetry: AgentTelemetry,
+    total_cost: f64,
+    telemetry_settings: TelemetrySettings,
 }
 
 /// Minimum interval between live stream edits. Telegram rate-limits edits
@@ -837,6 +884,7 @@ impl RunProgress {
         sink: Arc<dyn kerux_core::gateway::MessageSink>,
         channel_id: String,
         streaming: bool,
+        telemetry_settings: TelemetrySettings,
     ) -> Self {
         Self {
             sink,
@@ -852,15 +900,44 @@ impl RunProgress {
             last_stream_edit: Instant::now()
                 .checked_sub(STREAM_EDIT_INTERVAL)
                 .unwrap_or_else(Instant::now),
+            telemetry: AgentTelemetry::default(),
+            total_cost: 0.0,
+            telemetry_settings,
         }
     }
 
     /// Render the current status line.
     fn status_text(&self) -> String {
-        format!(
+        let status = format!(
             "⏳ Working — {} — {}",
             format_elapsed(self.started.elapsed()),
             self.phase
+        );
+        if !self.telemetry_settings.enabled || self.telemetry.total_tokens == 0 {
+            return status;
+        }
+        format!(
+            "{status}\n{}",
+            format_gateway_telemetry(
+                &self.telemetry,
+                self.total_cost,
+                &self.telemetry_settings.currency,
+            )
+        )
+    }
+
+    fn stream_suffix(&self, cursor: &str) -> String {
+        if !self.telemetry_settings.enabled || self.telemetry.total_tokens == 0 {
+            return cursor.to_string();
+        }
+        format!(
+            "\n\n{}{}",
+            format_gateway_telemetry(
+                &self.telemetry,
+                self.total_cost,
+                &self.telemetry_settings.currency,
+            ),
+            cursor,
         )
     }
 
@@ -895,7 +972,8 @@ impl RunProgress {
         if now.duration_since(self.last_stream_edit) < STREAM_EDIT_INTERVAL {
             return;
         }
-        self.render_stream_live(" ▌").await;
+        let suffix = self.stream_suffix(" ▌");
+        self.render_stream_live(&suffix).await;
         self.last_stream_edit = now;
     }
 
@@ -1074,7 +1152,21 @@ impl RunProgress {
             AgentEvent::IterationComplete { .. } => {
                 self.phase = "thinking".to_string();
             }
-            AgentEvent::Done { .. } | AgentEvent::Error { .. } | AgentEvent::Telemetry { .. } => {
+            AgentEvent::Telemetry { telemetry } => {
+                if self.telemetry_settings.enabled {
+                    if telemetry.billable {
+                        self.total_cost += telemetry_cost(&telemetry, &self.telemetry_settings);
+                    }
+                    self.telemetry = telemetry;
+                    if self.streaming && self.stream_msg_id.is_some() {
+                        let suffix = self.stream_suffix(" ▌");
+                        self.render_stream_live(&suffix).await;
+                    } else {
+                        self.refresh_status().await;
+                    }
+                }
+            }
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } => {
                 // Terminal / metadata events are handled by the run loop.
             }
         }
@@ -1283,8 +1375,10 @@ impl kerux_core::gateway::MessageHandler for AgentMessageHandler {
         let pump_sink = sink.clone();
         let pump_channel = message.channel_id.clone();
         let pump_streaming = self.streaming_replies;
+        let telemetry_settings = runtime_config().telemetry;
         let pump = tokio::spawn(async move {
-            let mut progress = RunProgress::new(pump_sink, pump_channel, pump_streaming);
+            let mut progress =
+                RunProgress::new(pump_sink, pump_channel, pump_streaming, telemetry_settings);
             // Initial status so the user sees activity immediately.
             progress.refresh_status().await;
 
@@ -2186,6 +2280,28 @@ mod tests {
                 .unwrap();
         assert_eq!(merged.find("formatter").unwrap().positive, 5);
         assert_eq!(merged.find("test runner").unwrap().value, "cargo nextest");
+    }
+
+    #[test]
+    fn gateway_telemetry_formats_live_session_metrics() {
+        let telemetry = AgentTelemetry {
+            prompt_tokens: 1_000,
+            completion_tokens: 250,
+            total_tokens: 1_250,
+            context_window: 10_000,
+            tokens_per_second: Some(42.5),
+            turns_completed: 3,
+            cached_prompt_tokens: 400,
+            ..AgentTelemetry::default()
+        };
+
+        let text = format_gateway_telemetry(&telemetry, 0.0045, "USD");
+
+        assert!(text.contains("42.5 tok/s"));
+        assert!(text.contains("1.2k tok"));
+        assert!(text.contains("40.0% cache"));
+        assert!(text.contains("$0.0045"));
+        assert!(text.contains("turn 3"));
     }
 
     #[test]

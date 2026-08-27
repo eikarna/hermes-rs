@@ -102,6 +102,10 @@ pub struct TelemetryState {
     pub compacted: bool,
     pub estimated: bool,
     pub total_cost: f64,
+    pub tokens_per_second: Option<f64>,
+    pub turns_completed: usize,
+    pub context_window_usage_pct: Option<f64>,
+    pub cached_prompt_tokens: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -578,7 +582,11 @@ impl AppState {
         }
 
         if telemetry.billable {
-            self.session.telemetry.total_cost += self.telemetry_cost(&telemetry);
+            if let Some(cost) = telemetry.estimated_cost_usd {
+                self.session.telemetry.total_cost += cost;
+            } else {
+                self.session.telemetry.total_cost += self.telemetry_cost(&telemetry);
+            }
         }
 
         self.session.telemetry.prompt_tokens = telemetry.prompt_tokens;
@@ -587,6 +595,10 @@ impl AppState {
         self.session.telemetry.context_window = telemetry.context_window;
         self.session.telemetry.compacted = telemetry.compacted;
         self.session.telemetry.estimated = telemetry.estimated;
+        self.session.telemetry.tokens_per_second = telemetry.tokens_per_second;
+        self.session.telemetry.turns_completed = telemetry.turns_completed;
+        self.session.telemetry.context_window_usage_pct = telemetry.context_window_usage_pct;
+        self.session.telemetry.cached_prompt_tokens = telemetry.cached_prompt_tokens;
     }
 
     fn telemetry_cost(&self, telemetry: &AgentTelemetry) -> f64 {
@@ -813,6 +825,11 @@ mod tests {
                 compacted: true,
                 estimated: false,
                 billable: true,
+                tokens_per_second: Some(35.0),
+                estimated_cost_usd: Some(0.005),
+                turns_completed: 1,
+                context_window_usage_pct: Some(15.0),
+                cached_prompt_tokens: 200,
             },
         });
 

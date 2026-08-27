@@ -166,12 +166,12 @@ impl GeminiClient {
                     .get("totalTokenCount")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as u32,
+                cached_prompt_tokens: u
+                    .get("cachedContentTokenCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32,
             })
-            .unwrap_or(Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            });
+            .unwrap_or_default();
 
         let candidate = value
             .get("candidates")
