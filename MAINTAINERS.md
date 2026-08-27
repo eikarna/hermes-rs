@@ -4,12 +4,6 @@
 |------|--------|------|
 | Adnan Syamsafa | [@adnansyamsafa](https://github.com/adnansyamsafa) | Lead maintainer |
 
-## Contributors
-
-| Name | GitHub | Since |
-|------|--------|-------|
-| Alxy Savin | [@xsa-dev](https://github.com/xsa-dev) | v0.3.0 |
-
 ## Responsibilities
 
 - Review and merge pull requests
