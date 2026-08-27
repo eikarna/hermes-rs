@@ -61,6 +61,66 @@ jobs:
           pathlib.Path("release_notes.md").write_text(match.group(1).strip() + "\n", encoding="utf-8")
           PY
 
+      - name: Append contributor credits
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib, subprocess
+
+          tag = "${{ steps.tag.outputs.tag }}"
+          repo = "${{ github.repository }}"
+          BOTS = {"imgbot", "imgbot[bot]", "dependabot[bot]", "github-actions[bot]", "web-flow"}
+
+          def gh(*args):
+              r = subprocess.run(["gh", "api", *args], capture_output=True, text=True)
+              if r.returncode != 0:
+                  return None
+              try:
+                  return json.loads(r.stdout)
+              except json.JSONDecodeError:
+                  return None
+
+          # previous tag by version sort
+          out = subprocess.run(["git", "tag", "--sort=-v:refname"], capture_output=True, text=True).stdout.split()
+          prev = next((t for t in out if t != tag), None)
+
+          if prev:
+              data = gh(f"repos/{repo}/compare/{prev}...{tag}")
+              commits = (data or {}).get("commits", [])
+          else:
+              commits = gh(f"repos/{repo}/commits?sha={tag}&per_page=100") or []
+
+          contributors = []
+          for c in commits:
+              author = c.get("author") or {}
+              login = author.get("login")
+              if login and login not in BOTS and login not in contributors:
+                  contributors.append(login)
+
+          new = []
+          if prev:
+              for login in contributors:
+                  prior = gh(f"repos/{repo}/commits?author={login}&sha={prev}&per_page=1")
+                  if prior == []:
+                      new.append(login)
+
+          notes = pathlib.Path("release_notes.md").read_text(encoding="utf-8").rstrip()
+          sections = []
+          if contributors:
+              lines = " ".join(f"[@{l}](https://github.com/{l})" for l in contributors)
+              sections.append(f"## Contributors\n\n{lines}")
+          if new:
+              lines = "\n".join(f"* [@{l}](https://github.com/{l}) made their first contribution" for l in new)
+              sections.append(f"## New Contributors\n\n{lines}")
+          if sections:
+              notes += "\n\n" + "\n\n".join(sections) + "\n"
+          pathlib.Path("release_notes.md").write_text(notes, encoding="utf-8")
+          print(f"contributors={contributors} new={new}")
+          PY
+
       - name: Publish GitHub release
         if: steps.tag.outputs.skip != 'true'
         env:
