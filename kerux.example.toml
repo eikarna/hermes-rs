@@ -201,6 +201,7 @@ discord_enabled = false
 discord_api_base = "https://discord.com/api/v10"
 slack_enabled = false
 # slack_token = ""
+# slack_signing_secret = ""
 slack_api_base = "https://slack.com/api"
 webhooks_enabled = false
 # webhooks_addr = "127.0.0.1:8080"

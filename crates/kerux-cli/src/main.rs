@@ -1468,7 +1468,7 @@ async fn run_gateway(config: &AppConfig, system_prompt: Option<&str>) -> Result<
     if gateway_config.slack_enabled {
         gateway = gateway.with_adapter(Arc::new(kerux_core::gateway::SlackAdapter::new(
             gateway_config.slack_token.clone(),
-            None,
+            gateway_config.slack_signing_secret.clone(),
         )));
     }
     if gateway_config.whatsapp_enabled {

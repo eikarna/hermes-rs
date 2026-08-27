@@ -568,6 +568,7 @@ pub struct GatewaySettings {
     pub discord_api_base: String,
     pub slack_enabled: bool,
     pub slack_token: Option<String>,
+    pub slack_signing_secret: Option<String>,
     pub slack_api_base: String,
     pub whatsapp_enabled: bool,
     /// Base URL of the Baileys WhatsApp bridge (e.g. "http://127.0.0.1:3000").
@@ -603,6 +604,7 @@ impl Default for GatewaySettings {
             discord_api_base: "https://discord.com/api/v10".to_string(),
             slack_enabled: false,
             slack_token: None,
+            slack_signing_secret: None,
             slack_api_base: "https://slack.com/api".to_string(),
             whatsapp_enabled: false,
             whatsapp_bridge_url: None,
