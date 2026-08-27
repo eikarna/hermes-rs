@@ -128,10 +128,21 @@ impl GeminiClient {
         for m in messages {
             match m.role {
                 Role::System => system_parts.push(m.content.trim()),
-                Role::User => contents.push(json!({
-                    "role": "user",
-                    "parts": [{ "text": m.content }],
-                })),
+                Role::User => {
+                    let mut parts: Vec<Value> = vec![json!({ "text": m.content })];
+                    for img in &m.images {
+                        parts.push(json!({
+                            "inlineData": {
+                                "mimeType": img.media_type,
+                                "data": img.data_base64,
+                            }
+                        }));
+                    }
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": parts,
+                    }));
+                }
                 Role::Assistant => {
                     let mut parts: Vec<Value> = Vec::new();
                     if !m.content.trim().is_empty() {

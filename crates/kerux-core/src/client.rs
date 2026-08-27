@@ -536,9 +536,21 @@ impl AnthropicClient {
             match m.role {
                 Role::System => system_parts.push(m.content.trim()),
                 Role::User => {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    blocks.push(json!({ "type": "text", "text": m.content }));
+                    for img in &m.images {
+                        blocks.push(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.media_type,
+                                "data": img.data_base64,
+                            }
+                        }));
+                    }
                     anthropic_messages.push(json!({
                         "role": "user",
-                        "content": [{ "type": "text", "text": m.content }],
+                        "content": blocks,
                     }));
                 }
                 Role::Assistant => {
@@ -905,6 +917,15 @@ impl Role {
     }
 }
 
+/// A base64-encoded image attached to a message (vision input).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageContent {
+    /// MIME type, e.g. `image/png`.
+    pub media_type: String,
+    /// Base64-encoded image bytes.
+    pub data_base64: String,
+}
+
 /// A chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -914,6 +935,9 @@ pub struct Message {
     pub name: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Images attached to the message (user turns only, in practice).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageContent>,
 }
 
 impl Message {
@@ -926,6 +950,7 @@ impl Message {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            images: Vec::new(),
         }
     }
 
@@ -953,7 +978,14 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             name: None,
             tool_calls: None,
+            images: Vec::new(),
         }
+    }
+
+    /// Attach base64-encoded images to the message (vision input).
+    pub fn with_images(mut self, images: Vec<ImageContent>) -> Self {
+        self.images = images;
+        self
     }
 
     /// Add tool calls to the message
@@ -976,6 +1008,26 @@ impl Message {
         let mut map = serde_json::Map::new();
         map.insert("role".to_string(), json!(self.role.as_str()));
 
+        // Messages with attached images serialize content as a parts array
+        // (OpenAI vision format); plain messages keep the string form.
+        let content_value = if self.images.is_empty() {
+            json!(self.content)
+        } else {
+            let mut parts: Vec<Value> = Vec::new();
+            if !self.content.is_empty() {
+                parts.push(json!({ "type": "text", "text": self.content }));
+            }
+            for img in &self.images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", img.media_type, img.data_base64)
+                    }
+                }));
+            }
+            json!(parts)
+        };
+
         if let Some(ref tool_calls) = self.tool_calls {
             let tc_array: Vec<Value> = tool_calls
                 .iter()
@@ -991,9 +1043,9 @@ impl Message {
                 })
                 .collect();
             map.insert("tool_calls".to_string(), json!(tc_array));
-            map.insert("content".to_string(), json!(self.content));
+            map.insert("content".to_string(), content_value);
         } else {
-            map.insert("content".to_string(), json!(self.content));
+            map.insert("content".to_string(), content_value);
         }
 
         if let Some(ref name) = self.name {
@@ -1016,6 +1068,7 @@ impl Default for Message {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            images: Vec::new(),
         }
     }
 }
@@ -1525,6 +1578,11 @@ impl MessageBuilder {
 
     pub fn tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
         self.message.tool_calls = Some(tool_calls);
+        self
+    }
+
+    pub fn images(mut self, images: Vec<ImageContent>) -> Self {
+        self.message.images = images;
         self
     }
 
