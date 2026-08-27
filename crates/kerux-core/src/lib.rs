@@ -106,10 +106,10 @@ pub use client::{
     ProviderSettings,
 };
 pub use config::{
-    install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
-    BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings,
-    LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TasteSettings,
-    TelemetrySettings, TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
+    install_runtime_config, load_app_config, parse_config_file, runtime_config, AppConfig,
+    AutonomousSettings, BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings,
+    HttpToolSettings, LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings,
+    TasteSettings, TelemetrySettings, TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
 };
 pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use context_files::{
