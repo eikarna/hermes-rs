@@ -82,6 +82,9 @@ pub enum Error {
     #[error("Agent run cancelled by user")]
     Cancelled,
 
+    #[error("Budget limit exceeded: {0}")]
+    BudgetExceeded(String),
+
     #[error("Context length exceeded")]
     ContextLengthExceeded,
 

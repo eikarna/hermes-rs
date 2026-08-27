@@ -18,9 +18,10 @@ use crate::client::{
     ChatResponse, ChatStreamEvent, ChatStreamResponse, LLMProvider, Message, OpenAIClient, Role,
     ToolCall, Usage,
 };
-use crate::config::{runtime_config, BehaviorSettings, TasteSettings};
+use crate::config::{runtime_config, BehaviorSettings, BudgetSettings, TasteSettings};
 use crate::context::{estimate_message_tokens, estimate_tokens};
 use crate::context_files::{load_default_context_files, load_workspace_context};
+use crate::cost::{BudgetAction, CostGuardrail, GuardrailVerdict};
 use crate::error::{Error, Result};
 use crate::memory::MemoryManager;
 use crate::parser::{ToolCallParser, ToolCallStreamParser};
@@ -78,6 +79,15 @@ pub struct AgentConfig {
     /// Task 2.3 bounded repair policy: per-path edit repair budget. `None`
     /// falls back to `max_healing_attempts`.
     pub max_repair_attempts: Option<usize>,
+    /// Cost guardrail policy (`[budget]` config section). Enforcement is
+    /// active only when `budget.enabled` is true.
+    pub budget: BudgetSettings,
+    /// Input token price per million tokens (`[telemetry]` rate) used for
+    /// budget cost estimation.
+    pub input_cost_per_million: f64,
+    /// Output token price per million tokens (`[telemetry]` rate) used for
+    /// budget cost estimation.
+    pub output_cost_per_million: f64,
 }
 
 impl Default for AgentConfig {
@@ -88,6 +98,7 @@ impl Default for AgentConfig {
 
 impl From<&BehaviorSettings> for AgentConfig {
     fn from(settings: &BehaviorSettings) -> Self {
+        let runtime = runtime_config();
         Self {
             model: settings.model.clone(),
             max_iterations: settings.max_iterations,
@@ -101,6 +112,9 @@ impl From<&BehaviorSettings> for AgentConfig {
             repo_map_max_files: settings.repo_map_max_files,
             edit_format_override: settings.edit_format_override,
             max_repair_attempts: settings.max_repair_attempts,
+            budget: runtime.budget.clone(),
+            input_cost_per_million: runtime.telemetry.input_cost_per_million,
+            output_cost_per_million: runtime.telemetry.output_cost_per_million,
         }
     }
 }
@@ -131,6 +145,16 @@ pub enum AgentEvent {
     IterationComplete { iteration: usize },
     /// Token, context, and compaction telemetry
     Telemetry { telemetry: AgentTelemetry },
+    /// Cost guardrail notification: the warn threshold was crossed or a
+    /// budget limit action (pause/downgrade/stop) was applied.
+    BudgetAlert {
+        /// `None` for soft warnings; the limit action otherwise.
+        action: Option<BudgetAction>,
+        reason: String,
+        current_run_cost: f64,
+        daily_cost: f64,
+        downgrade_model: Option<String>,
+    },
     /// Agent error
     Error { error: String },
 }
@@ -225,6 +249,22 @@ fn agent_event_record(event: &AgentEvent) -> Option<(&'static str, serde_json::V
                 "cached_prompt_tokens": telemetry.cached_prompt_tokens,
             }),
         )),
+        AgentEvent::BudgetAlert {
+            action,
+            reason,
+            current_run_cost,
+            daily_cost,
+            downgrade_model,
+        } => Some((
+            "budget_alert",
+            serde_json::json!({
+                "action": action,
+                "reason": reason,
+                "current_run_cost": current_run_cost,
+                "daily_cost": daily_cost,
+                "downgrade_model": downgrade_model,
+            }),
+        )),
         AgentEvent::IterationComplete { iteration } => Some((
             "iteration_completed",
             serde_json::json!({"iteration": iteration}),
@@ -261,6 +301,15 @@ pub struct KeruxAgent {
     approval_gate: Arc<std::sync::Mutex<Option<Arc<dyn crate::approval::ToolApprovalGate>>>>,
     /// Per-run edit-protocol outcome tracker (Task 2.4 measurement).
     edit_metrics: Arc<std::sync::Mutex<crate::edit_metrics::EditMetricsTracker>>,
+    /// Cost guardrail state. Wrapped in a Mutex because `record_tokens`
+    /// mutates accumulators while the run loop only holds `&self`. The
+    /// daily cost survives across runs on shared agents (gateway/TUI);
+    /// per-run state is reset at the start of each run.
+    guardrail: Arc<std::sync::Mutex<CostGuardrail>>,
+    /// Model override applied by the budget guardrail (`downgrade`). When
+    /// set, the run loop routes requests to this model instead of
+    /// `config.model`. Cleared at the start of each run.
+    model_override: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl KeruxAgent {
@@ -271,6 +320,165 @@ impl KeruxAgent {
             .max_repair_attempts
             .unwrap_or(config.max_healing_attempts)
             .min(u32::MAX as usize) as u32
+    }
+
+    /// Build the cost guardrail from the agent config's budget policy and
+    /// telemetry cost rates.
+    fn guardrail_from(config: &AgentConfig) -> CostGuardrail {
+        CostGuardrail::new(
+            config.budget.clone(),
+            config.input_cost_per_million,
+            config.output_cost_per_million,
+        )
+    }
+
+    /// The model the run loop should route requests to: the guardrail's
+    /// downgrade override when active, otherwise the configured model.
+    fn active_model(&self) -> String {
+        crate::lock_sync(&self.model_override)
+            .clone()
+            .unwrap_or_else(|| self.config.model.clone())
+    }
+
+    /// Reset per-run budget state (run cost, once-flags, model override)
+    /// while preserving the accumulated daily cost. Called at the start of
+    /// each run so shared agents enforce ceilings per run.
+    fn reset_budget_run(&self) {
+        crate::lock_sync(&self.guardrail).reset_run();
+        *crate::lock_sync(&self.model_override) = None;
+    }
+
+    /// Replace the guardrail state. Autonomous mode uses this to share one
+    /// daily-cost accumulator across the fresh agent it builds per tick.
+    pub fn set_guardrail(&self, guardrail: CostGuardrail) {
+        *crate::lock_sync(&self.guardrail) = guardrail;
+    }
+
+    /// Clone the current guardrail state so callers can carry the
+    /// accumulated daily cost back into a shared tracker after a run.
+    pub fn guardrail_snapshot(&self) -> CostGuardrail {
+        crate::lock_sync(&self.guardrail).clone()
+    }
+
+    /// Local estimated cost for one turn's usage, populated only when the
+    /// budget guardrail is enabled (feeds `AgentTelemetry.estimated_cost_usd`).
+    fn budget_turn_cost(&self, usage: Option<&Usage>) -> Option<f64> {
+        if !self.config.budget.enabled {
+            return None;
+        }
+        let usage = usage?;
+        let cost = crate::lock_sync(&self.guardrail).calculate_cost(
+            usage.prompt_tokens as usize,
+            usage.completion_tokens as usize,
+        );
+        Some(cost)
+    }
+
+    /// Record one turn's token usage against the cost guardrail and enforce
+    /// the resulting verdict. `Warn` emits a one-time threshold alert;
+    /// `LimitExceeded` applies the configured `on_limit` action —
+    /// `downgrade` routes the rest of the run to the cheaper model (once),
+    /// while `pause` and `stop` halt the run with [`Error::BudgetExceeded`].
+    /// No-op when the budget guardrail is disabled.
+    async fn enforce_budget(
+        &self,
+        usage: Option<&Usage>,
+        fallback_prompt_tokens: usize,
+        fallback_completion_tokens: usize,
+    ) -> Result<()> {
+        if !self.config.budget.enabled {
+            return Ok(());
+        }
+        let (prompt_tokens, completion_tokens) = match usage {
+            Some(usage) => (
+                usage.prompt_tokens as usize,
+                usage.completion_tokens as usize,
+            ),
+            None => (fallback_prompt_tokens, fallback_completion_tokens),
+        };
+        let verdict =
+            crate::lock_sync(&self.guardrail).record_tokens(prompt_tokens, completion_tokens);
+        match verdict {
+            GuardrailVerdict::Ok => Ok(()),
+            GuardrailVerdict::Warn {
+                current_run_cost,
+                daily_cost,
+                downgrade_model,
+                message,
+            } => {
+                let first_warning = {
+                    let mut guardrail = crate::lock_sync(&self.guardrail);
+                    if guardrail.warn_emitted {
+                        false
+                    } else {
+                        guardrail.warn_emitted = true;
+                        true
+                    }
+                };
+                if first_warning {
+                    warn!(cost = current_run_cost, "Budget warn threshold reached");
+                    self.emit(AgentEvent::BudgetAlert {
+                        action: None,
+                        reason: message,
+                        current_run_cost,
+                        daily_cost,
+                        downgrade_model,
+                    })
+                    .await?;
+                }
+                Ok(())
+            }
+            GuardrailVerdict::LimitExceeded {
+                action,
+                reason,
+                current_run_cost,
+                daily_cost,
+                downgrade_model,
+            } => match action {
+                BudgetAction::Downgrade => {
+                    let first_downgrade = {
+                        let mut guardrail = crate::lock_sync(&self.guardrail);
+                        if guardrail.downgrade_applied {
+                            false
+                        } else {
+                            guardrail.downgrade_applied = true;
+                            true
+                        }
+                    };
+                    if first_downgrade {
+                        if let Some(model) = downgrade_model.clone() {
+                            info!(
+                                from = %self.config.model,
+                                to = %model,
+                                "Budget limit hit; downgrading model for the rest of the run"
+                            );
+                            *crate::lock_sync(&self.model_override) = Some(model);
+                        }
+                        self.emit(AgentEvent::BudgetAlert {
+                            action: Some(BudgetAction::Downgrade),
+                            reason,
+                            current_run_cost,
+                            daily_cost,
+                            downgrade_model,
+                        })
+                        .await?;
+                    }
+                    Ok(())
+                }
+                action => {
+                    error!(cost = current_run_cost, %reason, "Budget limit hit; halting run");
+                    self.emit(AgentEvent::BudgetAlert {
+                        action: Some(action),
+                        reason: reason.clone(),
+                        current_run_cost,
+                        daily_cost,
+                        downgrade_model,
+                    })
+                    .await?;
+                    Err(Error::BudgetExceeded(reason))
+                }
+            },
+        }
     }
 
     /// Create a new Kerux agent
@@ -287,6 +495,7 @@ impl KeruxAgent {
         let edit_tracker = crate::edit_metrics::EditMetricsTracker::with_repair_budget(
             Self::repair_budget_from(&config),
         );
+        let guardrail = Self::guardrail_from(&config);
         Self {
             config,
             client,
@@ -299,6 +508,8 @@ impl KeruxAgent {
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
             approval_gate: Arc::new(std::sync::Mutex::new(None)),
             edit_metrics: Arc::new(std::sync::Mutex::new(edit_tracker)),
+            guardrail: Arc::new(std::sync::Mutex::new(guardrail)),
+            model_override: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -322,6 +533,7 @@ impl KeruxAgent {
         let edit_tracker = crate::edit_metrics::EditMetricsTracker::with_repair_budget(
             Self::repair_budget_from(&config),
         );
+        let guardrail = Self::guardrail_from(&config);
         Self {
             config,
             client,
@@ -334,6 +546,8 @@ impl KeruxAgent {
             repo_map_cache: Arc::new(tokio::sync::OnceCell::new()),
             approval_gate: Arc::new(std::sync::Mutex::new(None)),
             edit_metrics: Arc::new(std::sync::Mutex::new(edit_tracker)),
+            guardrail: Arc::new(std::sync::Mutex::new(guardrail)),
+            model_override: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -984,6 +1198,10 @@ impl KeruxAgent {
     ) -> Result<Message> {
         info!("Starting agent run");
 
+        // Fresh per-run budget state (run cost, once-flags, model override);
+        // the daily accumulator survives across runs on shared agents.
+        self.reset_budget_run();
+
         // Add user message
         self.add_message(Message::user(&user_query)).await;
 
@@ -1035,10 +1253,11 @@ impl KeruxAgent {
             )
             .await?;
 
+            let model = self.active_model();
             let response = if self.config.stream {
                 let stream = self
                     .client
-                    .chat_streaming(&self.config.model, &request_messages, Some(&tools))
+                    .chat_streaming(&model, &request_messages, Some(&tools))
                     .await?;
                 let stream_started = Instant::now();
                 match self
@@ -1055,6 +1274,15 @@ impl KeruxAgent {
                             stream_started.elapsed(),
                         )
                         .await?;
+                        let fallback_completion = estimate_tokens(&response_text)
+                            + estimate_tokens(&reasoning_text)
+                            + total_tool_call_tokens(&tool_calls);
+                        self.enforce_budget(
+                            usage.as_ref(),
+                            preflight_telemetry.prompt_tokens,
+                            fallback_completion,
+                        )
+                        .await?;
                         Ok((response_text, reasoning_text, tool_calls))
                     }
                     Err(error) => Err(error),
@@ -1063,7 +1291,7 @@ impl KeruxAgent {
                 let request_started = Instant::now();
                 let response = self
                     .client
-                    .chat(&self.config.model, &request_messages, Some(&tools))
+                    .chat(&model, &request_messages, Some(&tools))
                     .await?;
                 self.process_response(response, &preflight_telemetry, request_started.elapsed())
                     .await
@@ -1333,7 +1561,9 @@ impl KeruxAgent {
                 estimated: usage.is_none(),
                 billable: true,
                 tokens_per_second: tokens_per_second(completion_tokens, elapsed),
-                estimated_cost_usd: None,
+                estimated_cost_usd: preflight
+                    .estimated_cost_usd
+                    .or_else(|| self.budget_turn_cost(usage)),
                 turns_completed: preflight.turns_completed,
                 context_window_usage_pct: context_window_usage(
                     total_tokens,
@@ -1598,13 +1828,17 @@ impl KeruxAgent {
                 estimated: false,
                 billable: true,
                 tokens_per_second: tokens_per_second(usage.completion_tokens as usize, elapsed),
-                estimated_cost_usd: preflight.estimated_cost_usd,
+                estimated_cost_usd: preflight
+                    .estimated_cost_usd
+                    .or_else(|| self.budget_turn_cost(Some(&usage))),
                 turns_completed: preflight.turns_completed,
                 context_window_usage_pct: preflight.context_window_usage_pct,
                 cached_prompt_tokens: usage.cached_prompt_tokens as usize,
             },
         })
         .await?;
+
+        self.enforce_budget(Some(&usage), 0, 0).await?;
 
         Ok((content, reasoning, tool_calls))
     }
@@ -4744,5 +4978,197 @@ mod tests {
         assert!(!results[0].success);
         assert!(results[0].error.as_deref().unwrap().contains("cancelled"));
         assert!(approval_events(&recorder).is_empty());
+    }
+
+    fn usage(prompt_tokens: u32, completion_tokens: u32) -> Usage {
+        Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            cached_prompt_tokens: 0,
+        }
+    }
+
+    async fn budget_agent(
+        budget: crate::config::BudgetSettings,
+    ) -> (KeruxAgent, tokio::sync::mpsc::Receiver<AgentEvent>) {
+        let config = AgentConfig {
+            model: "expensive-model".to_string(),
+            budget,
+            input_cost_per_million: 10.0,
+            output_cost_per_million: 0.0,
+            ..AgentConfig::default()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let registry = ToolRegistry::new(Duration::from_secs(1));
+        let agent =
+            KeruxAgent::with_provider_events(config, Arc::new(StaticProvider), registry, tx);
+        (agent, rx)
+    }
+
+    async fn drain_budget_alerts(
+        rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    ) -> Vec<AgentEvent> {
+        let mut alerts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::BudgetAlert { .. }) {
+                alerts.push(event);
+            }
+        }
+        alerts
+    }
+
+    #[tokio::test]
+    async fn budget_warn_verdict_emits_alert_once() {
+        let budget = crate::config::BudgetSettings {
+            enabled: true,
+            per_run_limit: 10.0,
+            warn_threshold_pct: 80,
+            on_limit: "pause".to_string(),
+            ..Default::default()
+        };
+        let (agent, mut rx) = budget_agent(budget).await;
+
+        // $8.50 >= 80% of $10 -> Warn.
+        agent
+            .enforce_budget(Some(&usage(850_000, 0)), 0, 0)
+            .await
+            .unwrap();
+        let alerts = drain_budget_alerts(&mut rx).await;
+        assert_eq!(alerts.len(), 1);
+        match &alerts[0] {
+            AgentEvent::BudgetAlert {
+                action,
+                current_run_cost,
+                ..
+            } => {
+                assert!(action.is_none());
+                assert!((current_run_cost - 8.5).abs() < 1e-6);
+            }
+            _ => unreachable!(),
+        }
+
+        // Still in the warn band: no second alert.
+        agent
+            .enforce_budget(Some(&usage(100_000, 0)), 0, 0)
+            .await
+            .unwrap();
+        assert!(drain_budget_alerts(&mut rx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn budget_pause_verdict_halts_with_error() {
+        let budget = crate::config::BudgetSettings {
+            enabled: true,
+            per_run_limit: 5.0,
+            on_limit: "pause".to_string(),
+            ..Default::default()
+        };
+        let (agent, mut rx) = budget_agent(budget).await;
+
+        // $6.00 > $5.00 per-run limit -> LimitExceeded(Pause).
+        let error = agent
+            .enforce_budget(Some(&usage(600_000, 0)), 0, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::BudgetExceeded(_)));
+
+        let alerts = drain_budget_alerts(&mut rx).await;
+        assert_eq!(alerts.len(), 1);
+        match &alerts[0] {
+            AgentEvent::BudgetAlert { action, .. } => {
+                assert_eq!(action.as_ref(), Some(&BudgetAction::Pause));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_stop_verdict_halts_with_error() {
+        let budget = crate::config::BudgetSettings {
+            enabled: true,
+            daily_limit: 5.0,
+            on_limit: "stop".to_string(),
+            ..Default::default()
+        };
+        let (agent, mut rx) = budget_agent(budget).await;
+
+        let error = agent
+            .enforce_budget(Some(&usage(600_000, 0)), 0, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::BudgetExceeded(_)));
+
+        let alerts = drain_budget_alerts(&mut rx).await;
+        assert_eq!(alerts.len(), 1);
+        match &alerts[0] {
+            AgentEvent::BudgetAlert { action, .. } => {
+                assert_eq!(action.as_ref(), Some(&BudgetAction::Stop));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_downgrade_verdict_switches_model_once() {
+        let budget = crate::config::BudgetSettings {
+            enabled: true,
+            per_run_limit: 5.0,
+            on_limit: "downgrade".to_string(),
+            downgrade_model: Some("cheap-model".to_string()),
+            ..Default::default()
+        };
+        let (agent, mut rx) = budget_agent(budget).await;
+        assert_eq!(agent.active_model(), "expensive-model");
+
+        // Over the limit: downgrade applies, run continues.
+        agent
+            .enforce_budget(Some(&usage(600_000, 0)), 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(agent.active_model(), "cheap-model");
+
+        let alerts = drain_budget_alerts(&mut rx).await;
+        assert_eq!(alerts.len(), 1);
+        match &alerts[0] {
+            AgentEvent::BudgetAlert {
+                action,
+                downgrade_model,
+                ..
+            } => {
+                assert_eq!(action.as_ref(), Some(&BudgetAction::Downgrade));
+                assert_eq!(downgrade_model.as_deref(), Some("cheap-model"));
+            }
+            _ => unreachable!(),
+        }
+
+        // Still over the limit: no repeat alert, model stays downgraded.
+        agent
+            .enforce_budget(Some(&usage(100_000, 0)), 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(agent.active_model(), "cheap-model");
+        assert!(drain_budget_alerts(&mut rx).await.is_empty());
+
+        // A fresh run clears the override.
+        agent.reset_budget_run();
+        assert_eq!(agent.active_model(), "expensive-model");
+    }
+
+    #[tokio::test]
+    async fn budget_disabled_records_nothing() {
+        let budget = crate::config::BudgetSettings {
+            enabled: false,
+            per_run_limit: 1.0,
+            ..Default::default()
+        };
+        let (agent, mut rx) = budget_agent(budget).await;
+
+        agent
+            .enforce_budget(Some(&usage(10_000_000, 0)), 0, 0)
+            .await
+            .unwrap();
+        assert!(drain_budget_alerts(&mut rx).await.is_empty());
+        assert_eq!(crate::lock_sync(&agent.guardrail).current_run_cost, 0.0);
     }
 }
