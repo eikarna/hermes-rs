@@ -27,6 +27,7 @@
 - **Taste profiles** — confidence-scored coding preferences injected from `.kerux/taste.json`, portable through `kerux taste push|pull`
 - **Transactional git harness** — pre-run snapshots, Conventional Commits, TUI `/undo`
 - **Flight recorder** — hash-chained run journals with read-only inspection and offline-verifiable proof capsules (see [docs/src/features/flight-recorder.md](docs/src/features/flight-recorder.md))
+- **Fallback provider chain** — opt-in `[[client.fallback]]` failover across providers on 429/5xx/network errors, soak-tested and documented (see [docs/src/features/fallback-chain.md](docs/src/features/fallback-chain.md))
 
 ## Install
 

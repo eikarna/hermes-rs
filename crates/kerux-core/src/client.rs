@@ -462,10 +462,12 @@ impl AnthropicClient {
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(Error::Agent(format!(
-                "Anthropic request failed ({}): {}",
-                status, body
-            )));
+            // Typed variant so fallback/retry classifiers can branch on the
+            // status instead of parsing formatted strings.
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body,
+            });
         }
         Self::parse_anthropic_response(&body, model)
     }
@@ -490,10 +492,12 @@ impl AnthropicClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await?;
-            return Err(Error::Agent(format!(
-                "Anthropic streaming request failed ({}): {}",
-                status, body
-            )));
+            // Same typed variant as non-streaming: 429/5xx must be visible
+            // to the fallback classifier without string sniffing.
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body,
+            });
         }
         Ok(ChatStreamResponse::new(response.bytes_stream()))
     }

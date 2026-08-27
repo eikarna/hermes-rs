@@ -61,6 +61,7 @@ pub mod client;
 pub mod config;
 pub mod context;
 pub mod context_files;
+pub mod cost;
 pub mod curator;
 pub mod distillation;
 pub mod edit_metrics;
@@ -108,6 +109,7 @@ pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use context_files::{
     load_context_dir, load_default_context_files, load_workspace_context, scan_context_content,
 };
+pub use cost::{BudgetAction, CostGuardrail, GuardrailVerdict};
 pub use curator::{curate, CurationPolicy, CurationReport};
 pub use distillation::{distill_session_to_memory, distill_session_with_provider};
 pub use error::{Error, Result};
