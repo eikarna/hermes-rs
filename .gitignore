@@ -41,3 +41,6 @@ hermes.toml
 docs/book/
 run-smoke-1.capsule.html
 .build-tmp/
+
+# Kanban worker worktrees
+.worktrees/

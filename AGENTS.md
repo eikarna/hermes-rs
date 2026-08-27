@@ -18,6 +18,8 @@
   - `cargo test --workspace`
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 
+- **Batch verification, never interleave:** write ALL code changes first, then run the verification suite ONCE at the end. No code->test->code->test loops — each cargo run costs minutes of CPU and GB of SSD writes. If a run fails, read the full output, fix everything in one pass, re-run once. Max 2-3 verification cycles per task. Use `cargo check` for intermediate sanity only; `cargo test` + `cargo clippy` are final-verification-only. Never re-run after cosmetic edits.
+
 - Commit in small staged units (`git add <specific files>` then commit); never bulk `git add -A` of unrelated changes
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
