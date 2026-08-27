@@ -14,7 +14,18 @@ The binary lands at `target/release/kerux`.
 
 ## Configure
 
-Copy the example config and fill in your provider:
+Fastest path — the interactive wizard:
+
+```bash
+kerux wizard
+```
+
+It sniffs provider credentials from the environment, validates the API key
+with a live model-list call, lets you fuzzy-pick a model (with capability
+badges), optionally probes it and wires a fallback model, then writes the
+config and runs a smoke test. `kerux model` switches the model anytime.
+
+Or copy the example config and fill in your provider:
 
 ```bash
 mkdir -p ~/.config/kerux

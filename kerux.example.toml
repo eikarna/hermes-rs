@@ -1,4 +1,7 @@
 # Kerux configuration example
+#
+# Fastest way to produce this file: `kerux wizard` (interactive setup).
+# Switch models later with `kerux model`.
 
 [client]
 provider = "openai" # openai | anthropic | ollama | openrouter | gemini | nous
