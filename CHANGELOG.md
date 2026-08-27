@@ -5,6 +5,8 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-27
+
 ### Added
 
 - **Inbound webhook gateway** (`[gateway] webhooks_enabled` + `webhooks_addr`): axum listener with health checks, generic JSON triggers for CI/automation, `platform:channel` reply routing, Slack Events API challenge/event handling, HMAC-SHA256 signature verification with replay-window enforcement, and graceful shutdown
