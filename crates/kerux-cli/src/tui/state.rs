@@ -353,6 +353,28 @@ impl AppState {
                 );
             }
             AgentEvent::Telemetry { telemetry } => self.apply_telemetry(telemetry),
+            AgentEvent::BudgetAlert {
+                action,
+                reason,
+                current_run_cost,
+                daily_cost,
+                downgrade_model,
+            } => {
+                let label = match action {
+                    Some(action) => format!("Budget {:?} alert", action),
+                    None => "Budget warning".to_string(),
+                };
+                let mut detail = format!(
+                    "{} (run ${:.4}, day ${:.4}",
+                    reason, current_run_cost, daily_cost
+                );
+                if let Some(model) = downgrade_model {
+                    detail.push_str(&format!(", downgrade → {}", model));
+                }
+                detail.push(')');
+                self.push_activity(label, detail, Tone::Warning);
+                self.session.status = "Budget alert".to_string();
+            }
             AgentEvent::Error { error } => {
                 self.session.error = Some(error.clone());
                 self.session.status = "Errored".to_string();
