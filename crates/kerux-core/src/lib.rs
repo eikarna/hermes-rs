@@ -95,9 +95,10 @@ pub use auth::{
 };
 pub use client::{
     build_provider_client, build_provider_for_kind, chat_streaming_with_provider,
-    chat_with_provider, resolve_provider_settings, AnthropicClient, ClientConfig, EditFormat,
-    LLMProvider, Message, OpenAIClient, ProviderCapabilities, ProviderClient, ProviderConfig,
-    ProviderKind, ProviderSettings,
+    chat_with_provider, discover_models, discover_models_or_empty, resolve_provider_settings,
+    AnthropicClient, ClientConfig, EditFormat, LLMProvider, Message, ModelCache, ModelInfo,
+    OpenAIClient, ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind,
+    ProviderSettings,
 };
 pub use config::{
     install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,

@@ -7,12 +7,26 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::{AnthropicClient, ChatResponse, ChatStreamResponse, Message, OpenAIClient};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::schema::ToolSchema;
+
+/// Provider-reported model metadata used by discovery and onboarding.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub display_name: String,
+    pub context_window: Option<u64>,
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+    pub pricing: Option<serde_json::Value>,
+    pub raw: serde_json::Value,
+}
 
 /// Preferred code-edit format a provider/model supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -274,6 +288,12 @@ impl ProviderKind {
 /// A model-agnostic chat interface implemented by every provider adapter.
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        Err(crate::error::Error::Agent(
+            "model listing is not implemented for this provider".into(),
+        ))
+    }
+
     async fn chat(
         &self,
         model: &str,
@@ -328,6 +348,15 @@ pub enum ProviderClient {
 
 #[async_trait]
 impl LLMProvider for ProviderClient {
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        match self {
+            Self::Openai(c) | Self::Openrouter(c) | Self::Nous(c) => c.list_models().await,
+            Self::Ollama(c) => c.list_ollama_models().await,
+            Self::Anthropic(c) => c.list_models().await,
+            Self::Gemini(c) => c.list_models().await,
+        }
+    }
+
     async fn chat(
         &self,
         model: &str,
@@ -467,9 +496,149 @@ impl ProviderClient {
     }
 }
 
+/// File-backed model-list cache keyed by (provider, endpoint).
+///
+/// One JSON document per provider/endpoint hash under `model-cache/`.
+/// Entries carry a Unix timestamp; reads older than `ttl` are treated
+/// as misses. Corrupt or unreadable files degrade to a cache miss.
+#[derive(Debug, Clone)]
+pub struct ModelCache {
+    dir: PathBuf,
+    ttl: Duration,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedModelList {
+    fetched_at_unix: u64,
+    models: Vec<ModelInfo>,
+}
+
+impl ModelCache {
+    pub fn new(dir: PathBuf, ttl: Duration) -> Self {
+        Self { dir, ttl }
+    }
+
+    /// Default cache location: `<KERUX_HOME>/model-cache`.
+    pub fn default_location() -> Self {
+        Self::new(
+            crate::platform::kerux_home().join("model-cache"),
+            Duration::from_secs(3600),
+        )
+    }
+
+    fn path(&self, kind: ProviderKind, endpoint: &str) -> PathBuf {
+        let mut hasher = Sha256::new();
+        hasher.update(kind.as_str().as_bytes());
+        hasher.update(b"|");
+        hasher.update(endpoint.as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        self.dir.join(format!("{}.json", &hash[..16]))
+    }
+
+    /// Read a fresh entry; returns `None` on miss, expiry, or corruption.
+    pub fn load(&self, kind: ProviderKind, endpoint: &str) -> Option<Vec<ModelInfo>> {
+        let path = self.path(kind, endpoint);
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let cached: CachedModelList = serde_json::from_str(&raw).ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        if now.saturating_sub(cached.fetched_at_unix) >= self.ttl.as_secs() {
+            return None;
+        }
+        Some(cached.models)
+    }
+
+    /// Persist a model list with the current timestamp.
+    pub fn store(&self, kind: ProviderKind, endpoint: &str, models: &[ModelInfo]) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Error::Agent(format!("system clock before Unix epoch: {e}")))?
+            .as_secs();
+        self.store_at(kind, endpoint, models, now)
+    }
+
+    /// Persist with an explicit timestamp (test seam for TTL checks).
+    pub fn store_at(
+        &self,
+        kind: ProviderKind,
+        endpoint: &str,
+        models: &[ModelInfo],
+        fetched_at_unix: u64,
+    ) -> Result<()> {
+        let path = self.path(kind, endpoint);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Agent(format!("model cache dir: {e}")))?;
+        }
+        let payload = CachedModelList {
+            fetched_at_unix,
+            models: models.to_vec(),
+        };
+        let json = serde_json::to_string_pretty(&payload)
+            .map_err(|e| Error::Agent(format!("model cache serialize: {e}")))?;
+        std::fs::write(&path, json).map_err(|e| Error::Agent(format!("model cache write: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Fetch a provider's model list with cache-first semantics.
+///
+/// Fresh cache entries short-circuit the network unless `force_refresh`
+/// is set. The fetch is bounded by `timeout`; on timeout the error names
+/// the provider so the wizard can fall back to manual entry.
+pub async fn discover_models(
+    provider: &dyn LLMProvider,
+    cache: &ModelCache,
+    kind: ProviderKind,
+    endpoint: &str,
+    force_refresh: bool,
+    timeout: Duration,
+) -> Result<Vec<ModelInfo>> {
+    if !force_refresh {
+        if let Some(cached) = cache.load(kind, endpoint) {
+            return Ok(cached);
+        }
+    }
+
+    let fetch = provider.list_models();
+    let models = match tokio::time::timeout(timeout, fetch).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(Error::Agent(format!(
+                "model list for {} timed out after {}s",
+                kind.as_str(),
+                timeout.as_secs()
+            )));
+        }
+    };
+
+    // Cache write failures must not break discovery.
+    let _ = cache.store(kind, endpoint, &models);
+    Ok(models)
+}
+
+/// Wizard-friendly discovery: never fails. On any error returns an empty
+/// list plus the error message so the caller can fall back to manual entry.
+pub async fn discover_models_or_empty(
+    provider: &dyn LLMProvider,
+    cache: &ModelCache,
+    kind: ProviderKind,
+    endpoint: &str,
+    force_refresh: bool,
+    timeout: Duration,
+) -> (Vec<ModelInfo>, Option<String>) {
+    match discover_models(provider, cache, kind, endpoint, force_refresh, timeout).await {
+        Ok(models) => (models, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ClientConfig;
     use crate::config::ClientSettings;
 
     #[test]
@@ -579,5 +748,353 @@ mod tests {
         assert_eq!(resolved.kind, ProviderKind::Ollama);
         assert_eq!(resolved.config.base_url, "http://localhost:11434/v1");
         assert_eq!(resolved.config.api_key.as_deref(), Some("ollama"));
+    }
+
+    #[tokio::test]
+    async fn openai_model_list_parses_openrouter_metadata_and_minimal_rows() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .match_header("authorization", "Bearer test-key")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "data": [
+                        {
+                            "id": "vendor/rich-model",
+                            "name": "Rich Model",
+                            "context_length": 131072,
+                            "architecture": {
+                                "input_modalities": ["text", "image"],
+                                "output_modalities": ["text"]
+                            },
+                            "pricing": {"prompt": "0.000001"}
+                        },
+                        {"id": "minimal-model"}
+                    ]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = OpenAIClient::new(ClientConfig {
+            base_url: format!("{}/v1", server.url()),
+            api_key: Some("test-key".to_string()),
+            timeout: Duration::from_secs(5),
+            max_context_length: 128_000,
+        });
+
+        let models = client.list_models().await.unwrap();
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "vendor/rich-model");
+        assert_eq!(models[0].display_name, "Rich Model");
+        assert_eq!(models[0].context_window, Some(131_072));
+        assert_eq!(models[0].input_modalities, ["text", "image"]);
+        assert_eq!(models[0].output_modalities, ["text"]);
+        assert!(models[0].pricing.is_some());
+        assert_eq!(models[1].display_name, "minimal-model");
+        assert!(models[1].input_modalities.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_model_list_routes_through_provider_trait() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .match_header("x-api-key", "anthropic-key")
+            .match_header("anthropic-version", "2023-06-01")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "data": [{
+                        "id": "claude-sonnet-4-20250514",
+                        "display_name": "Claude Sonnet 4",
+                        "type": "model"
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = AnthropicClient::new(ClientConfig {
+            base_url: format!("{}/v1", server.url()),
+            api_key: Some("anthropic-key".to_string()),
+            timeout: Duration::from_secs(5),
+            max_context_length: 200_000,
+        })
+        .unwrap();
+        let provider: &dyn LLMProvider = &client;
+
+        let models = provider.list_models().await.unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-sonnet-4-20250514");
+        assert_eq!(models[0].display_name, "Claude Sonnet 4");
+        assert_eq!(models[0].context_window, None);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn gemini_model_list_normalizes_resource_names() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1beta/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "key".into(),
+                "gemini-key".into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "models": [{
+                        "name": "models/gemini-2.5-pro",
+                        "displayName": "Gemini 2.5 Pro",
+                        "inputTokenLimit": 1048576,
+                        "inputModalities": ["text", "image"],
+                        "outputModalities": ["text"],
+                        "supportedGenerationMethods": ["generateContent"]
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = crate::client::GeminiClient::new(ClientConfig {
+            base_url: format!("{}/v1beta", server.url()),
+            api_key: Some("gemini-key".to_string()),
+            timeout: Duration::from_secs(5),
+            max_context_length: 1_048_576,
+        })
+        .unwrap();
+
+        let models = client.list_models().await.unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-2.5-pro");
+        assert_eq!(models[0].display_name, "Gemini 2.5 Pro");
+        assert_eq!(models[0].context_window, Some(1_048_576));
+        assert_eq!(models[0].input_modalities, ["text", "image"]);
+        assert_eq!(models[0].output_modalities, ["text"]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ollama_model_list_uses_native_tags_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/tags")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "models": [{
+                        "name": "qwen3:8b",
+                        "model": "qwen3:8b",
+                        "size": 5234567890_u64,
+                        "digest": "sha256:abc",
+                        "details": {"family": "qwen3", "parameter_size": "8.2B"}
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = ProviderClient::from_openai_compatible(
+            ProviderKind::Ollama,
+            ClientConfig {
+                base_url: format!("{}/v1", server.url()),
+                api_key: Some("ollama".to_string()),
+                timeout: Duration::from_secs(5),
+                max_context_length: 128_000,
+            },
+        );
+
+        let models = client.list_models().await.unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3:8b");
+        assert_eq!(models[0].display_name, "qwen3:8b");
+        assert_eq!(models[0].raw["details"]["family"], "qwen3");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn model_cache_reuses_fresh_data_and_force_refreshes() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(serde_json::json!({"data": [{"id": "cached-model"}]}).to_string())
+            .expect(2)
+            .create_async()
+            .await;
+        let client = OpenAIClient::new(ClientConfig {
+            base_url: format!("{}/v1", server.url()),
+            api_key: None,
+            timeout: Duration::from_secs(5),
+            max_context_length: 128_000,
+        });
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(cache_dir.path().to_path_buf(), Duration::from_secs(3600));
+
+        let first = discover_models(
+            &client,
+            &cache,
+            ProviderKind::Openai,
+            &format!("{}/v1", server.url()),
+            false,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let cached = discover_models(
+            &client,
+            &cache,
+            ProviderKind::Openai,
+            &format!("{}/v1", server.url()),
+            false,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let refreshed = discover_models(
+            &client,
+            &cache,
+            ProviderKind::Openai,
+            &format!("{}/v1", server.url()),
+            true,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first, cached);
+        assert_eq!(cached, refreshed);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn expired_model_cache_fetches_again() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(serde_json::json!({"data": [{"id": "live-model"}]}).to_string())
+            .create_async()
+            .await;
+        let client = OpenAIClient::new(ClientConfig {
+            base_url: format!("{}/v1", server.url()),
+            api_key: None,
+            timeout: Duration::from_secs(5),
+            max_context_length: 128_000,
+        });
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(cache_dir.path().to_path_buf(), Duration::from_secs(3600));
+        cache
+            .store_at(
+                ProviderKind::Openai,
+                &format!("{}/v1", server.url()),
+                &[ModelInfo {
+                    id: "expired-model".into(),
+                    display_name: "expired-model".into(),
+                    context_window: None,
+                    input_modalities: Vec::new(),
+                    output_modalities: Vec::new(),
+                    pricing: None,
+                    raw: serde_json::json!({"id": "expired-model"}),
+                }],
+                3_601,
+            )
+            .unwrap();
+
+        let models = discover_models(
+            &client,
+            &cache,
+            ProviderKind::Openai,
+            &format!("{}/v1", server.url()),
+            false,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(models[0].id, "live-model");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn model_discovery_times_out_slow_endpoints() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/v1/models")
+            .with_chunked_body(|w| {
+                w.write_all(b"{\"data\":[")?;
+                std::thread::sleep(Duration::from_secs(5));
+                w.write_all(b"]}")
+            })
+            .create_async()
+            .await;
+        let client = OpenAIClient::new(ClientConfig {
+            base_url: format!("{}/v1", server.url()),
+            api_key: None,
+            timeout: Duration::from_secs(30),
+            max_context_length: 128_000,
+        });
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(cache_dir.path().to_path_buf(), Duration::from_secs(3600));
+
+        let result = discover_models(
+            &client,
+            &cache,
+            ProviderKind::Openai,
+            &format!("{}/v1", server.url()),
+            false,
+            Duration::from_millis(250),
+        )
+        .await;
+
+        match result {
+            Err(crate::error::Error::Agent(message)) => {
+                assert!(
+                    message.contains("timed out"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_discovery_returns_empty_list_with_error_context() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/v1/models")
+            .with_status(500)
+            .with_body("upstream exploded")
+            .create_async()
+            .await;
+        let client = OpenAIClient::new(ClientConfig {
+            base_url: format!("{}/v1", server.url()),
+            api_key: None,
+            timeout: Duration::from_secs(5),
+            max_context_length: 128_000,
+        });
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(cache_dir.path().to_path_buf(), Duration::from_secs(3600));
+
+        let (models, error_context) = discover_models_or_empty(
+            &client,
+            &cache,
+            ProviderKind::Openai,
+            &format!("{}/v1", server.url()),
+            false,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(models.is_empty());
+        let context = error_context.expect("failed fetch must carry error context");
+        assert!(context.contains("500"), "unexpected context: {context}");
     }
 }

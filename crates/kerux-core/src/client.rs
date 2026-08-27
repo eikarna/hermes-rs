@@ -10,9 +10,9 @@ pub mod provider;
 pub use fallback::{FallbackChainProvider, FallbackEntry};
 pub use gemini::GeminiClient;
 pub use provider::{
-    build_provider_client, build_provider_for_kind, resolve_provider_settings, EditFormat,
-    LLMProvider, ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind,
-    ProviderSettings,
+    build_provider_client, build_provider_for_kind, discover_models, discover_models_or_empty,
+    resolve_provider_settings, EditFormat, LLMProvider, ModelCache, ModelInfo,
+    ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind, ProviderSettings,
 };
 
 use async_trait::async_trait;
@@ -190,6 +190,114 @@ impl OpenAIClient {
         reqwest::Url::parse(&url).map_err(|e| Error::InvalidUrl(e.to_string()))
     }
 
+    /// List models exposed by an OpenAI-compatible `/models` endpoint.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = reqwest::Url::parse(&format!("{base}/models"))
+            .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        let response = self
+            .http_client
+            .get(url)
+            .headers(self.build_headers()?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+
+        let payload: Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::ParseResponse(format!("model list: {e}")))?;
+        let rows = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::ParseResponse("model list is missing data array".into()))?;
+
+        rows.iter()
+            .map(|raw| {
+                let id = raw
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::ParseResponse("model row is missing id".into()))?;
+                let strings = |value: Option<&Value>| {
+                    value
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                Ok(ModelInfo {
+                    id: id.to_owned(),
+                    display_name: raw
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned(),
+                    context_window: raw.get("context_length").and_then(Value::as_u64),
+                    input_modalities: strings(raw.pointer("/architecture/input_modalities")),
+                    output_modalities: strings(raw.pointer("/architecture/output_modalities")),
+                    pricing: raw.get("pricing").cloned(),
+                    raw: raw.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// List locally installed models from Ollama's native `/api/tags` endpoint.
+    pub async fn list_ollama_models(&self) -> Result<Vec<ModelInfo>> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let native_base = base.strip_suffix("/v1").unwrap_or(base);
+        let url = reqwest::Url::parse(&format!("{native_base}/api/tags"))
+            .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        let response = self.http_client.get(url).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+
+        let payload: Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::ParseResponse(format!("Ollama model list: {e}")))?;
+        let rows = payload
+            .get("models")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::ParseResponse("Ollama model list is missing models".into()))?;
+        rows.iter()
+            .map(|raw| {
+                let id = raw
+                    .get("model")
+                    .or_else(|| raw.get("name"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::ParseResponse("Ollama model is missing name".into()))?;
+                Ok(ModelInfo {
+                    id: id.to_owned(),
+                    display_name: raw
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned(),
+                    context_window: raw.get("context_length").and_then(Value::as_u64),
+                    input_modalities: Vec::new(),
+                    output_modalities: Vec::new(),
+                    pricing: None,
+                    raw: raw.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Send a non-streaming chat completion request
     #[instrument(skip(self, messages, tools), fields(model = % model))]
     pub async fn chat(
@@ -360,6 +468,55 @@ impl AnthropicClient {
         let base = self.config.base_url.trim_end_matches('/');
         let url = format!("{}/messages", base);
         reqwest::Url::parse(&url).map_err(|e| Error::InvalidUrl(e.to_string()))
+    }
+
+    /// List models exposed by Anthropic's `/models` endpoint.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = reqwest::Url::parse(&format!("{base}/models"))
+            .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        let response = self
+            .http_client
+            .get(url)
+            .headers(self.build_headers()?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+
+        let payload: Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::ParseResponse(format!("Anthropic model list: {e}")))?;
+        let rows = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::ParseResponse("Anthropic model list is missing data".into()))?;
+        rows.iter()
+            .map(|raw| {
+                let id = raw
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::ParseResponse("Anthropic model is missing id".into()))?;
+                Ok(ModelInfo {
+                    id: id.to_owned(),
+                    display_name: raw
+                        .get("display_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned(),
+                    context_window: raw.get("context_length").and_then(Value::as_u64),
+                    input_modalities: Vec::new(),
+                    output_modalities: Vec::new(),
+                    pricing: raw.get("pricing").cloned(),
+                    raw: raw.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Convert the internal OpenAI-shaped message list into Anthropic's
@@ -626,6 +783,10 @@ impl AnthropicClient {
 
 #[async_trait]
 impl LLMProvider for AnthropicClient {
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        AnthropicClient::list_models(self).await
+    }
+
     async fn chat(
         &self,
         model: &str,
@@ -663,6 +824,10 @@ impl LLMProvider for AnthropicClient {
 /// Concrete per-model negotiation lands with the provider registry.
 #[async_trait]
 impl LLMProvider for OpenAIClient {
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        OpenAIClient::list_models(self).await
+    }
+
     async fn chat(
         &self,
         model: &str,
