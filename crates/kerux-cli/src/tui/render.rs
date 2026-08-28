@@ -11,7 +11,8 @@ use crate::tui::layout::{
     centered_rect_percent, is_constrained, DESKTOP_HEIGHT, DESKTOP_WIDTH,
 };
 use crate::tui::state::{
-    ActivePanel, AppState, InputMode, LayoutMode, McpServerItem, SkillItem, Tone, TranscriptEntry,
+    ActivePanel, AppState, InputMode, LayoutMode, McpServerItem, SkillItem, Tone, ToolCallLine,
+    TranscriptEntry,
 };
 use crate::tui::theme::{ACCENT, BG, ERROR, HELP, MUTED, PANEL, PANEL_ALT, SUCCESS, TEXT, WARN};
 
@@ -492,9 +493,9 @@ fn constrained_header_widget(state: &AppState, width: u16) -> Paragraph<'_> {
 }
 
 fn render_conversation_widget(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
-    let lines = conversation_lines(state);
     let block = panel_block("Conversation");
     let inner = block.inner(area);
+    let lines = conversation_lines(state, inner.width);
     let max_scroll = max_wrapped_scroll(&lines, inner.width, inner.height);
     let scroll = if state.follow_conversation_tail() {
         max_scroll
@@ -504,42 +505,37 @@ fn render_conversation_widget(frame: &mut Frame<'_>, state: &AppState, area: Rec
 
     let widget = Paragraph::new(Text::from(lines))
         .block(block)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: true });
+        .scroll((scroll, 0));
     frame.render_widget(widget, area);
 }
 
-fn conversation_lines(state: &AppState) -> Vec<Line<'static>> {
+fn conversation_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for entry in state.session.transcript.iter().rev().take(8).rev() {
-        lines.push(role_line(entry));
-        lines.extend(render_message_body(&entry.content));
+    let entries: Vec<&TranscriptEntry> = state
+        .session
+        .transcript
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .collect();
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 && is_turn_start(entry.role) {
+            lines.push(turn_separator(width));
+        }
+        lines.extend(turn_lines(entry, width));
         lines.push(Line::from(""));
     }
 
     if state.session.running {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Assistant",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                if state.persistent.behavior.stream {
-                    "(streaming)"
-                } else {
-                    "(responding)"
-                },
-                Style::default().fg(MUTED),
-            ),
-        ]));
-        lines.extend(render_message_body(
-            if state.session.streaming_response.is_empty() {
-                "Waiting for visible assistant output..."
-            } else {
-                &state.session.streaming_response
-            },
-        ));
+        let content = if state.session.streaming_response.is_empty() {
+            "Waiting for visible assistant output..."
+        } else {
+            &state.session.streaming_response
+        };
+        let mut streaming = TranscriptEntry::new("Assistant", content);
+        streaming.tools = state.session.pending_tools.clone();
+        lines.extend(turn_lines(&streaming, width));
     }
 
     if lines.is_empty() {
@@ -550,6 +546,176 @@ fn conversation_lines(state: &AppState) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+const GUTTER_WIDTH: usize = 9;
+
+fn is_turn_start(role: &str) -> bool {
+    role == "User" || role == "Shell"
+}
+
+fn turn_separator(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "┄".repeat(usize::from(width)),
+        Style::default().fg(PANEL_ALT),
+    ))
+}
+
+fn turn_lines(entry: &TranscriptEntry, width: u16) -> Vec<Line<'static>> {
+    let body_width = usize::from(width).saturating_sub(GUTTER_WIDTH);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut first = true;
+    for body_line in render_message_body(&entry.content) {
+        for (index, wrapped) in wrap_line(body_line, body_width).into_iter().enumerate() {
+            if first && index == 0 {
+                let mut spans = glyph_spans(entry);
+                spans.extend(wrapped.spans);
+                lines.push(Line::from(spans));
+            } else {
+                let mut spans = vec![Span::raw(" ".repeat(GUTTER_WIDTH))];
+                spans.extend(wrapped.spans);
+                lines.push(Line::from(spans));
+            }
+        }
+        first = false;
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(glyph_spans(entry)));
+    }
+    for tool in &entry.tools {
+        lines.push(tool_subline(tool));
+    }
+    lines
+}
+
+fn glyph_spans(entry: &TranscriptEntry) -> Vec<Span<'static>> {
+    let (glyph, color) = if is_turn_start(entry.role) {
+        ("❯", SUCCESS)
+    } else {
+        ("✦", ACCENT)
+    };
+    vec![
+        Span::styled(
+            glyph.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            entry
+                .timestamp
+                .clone()
+                .unwrap_or_else(|| "--:--".to_string()),
+            Style::default().fg(MUTED),
+        ),
+        Span::raw("  "),
+    ]
+}
+
+fn tool_subline(tool: &ToolCallLine) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw(" ".repeat(GUTTER_WIDTH)),
+        Span::styled(format!("┊ tool: {}", tool.name), Style::default().fg(MUTED)),
+        Span::raw(" "),
+        Span::styled(
+            if tool.ok { "✓" } else { "✗" }.to_string(),
+            Style::default().fg(if tool.ok { SUCCESS } else { ERROR }),
+        ),
+    ];
+    if let Some(secs) = tool.duration_secs {
+        spans.push(Span::styled(
+            format!(" {:.1}s", secs),
+            Style::default().fg(MUTED),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let total: usize = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if width == 0 || total <= width {
+        return vec![line];
+    }
+
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut col = 0usize;
+
+    for span in line.spans {
+        let style = span.style;
+        for token in wrap_tokens(span.content.as_ref()) {
+            let token_width = UnicodeWidthStr::width(token.as_str());
+            if token_width == 0 {
+                continue;
+            }
+            let is_space = token.bytes().all(|b| b == b' ');
+            if col + token_width > width {
+                if is_space {
+                    continue;
+                }
+                if col > 0 {
+                    rows.push(Vec::new());
+                    col = 0;
+                }
+                if token_width > width {
+                    let mut chunk = String::new();
+                    let mut chunk_width = 0usize;
+                    for ch in token.chars() {
+                        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if col + chunk_width + ch_width > width && !chunk.is_empty() {
+                            rows.last_mut()
+                                .expect("rows is never empty")
+                                .push(Span::styled(std::mem::take(&mut chunk), style));
+                            rows.push(Vec::new());
+                            col = 0;
+                            chunk_width = 0;
+                        }
+                        chunk.push(ch);
+                        chunk_width += ch_width;
+                    }
+                    if !chunk.is_empty() {
+                        rows.last_mut()
+                            .expect("rows is never empty")
+                            .push(Span::styled(chunk, style));
+                    }
+                    col += chunk_width;
+                    continue;
+                }
+            }
+            if is_space && col == 0 {
+                continue;
+            }
+            rows.last_mut()
+                .expect("rows is never empty")
+                .push(Span::styled(token, style));
+            col += token_width;
+        }
+    }
+
+    rows.into_iter()
+        .filter(|row| !row.is_empty())
+        .map(Line::from)
+        .collect()
+}
+
+fn wrap_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_space: Option<bool> = None;
+    for ch in text.chars() {
+        let is_space = ch == ' ';
+        if current_space.is_some_and(|prev| prev != is_space) {
+            tokens.push(std::mem::take(&mut current));
+        }
+        current_space = Some(is_space);
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 fn reasoning_widget(state: &AppState) -> Paragraph<'_> {
@@ -1012,31 +1178,35 @@ fn currency_symbol(currency: &str) -> &str {
 }
 
 fn render_session_compact_widget(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let block = panel_block("Session");
+    let inner = block.inner(area);
+    let body_width = usize::from(inner.width);
+
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         "Conversation",
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
     for entry in state.session.transcript.iter().rev().take(4).rev() {
-        lines.push(role_line(entry));
-        lines.extend(render_message_body(&entry.content));
+        lines.extend(turn_lines(entry, inner.width));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Reasoning",
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(truncate_text(
+    let reasoning = truncate_text(
         if state.session.reasoning.is_empty() {
             "Waiting for reasoning..."
         } else {
             &state.session.reasoning
         },
         300,
-    )));
+    );
+    for wrapped in wrap_line(Line::from(reasoning), body_width) {
+        lines.push(wrapped);
+    }
 
-    let block = panel_block("Session");
-    let inner = block.inner(area);
     let max_scroll = max_wrapped_scroll(&lines, inner.width, inner.height);
     let scroll = if state.follow_conversation_tail() {
         max_scroll
@@ -1046,8 +1216,7 @@ fn render_session_compact_widget(frame: &mut Frame<'_>, state: &AppState, area: 
 
     let widget = Paragraph::new(Text::from(lines))
         .block(block)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: true });
+        .scroll((scroll, 0));
     frame.render_widget(widget, area);
 }
 
@@ -1271,21 +1440,6 @@ fn render_modal(
         .wrap(Wrap { trim: true });
 
     frame.render_widget(modal, modal_area);
-}
-
-fn role_line(entry: &TranscriptEntry) -> Line<'static> {
-    let color = if entry.role == "User" {
-        SUCCESS
-    } else {
-        ACCENT
-    };
-    Line::from(vec![
-        Span::styled(
-            entry.role.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-    ])
 }
 
 fn mcp_line(server: &McpServerItem, selected: bool) -> Line<'static> {
@@ -1720,7 +1874,7 @@ mod tests {
     use kerux_core::config::AppConfig;
 
     use super::*;
-    use crate::tui::state::{AppState, TelemetryState, ViewMode};
+    use crate::tui::state::{AppState, TelemetryState, ToolCallLine, TranscriptEntry, ViewMode};
 
     fn buffer_text(state: &AppState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -1740,6 +1894,18 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, state)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn buffer_rows(state: &AppState, width: u16, height: u16) -> Vec<String> {
+        let buf = buffer(state, width, height);
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect()
     }
 
     #[test]
@@ -1907,10 +2073,10 @@ mod tests {
         let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
         state.ui.view = ViewMode::Workspace;
         state.set_layout_for_width(160);
-        state.session.transcript.push(TranscriptEntry {
-            role: "Assistant",
-            content: "Line one\n\nLine two\n- item".to_string(),
-        });
+        state.session.transcript.push(TranscriptEntry::new(
+            "Assistant",
+            "Line one\n\nLine two\n- item",
+        ));
 
         let text = buffer_text(&state, 160, 40);
         assert!(text.contains("Line one"));
@@ -1923,10 +2089,10 @@ mod tests {
         let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
         state.ui.view = ViewMode::Workspace;
         state.set_layout_for_width(160);
-        state.session.transcript.push(TranscriptEntry {
-            role: "Assistant",
-            content: "## Heading\n**Bold** and `code`".to_string(),
-        });
+        state.session.transcript.push(TranscriptEntry::new(
+            "Assistant",
+            "## Heading\n**Bold** and `code`",
+        ));
 
         let text = buffer_text(&state, 160, 40);
         assert!(text.contains("Heading"));
@@ -1941,10 +2107,10 @@ mod tests {
         let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
         state.ui.view = ViewMode::Workspace;
         state.set_layout_for_width(160);
-        state.session.transcript.push(TranscriptEntry {
-            role: "Assistant",
-            content: "entry 01\nentry 02\nentry 03\nentry 04\nentry 05\nentry 06\nentry 07\nentry 08\nentry 09\nentry 10\nentry 11\nentry 12".to_string(),
-        });
+        state.session.transcript.push(TranscriptEntry::new(
+            "Assistant",
+            "entry 01\nentry 02\nentry 03\nentry 04\nentry 05\nentry 06\nentry 07\nentry 08\nentry 09\nentry 10\nentry 11\nentry 12",
+        ));
         state.scroll_conversation_down(6);
 
         let text = buffer_text(&state, 160, 22);
@@ -1957,12 +2123,10 @@ mod tests {
         let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
         state.ui.view = ViewMode::Workspace;
         state.set_layout_for_width(160);
-        state.session.transcript.push(TranscriptEntry {
-            role: "Assistant",
-            content:
-                "---\n> quoted line\n| Tool | Use |\n| --- | --- |\n| echo | test |\n- [x] done"
-                    .to_string(),
-        });
+        state.session.transcript.push(TranscriptEntry::new(
+            "Assistant",
+            "---\n> quoted line\n| Tool | Use |\n| --- | --- |\n| echo | test |\n- [x] done",
+        ));
 
         let text = buffer_text(&state, 160, 40);
         assert!(text.contains("quoted line"));
@@ -2028,5 +2192,120 @@ mod tests {
         assert!(text.contains("$0.0045"));
         assert!(text.contains("1.5k tok"));
         assert!(text.contains("12.5% ctx"));
+    }
+
+    fn entry_with(role: &'static str, content: &str, timestamp: &str) -> TranscriptEntry {
+        let mut entry = TranscriptEntry::new(role, content);
+        entry.timestamp = Some(timestamp.to_string());
+        entry
+    }
+
+    #[test]
+    fn conversation_renders_glyph_gutter_with_timestamps() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.transcript = vec![
+            entry_with("User", "what's the crumb", "14:32"),
+            entry_with("Assistant", "here it is — gnawed clean", "14:33"),
+        ];
+
+        let text = buffer_text(&state, 160, 40);
+        assert!(text.contains("❯ 14:32  what's the crumb"));
+        assert!(text.contains("✦ 14:33  here it is — gnawed clean"));
+        assert!(!text.contains("User"));
+        assert!(!text.contains("Assistant"));
+    }
+
+    #[test]
+    fn conversation_renders_tool_sublines_under_turn() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        let mut assistant = entry_with("Assistant", "here it is — gnawed clean", "14:33");
+        assistant.tools = vec![
+            ToolCallLine {
+                name: "read_file".to_string(),
+                ok: true,
+                duration_secs: Some(0.2),
+            },
+            ToolCallLine {
+                name: "shell".to_string(),
+                ok: false,
+                duration_secs: None,
+            },
+        ];
+        state.session.transcript = vec![entry_with("User", "what's the crumb", "14:32"), assistant];
+
+        let text = buffer_text(&state, 160, 40);
+        assert!(text.contains("┊ tool: read_file ✓ 0.2s"));
+        assert!(text.contains("┊ tool: shell ✗"));
+    }
+
+    #[test]
+    fn conversation_renders_turn_separator_between_turns_only() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.transcript = vec![
+            entry_with("User", "first turn", "14:32"),
+            entry_with("Assistant", "first answer", "14:33"),
+            entry_with("User", "second turn", "14:40"),
+            entry_with("Assistant", "second answer", "14:41"),
+        ];
+
+        let rows = buffer_rows(&state, 160, 40);
+        let sep_count = rows
+            .iter()
+            .filter(|row| {
+                let mut chars = row.chars();
+                chars.next() == Some('│') && chars.next() == Some('┄')
+            })
+            .count();
+        assert_eq!(sep_count, 1);
+    }
+
+    #[test]
+    fn conversation_wraps_body_at_consistent_indent() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi \
+                    omicron pi rho sigma tau upsilon phi chi psi omega";
+        state.session.transcript = vec![entry_with("User", long, "14:32")];
+
+        for width in [40u16, 80, 120] {
+            state.set_layout_for_width(width);
+            let rows = buffer_rows(&state, width, 30);
+            let continuations = rows
+                .iter()
+                .filter(|row| {
+                    let chars: Vec<char> = row.chars().collect();
+                    chars.len() > 10
+                        && chars[0] == '│'
+                        && chars[1..10].iter().all(|ch| *ch == ' ')
+                        && chars[10] != ' '
+                })
+                .count();
+            assert!(
+                continuations > 0,
+                "width {} should wrap with a 9-column body indent",
+                width
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_turn_shows_glyph_before_body() {
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), true);
+        state.ui.view = ViewMode::Workspace;
+        state.set_layout_for_width(160);
+        state.session.transcript = vec![entry_with("User", "what's the crumb", "14:32")];
+        state.session.running = true;
+        state.session.streaming_response = "partial output".to_string();
+
+        let text = buffer_text(&state, 160, 40);
+        assert!(text.contains("✦"));
+        assert!(text.contains("partial output"));
+        assert!(!text.contains("Assistant"));
     }
 }

@@ -91,6 +91,30 @@ pub struct FooterNotice {
 pub struct TranscriptEntry {
     pub role: &'static str,
     pub content: String,
+    pub timestamp: Option<String>,
+    pub tools: Vec<ToolCallLine>,
+}
+
+impl TranscriptEntry {
+    pub fn new(role: &'static str, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            timestamp: Some(now_hhmm()),
+            tools: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCallLine {
+    pub name: String,
+    pub ok: bool,
+    pub duration_secs: Option<f64>,
+}
+
+fn now_hhmm() -> String {
+    chrono::Local::now().format("%H:%M").to_string()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +147,8 @@ pub struct SessionState {
     pub final_message: Option<String>,
     pub running: bool,
     pub telemetry: TelemetryState,
+    pub pending_tools: Vec<ToolCallLine>,
+    tool_starts: Vec<(String, String, std::time::Instant)>,
 }
 
 impl SessionState {
@@ -145,6 +171,8 @@ impl SessionState {
             final_message: None,
             running: false,
             telemetry: TelemetryState::default(),
+            pending_tools: Vec::new(),
+            tool_starts: Vec::new(),
         }
     }
 }
@@ -312,10 +340,13 @@ impl AppState {
                 self.session.status = "Streaming reasoning".to_string();
             }
             AgentEvent::ToolStart {
-                call_id: _,
+                call_id,
                 name,
                 arguments,
             } => {
+                self.session
+                    .tool_starts
+                    .push((call_id, name.clone(), std::time::Instant::now()));
                 self.push_activity(
                     format!("Tool {}", name),
                     truncate(&arguments, 140),
@@ -324,6 +355,24 @@ impl AppState {
                 self.session.status = format!("Running {}", name);
             }
             AgentEvent::ToolComplete { result } => {
+                let started = self
+                    .session
+                    .tool_starts
+                    .iter()
+                    .position(|(id, _, _)| *id == result.tool_call_id)
+                    .map(|pos| self.session.tool_starts.remove(pos));
+                let (name, duration_secs) = match started {
+                    Some((_, name, at)) => (name, Some(at.elapsed().as_secs_f64())),
+                    None => (
+                        result.tool_call_id.chars().take(12).collect::<String>(),
+                        None,
+                    ),
+                };
+                self.session.pending_tools.push(ToolCallLine {
+                    name,
+                    ok: result.success,
+                    duration_secs,
+                });
                 self.push_activity(
                     "Tool complete",
                     truncate(&result.content, 160),
@@ -336,6 +385,11 @@ impl AppState {
                 self.session.status = "Tool completed".to_string();
             }
             AgentEvent::ToolError { name, error } => {
+                self.session.pending_tools.push(ToolCallLine {
+                    name: name.clone(),
+                    ok: false,
+                    duration_secs: None,
+                });
                 self.push_activity(format!("Tool {}", name), error.clone(), Tone::Error);
                 self.session.status = format!("{} failed", name);
             }
@@ -400,12 +454,13 @@ impl AppState {
         self.session.active_query = query.clone();
         self.session.streaming_response.clear();
         self.session.reasoning.clear();
+        self.session.pending_tools.clear();
+        self.session.tool_starts.clear();
         self.session.current_iteration = 0;
         self.session.status = "Requesting model response".to_string();
-        self.session.transcript.push(TranscriptEntry {
-            role: "User",
-            content: query,
-        });
+        self.session
+            .transcript
+            .push(TranscriptEntry::new("User", query));
     }
 
     pub fn begin_shell_run(&mut self, command: String) {
@@ -425,16 +480,19 @@ impl AppState {
         self.session.active_query = format!("$ {}", command);
         self.session.streaming_response.clear();
         self.session.reasoning.clear();
+        self.session.pending_tools.clear();
+        self.session.tool_starts.clear();
         self.session.current_iteration = 0;
         self.session.status = "Running shell command".to_string();
-        self.session.transcript.push(TranscriptEntry {
-            role: "Shell",
-            content: command,
-        });
+        self.session
+            .transcript
+            .push(TranscriptEntry::new("Shell", command));
     }
 
     pub fn fail_run(&mut self, error: String) {
         self.session.running = false;
+        self.session.pending_tools.clear();
+        self.session.tool_starts.clear();
         self.session.error = Some(error.clone());
         self.session.status = "Run failed".to_string();
         self.ui.input_mode = InputMode::Prompt;
@@ -587,10 +645,9 @@ impl AppState {
         self.ui.input_mode = InputMode::Prompt;
         self.ui.conversation_scroll = 0;
         self.ui.conversation_follow_tail = true;
-        self.session.transcript.push(TranscriptEntry {
-            role: "Assistant",
-            content,
-        });
+        let mut entry = TranscriptEntry::new("Assistant", content);
+        entry.tools = std::mem::take(&mut self.session.pending_tools);
+        self.session.transcript.push(entry);
         if !reasoning.is_empty() {
             self.session.reasoning = reasoning;
         }
@@ -778,6 +835,46 @@ mod tests {
             state.session.activity.last().map(|item| item.body.as_str()),
             Some("api failed")
         );
+    }
+
+    #[test]
+    fn failed_run_tool_sublines_do_not_leak_into_next_run() {
+        use kerux_core::tools::ToolResult;
+        let mut state = AppState::new(AppConfig::default(), "hello".to_string(), false);
+        state.begin_run("first try".to_string());
+        state.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: "src/main.rs".to_string(),
+        });
+        state.apply_agent_event(AgentEvent::ToolComplete {
+            result: ToolResult {
+                tool_call_id: "call-1".to_string(),
+                success: true,
+                content: "ok".to_string(),
+                error: None,
+            },
+        });
+        state.fail_run("api failed".to_string());
+
+        state.begin_run("second try".to_string());
+        state.apply_agent_event(AgentEvent::Done {
+            message: Message::assistant("recovered"),
+        });
+
+        let assistant = state
+            .session
+            .transcript
+            .iter()
+            .rev()
+            .find(|entry| entry.role == "Assistant")
+            .expect("assistant entry exists");
+        assert!(
+            assistant.tools.is_empty(),
+            "stale tool sub-lines leaked into the next run: {:?}",
+            assistant.tools
+        );
+        assert!(state.session.pending_tools.is_empty());
     }
 
     #[test]

@@ -38,6 +38,14 @@ const BROWSERS: &[&str] = &[
     "google-chrome-stable",
 ];
 
+/// Absolute-path candidates for Windows installs.
+const WINDOWS_BROWSERS: &[&str] = &[
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+];
+
 /// Capture the landing and workspace shots into `out_dir`.
 pub fn capture(config: &AppConfig, out_dir: &Path) -> Result<()> {
     fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
@@ -93,18 +101,14 @@ fn build_workspace(config: &AppConfig) -> AppState {
     state.session.status = "Idle".to_string();
     state.session.running = false;
     state.session.transcript = vec![
-        TranscriptEntry {
-            role: "User",
-            content: "Summarize the gateway module.".to_string(),
-        },
-        TranscriptEntry {
-            role: "Assistant",
-            content: "The gateway connects Kerux to messaging platforms. It \
-                      long-polls Telegram, drains the WhatsApp bridge queue, \
-                      converts Markdown to MarkdownV2, and streams replies \
-                      back with live status edits."
-                .to_string(),
-        },
+        TranscriptEntry::new("User", "Summarize the gateway module."),
+        TranscriptEntry::new(
+            "Assistant",
+            "The gateway connects Kerux to messaging platforms. It \
+             long-polls Telegram, drains the WhatsApp bridge queue, \
+             converts Markdown to MarkdownV2, and streams replies \
+             back with live status edits.",
+        ),
     ];
     state.session.activity = vec![
         ActivityItem {
@@ -245,17 +249,30 @@ fn rasterise(html: &Path, png: &Path) -> Result<()> {
         .iter()
         .find(|b| which(b))
         .copied()
-        .context("no headless Chromium binary found (chromium / google-chrome)")?;
+        .or_else(|| {
+            WINDOWS_BROWSERS
+                .iter()
+                .find(|b| Path::new(b).is_file())
+                .copied()
+        })
+        .context("no headless Chromium binary found (chromium / google-chrome / chrome.exe)")?;
 
     let px_w = COLS as u32 * CELL_W;
     let px_h = ROWS as u32 * CELL_H;
 
-    let url = format!(
-        "file://{}",
-        html.canonicalize()
-            .context("canonicalize html path")?
-            .display()
-    );
+    let url = file_url(html);
+    let png_abs = png
+        .canonicalize()
+        .or_else(|_| {
+            png.parent()
+                .map(|parent| {
+                    parent
+                        .canonicalize()
+                        .map(|p| p.join(png.file_name().unwrap_or_default()))
+                })
+                .unwrap_or_else(|| png.canonicalize())
+        })
+        .unwrap_or_else(|_| png.to_path_buf());
 
     let status = Command::new(browser)
         .arg("--headless=new")
@@ -265,7 +282,7 @@ fn rasterise(html: &Path, png: &Path) -> Result<()> {
         .arg("--force-device-scale-factor=1")
         .arg("--default-background-color=FF000000")
         .arg(format!("--window-size={px_w},{px_h}"))
-        .arg(format!("--screenshot={}", png.display()))
+        .arg(format!("--screenshot={}", png_abs.display()))
         .arg(url)
         .status()
         .with_context(|| format!("spawning {browser}"))?;
@@ -279,9 +296,24 @@ fn rasterise(html: &Path, png: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Build a `file:///` URL from a path, normalising Windows UNC/`\\?\` prefixes
+/// and backslashes so headless Chromium can load it.
+fn file_url(path: &Path) -> String {
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut s = abs.to_string_lossy().replace('\\', "/");
+    if let Some(stripped) = s.strip_prefix("//?/") {
+        s = stripped.to_string();
+    }
+    // Windows drive paths need a leading slash: C:/... -> /C:/...
+    if s.len() >= 2 && s.as_bytes()[1] == b':' {
+        s = format!("/{}", s);
+    }
+    format!("file://{}", s)
+}
+
 fn which(bin: &str) -> bool {
     if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
+        for dir in path.split([':', ';']) {
             if PathBuf::from(dir).join(bin).is_file() {
                 return true;
             }

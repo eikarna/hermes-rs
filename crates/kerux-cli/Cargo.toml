@@ -41,6 +41,7 @@ unicode-width = { workspace = true }
 
 # Utilities
 anyhow = { workspace = true }
+chrono = "0.4"
 dirs = "5.0"
 console = "0.15"
 

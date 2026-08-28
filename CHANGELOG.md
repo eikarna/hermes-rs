@@ -5,6 +5,14 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 
 ## [Unreleased]
 
+### Fixed
+
+- TUI: clear pending tool sub-lines and in-flight tool timers at every run boundary (`begin_run`, `begin_shell_run`, `fail_run`) so tool lines from a failed or interrupted run no longer leak into the next run's streaming turn
+
+### Changed
+
+- **TUI chat redesign**: the Conversation panel now renders turns with a glyph gutter (`❯` user / `✦` assistant) plus a dim `HH:MM` timestamp instead of full `User:`/`Assistant:` role labels; tool calls render as indented `┊ tool: <name> ✓/✗ <duration>` sub-lines attached to their turn; a thin `┄` separator marks turn boundaries; body text wraps at a consistent 9-column indent across 40/80/120-column widths, and streaming turns show the glyph immediately while output flows beside it
+
 ## [0.3.0] - 2026-08-27
 
 ### Added
