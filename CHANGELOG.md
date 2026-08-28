@@ -11,6 +11,14 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 - **Model picker command** (`kerux model [id] [--refresh]`): switch the configured model anytime through the same fuzzy picker with capability badges, or set an id directly; writes only `[agent] model`, preserving the rest of the config
 - **Live capability probes** (`kerux_core::probe`): opt-in per-model verification for wizard-selected models — a mini streaming completion (verifies SSE flow + measures TTFT), a trivial `get_time` tool-call request, and a 1px base64 PNG vision payload; verdicts are `Some(true)`/`Some(false)` (verified/rejected) vs `None` (untested or inconclusive network/timeout), and `ProbeResult::to_capability_updates()` feeds `CapabilityReport::merge_probe` so probed verdicts override catalog/heuristic ones. Messages can now carry base64 images (`Message::with_images`), serialized as OpenAI `image_url` data-URL parts, Anthropic `image` blocks, and Gemini `inlineData` parts
 
+### Changed
+
+- **TUI chat redesign**: the Conversation panel now renders turns with a glyph gutter (`❯` user / `✦` assistant) plus a dim `HH:MM` timestamp instead of full `User:`/`Assistant:` role labels; tool calls render as indented `┊ tool: <name> ✓/✗ <duration>` sub-lines attached to their turn; a thin `┄` separator marks turn boundaries; body text wraps at a consistent 9-column indent across 40/80/120-column widths, and streaming turns show the glyph immediately while output flows beside it
+
+### Fixed
+
+- TUI: clear pending tool sub-lines and in-flight tool timers at every run boundary (`begin_run`, `begin_shell_run`, `fail_run`) so tool lines from a failed or interrupted run no longer leak into the next run's streaming turn
+
 ## [0.3.0] - 2026-08-27
 
 ### Added
