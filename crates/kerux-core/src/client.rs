@@ -10,9 +10,9 @@ pub mod provider;
 pub use fallback::{FallbackChainProvider, FallbackEntry};
 pub use gemini::GeminiClient;
 pub use provider::{
-    build_provider_client, build_provider_for_kind, resolve_provider_settings, EditFormat,
-    LLMProvider, ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind,
-    ProviderSettings,
+    build_provider_client, build_provider_for_kind, discover_models, discover_models_or_empty,
+    resolve_provider_settings, EditFormat, LLMProvider, ModelCache, ModelInfo,
+    ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind, ProviderSettings,
 };
 
 use async_trait::async_trait;
@@ -190,6 +190,114 @@ impl OpenAIClient {
         reqwest::Url::parse(&url).map_err(|e| Error::InvalidUrl(e.to_string()))
     }
 
+    /// List models exposed by an OpenAI-compatible `/models` endpoint.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = reqwest::Url::parse(&format!("{base}/models"))
+            .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        let response = self
+            .http_client
+            .get(url)
+            .headers(self.build_headers()?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+
+        let payload: Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::ParseResponse(format!("model list: {e}")))?;
+        let rows = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::ParseResponse("model list is missing data array".into()))?;
+
+        rows.iter()
+            .map(|raw| {
+                let id = raw
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::ParseResponse("model row is missing id".into()))?;
+                let strings = |value: Option<&Value>| {
+                    value
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                Ok(ModelInfo {
+                    id: id.to_owned(),
+                    display_name: raw
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned(),
+                    context_window: raw.get("context_length").and_then(Value::as_u64),
+                    input_modalities: strings(raw.pointer("/architecture/input_modalities")),
+                    output_modalities: strings(raw.pointer("/architecture/output_modalities")),
+                    pricing: raw.get("pricing").cloned(),
+                    raw: raw.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// List locally installed models from Ollama's native `/api/tags` endpoint.
+    pub async fn list_ollama_models(&self) -> Result<Vec<ModelInfo>> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let native_base = base.strip_suffix("/v1").unwrap_or(base);
+        let url = reqwest::Url::parse(&format!("{native_base}/api/tags"))
+            .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        let response = self.http_client.get(url).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+
+        let payload: Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::ParseResponse(format!("Ollama model list: {e}")))?;
+        let rows = payload
+            .get("models")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::ParseResponse("Ollama model list is missing models".into()))?;
+        rows.iter()
+            .map(|raw| {
+                let id = raw
+                    .get("model")
+                    .or_else(|| raw.get("name"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::ParseResponse("Ollama model is missing name".into()))?;
+                Ok(ModelInfo {
+                    id: id.to_owned(),
+                    display_name: raw
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned(),
+                    context_window: raw.get("context_length").and_then(Value::as_u64),
+                    input_modalities: Vec::new(),
+                    output_modalities: Vec::new(),
+                    pricing: None,
+                    raw: raw.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Send a non-streaming chat completion request
     #[instrument(skip(self, messages, tools), fields(model = % model))]
     pub async fn chat(
@@ -362,6 +470,55 @@ impl AnthropicClient {
         reqwest::Url::parse(&url).map_err(|e| Error::InvalidUrl(e.to_string()))
     }
 
+    /// List models exposed by Anthropic's `/models` endpoint.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = reqwest::Url::parse(&format!("{base}/models"))
+            .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        let response = self
+            .http_client
+            .get(url)
+            .headers(self.build_headers()?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+
+        let payload: Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::ParseResponse(format!("Anthropic model list: {e}")))?;
+        let rows = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::ParseResponse("Anthropic model list is missing data".into()))?;
+        rows.iter()
+            .map(|raw| {
+                let id = raw
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::ParseResponse("Anthropic model is missing id".into()))?;
+                Ok(ModelInfo {
+                    id: id.to_owned(),
+                    display_name: raw
+                        .get("display_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned(),
+                    context_window: raw.get("context_length").and_then(Value::as_u64),
+                    input_modalities: Vec::new(),
+                    output_modalities: Vec::new(),
+                    pricing: raw.get("pricing").cloned(),
+                    raw: raw.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Convert the internal OpenAI-shaped message list into Anthropic's
     /// `messages` + `system` shape. System messages are extracted into the
     /// `system` parameter; tool results become `tool_result` content blocks.
@@ -379,9 +536,21 @@ impl AnthropicClient {
             match m.role {
                 Role::System => system_parts.push(m.content.trim()),
                 Role::User => {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    blocks.push(json!({ "type": "text", "text": m.content }));
+                    for img in &m.images {
+                        blocks.push(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.media_type,
+                                "data": img.data_base64,
+                            }
+                        }));
+                    }
                     anthropic_messages.push(json!({
                         "role": "user",
-                        "content": [{ "type": "text", "text": m.content }],
+                        "content": blocks,
                     }));
                 }
                 Role::Assistant => {
@@ -626,6 +795,10 @@ impl AnthropicClient {
 
 #[async_trait]
 impl LLMProvider for AnthropicClient {
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        AnthropicClient::list_models(self).await
+    }
+
     async fn chat(
         &self,
         model: &str,
@@ -663,6 +836,10 @@ impl LLMProvider for AnthropicClient {
 /// Concrete per-model negotiation lands with the provider registry.
 #[async_trait]
 impl LLMProvider for OpenAIClient {
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        OpenAIClient::list_models(self).await
+    }
+
     async fn chat(
         &self,
         model: &str,
@@ -740,6 +917,15 @@ impl Role {
     }
 }
 
+/// A base64-encoded image attached to a message (vision input).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageContent {
+    /// MIME type, e.g. `image/png`.
+    pub media_type: String,
+    /// Base64-encoded image bytes.
+    pub data_base64: String,
+}
+
 /// A chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -749,6 +935,9 @@ pub struct Message {
     pub name: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Images attached to the message (user turns only, in practice).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageContent>,
 }
 
 impl Message {
@@ -761,6 +950,7 @@ impl Message {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            images: Vec::new(),
         }
     }
 
@@ -788,7 +978,14 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             name: None,
             tool_calls: None,
+            images: Vec::new(),
         }
+    }
+
+    /// Attach base64-encoded images to the message (vision input).
+    pub fn with_images(mut self, images: Vec<ImageContent>) -> Self {
+        self.images = images;
+        self
     }
 
     /// Add tool calls to the message
@@ -811,6 +1008,26 @@ impl Message {
         let mut map = serde_json::Map::new();
         map.insert("role".to_string(), json!(self.role.as_str()));
 
+        // Messages with attached images serialize content as a parts array
+        // (OpenAI vision format); plain messages keep the string form.
+        let content_value = if self.images.is_empty() {
+            json!(self.content)
+        } else {
+            let mut parts: Vec<Value> = Vec::new();
+            if !self.content.is_empty() {
+                parts.push(json!({ "type": "text", "text": self.content }));
+            }
+            for img in &self.images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", img.media_type, img.data_base64)
+                    }
+                }));
+            }
+            json!(parts)
+        };
+
         if let Some(ref tool_calls) = self.tool_calls {
             let tc_array: Vec<Value> = tool_calls
                 .iter()
@@ -826,9 +1043,9 @@ impl Message {
                 })
                 .collect();
             map.insert("tool_calls".to_string(), json!(tc_array));
-            map.insert("content".to_string(), json!(self.content));
+            map.insert("content".to_string(), content_value);
         } else {
-            map.insert("content".to_string(), json!(self.content));
+            map.insert("content".to_string(), content_value);
         }
 
         if let Some(ref name) = self.name {
@@ -851,6 +1068,7 @@ impl Default for Message {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            images: Vec::new(),
         }
     }
 }
@@ -1360,6 +1578,11 @@ impl MessageBuilder {
 
     pub fn tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
         self.message.tool_calls = Some(tool_calls);
+        self
+    }
+
+    pub fn images(mut self, images: Vec<ImageContent>) -> Self {
+        self.message.images = images;
         self
     }
 

@@ -40,15 +40,21 @@ cargo install --path crates/kerux-cli
 ## Quick start
 
 ```bash
+kerux wizard                      # interactive setup (provider, key, model)
+# or manually:
 export OPENAI_API_KEY=***        # or: kerux auth login nous (OAuth, no key needed)
 
 kerux chat                        # prompt-first TUI
 kerux run --query "What is 2+2?"  # one-shot
+kerux model                       # switch model anytime (fuzzy picker)
 kerux serve                       # Messaging + webhook gateway
 kerux autonomous                  # 24/7 coding loop
 kerux taste push team             # publish this project's learned style
 kerux taste pull team             # merge that style into this project
 ```
+
+First run with no config file and no provider credentials in the environment
+auto-launches `kerux wizard` before `chat`/`run`/`serve`/`autonomous`.
 
 ## Documentation
 

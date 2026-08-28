@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 
 use crate::client::{
     ChatResponse, ChatStreamResponse, Choice, ClientConfig, EditFormat, LLMProvider, Message,
-    MessageDelta, ProviderCapabilities, Role, ToolCall, ToolCallDelta, ToolCallFunction, Usage,
+    MessageDelta, ModelInfo, ProviderCapabilities, Role, ToolCall, ToolCallDelta, ToolCallFunction,
+    Usage,
 };
 use crate::error::{Error, Result};
 use crate::schema::ToolSchema;
@@ -56,6 +57,67 @@ impl GeminiClient {
         ))
     }
 
+    /// List models exposed by Gemini's `/models` endpoint.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let mut url = reqwest::Url::parse(&format!("{base}/models"))
+            .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        url.query_pairs_mut().append_pair("key", self.api_key()?);
+        let response = self.http_client.get(url).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            return Err(Error::Http {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+
+        let payload: Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::ParseResponse(format!("Gemini model list: {e}")))?;
+        let rows = payload
+            .get("models")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::ParseResponse("Gemini model list is missing models".into()))?;
+        rows.iter()
+            .map(|raw| {
+                let resource_name = raw
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::ParseResponse("Gemini model is missing name".into()))?;
+                let id = resource_name
+                    .strip_prefix("models/")
+                    .unwrap_or(resource_name)
+                    .to_owned();
+                let strings = |key: &str| {
+                    raw.get(key)
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(|item| item.to_ascii_lowercase())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                Ok(ModelInfo {
+                    display_name: raw
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&id)
+                        .to_owned(),
+                    id,
+                    context_window: raw.get("inputTokenLimit").and_then(Value::as_u64),
+                    input_modalities: strings("inputModalities"),
+                    output_modalities: strings("outputModalities"),
+                    pricing: raw.get("pricing").cloned(),
+                    raw: raw.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// OpenAI-shaped message list → Gemini `contents` + `systemInstruction`.
     /// `assistant` becomes `model`; system lines fold into `systemInstruction`;
     /// tool results fold into a `functionResponse` part under `user`.
@@ -66,10 +128,21 @@ impl GeminiClient {
         for m in messages {
             match m.role {
                 Role::System => system_parts.push(m.content.trim()),
-                Role::User => contents.push(json!({
-                    "role": "user",
-                    "parts": [{ "text": m.content }],
-                })),
+                Role::User => {
+                    let mut parts: Vec<Value> = vec![json!({ "text": m.content })];
+                    for img in &m.images {
+                        parts.push(json!({
+                            "inlineData": {
+                                "mimeType": img.media_type,
+                                "data": img.data_base64,
+                            }
+                        }));
+                    }
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": parts,
+                    }));
+                }
                 Role::Assistant => {
                     let mut parts: Vec<Value> = Vec::new();
                     if !m.content.trim().is_empty() {
@@ -412,6 +485,10 @@ fn gemini_frame_to_openai(data: &str, model: &str) -> Option<String> {
 
 #[async_trait]
 impl LLMProvider for GeminiClient {
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        GeminiClient::list_models(self).await
+    }
+
     async fn chat(
         &self,
         model: &str,

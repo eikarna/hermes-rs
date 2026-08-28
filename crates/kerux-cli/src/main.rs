@@ -4,6 +4,7 @@ mod autonomous;
 mod runs;
 mod screenshot;
 mod tui;
+mod wizard;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -137,6 +138,19 @@ enum Commands {
     Runs {
         #[command(subcommand)]
         command: runs::RunsCommands,
+    },
+    /// Interactive setup: provider, API key, model picker, fallback, smoke test.
+    #[command(alias = "onboarding")]
+    Wizard,
+    /// Switch the configured model (fuzzy picker over the live model list).
+    Model {
+        /// Model id to set directly; omit to open the picker.
+        #[arg()]
+        model_id: Option<String>,
+
+        /// Bypass the model-list cache and force a fresh fetch.
+        #[arg(long)]
+        refresh: bool,
     },
     /// Render TUI screenshots headlessly (used by the docs preview workflow).
     #[command(hide = true)]
@@ -2099,6 +2113,30 @@ async fn main() -> Result<()> {
     apply_cli_overrides(&cli, &mut loaded.config);
     install_runtime_config(loaded.config.clone());
 
+    // Fresh install: no config file anywhere and no provider credentials in
+    // the environment — offer the interactive wizard before commands that
+    // need a working LLM. Cancelling continues with defaults (the run then
+    // fails with the usual missing-key error).
+    if loaded.source.is_none()
+        && !wizard::env_has_credentials()
+        && std::io::stdin().is_terminal()
+        && matches!(
+            cli.command,
+            Commands::Run { .. }
+                | Commands::Chat { .. }
+                | Commands::Serve { .. }
+                | Commands::Autonomous { .. }
+        )
+    {
+        println!("No config file found — launching the setup wizard.");
+        wizard::run_wizard().await?;
+        // Reload so the freshly written config drives this run.
+        loaded = load_app_config(cli.config.as_deref())?;
+        loaded.config.apply_env_overrides()?;
+        apply_cli_overrides(&cli, &mut loaded.config);
+        install_runtime_config(loaded.config.clone());
+    }
+
     init_logging(
         cli.verbose,
         cli.log_level.as_deref(),
@@ -2179,6 +2217,12 @@ async fn main() -> Result<()> {
         }
         Commands::Runs { command } => {
             runs::handle(command)?;
+        }
+        Commands::Wizard => {
+            wizard::run_wizard().await?;
+        }
+        Commands::Model { model_id, refresh } => {
+            wizard::switch_model(model_id.clone(), *refresh).await?;
         }
         Commands::Screenshot { out } => {
             screenshot::capture(&loaded.config, out)?;

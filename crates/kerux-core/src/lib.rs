@@ -56,6 +56,7 @@ pub(crate) fn lock_sync<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub mod agent;
 pub mod approval;
 pub mod auth;
+pub mod capability;
 pub mod capsule;
 pub mod client;
 pub mod config;
@@ -73,6 +74,7 @@ pub mod memory;
 pub mod parser;
 pub mod persist;
 pub mod platform;
+pub mod probe;
 pub mod redaction;
 pub mod repomap;
 pub mod run_journal;
@@ -93,17 +95,21 @@ pub use auth::{
     generate_oauth_state, generate_pkce_challenge, parse_loopback_authorization_code, AuthMethod,
     AuthProfile, AuthStore, LoopbackOAuthReceiver, OAuthTokenResponse, PkceChallenge,
 };
+pub use capability::{
+    classify, Capability, CapabilityEntry, CapabilityReport, CapabilitySource, CapabilityStatus,
+};
 pub use client::{
     build_provider_client, build_provider_for_kind, chat_streaming_with_provider,
-    chat_with_provider, resolve_provider_settings, AnthropicClient, ClientConfig, EditFormat,
-    LLMProvider, Message, OpenAIClient, ProviderCapabilities, ProviderClient, ProviderConfig,
-    ProviderKind, ProviderSettings,
+    chat_with_provider, discover_models, discover_models_or_empty, resolve_provider_settings,
+    AnthropicClient, ClientConfig, EditFormat, ImageContent, LLMProvider, Message, ModelCache,
+    ModelInfo, OpenAIClient, ProviderCapabilities, ProviderClient, ProviderConfig, ProviderKind,
+    ProviderSettings,
 };
 pub use config::{
-    install_runtime_config, load_app_config, runtime_config, AppConfig, AutonomousSettings,
-    BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings, HttpToolSettings,
-    LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings, TasteSettings,
-    TelemetrySettings, TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
+    install_runtime_config, load_app_config, parse_config_file, runtime_config, AppConfig,
+    AutonomousSettings, BehaviorSettings, ClientSettings, CodeExecutionSettings, GatewaySettings,
+    HttpToolSettings, LoadedConfig, LoggingSettings, McpServerConfig, McpSettings, SkillsSettings,
+    TasteSettings, TelemetrySettings, TerminalSettings, ToolSettings, TuiSettings, WebToolSettings,
 };
 pub use context::{estimate_tokens, ContextConfig, ContextManager};
 pub use context_files::{
@@ -122,6 +128,7 @@ pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};
 pub use memory::{MemoryBlock, MemoryManager, Session, UserProfile};
 pub use parser::ToolCallParser;
 pub use platform::PlatformInfo;
+pub use probe::{probe_model, probe_streaming, probe_tools, probe_vision, ProbeResult};
 pub use repomap::{
     discover_source_files, extract_file_tags, rank_and_render, Language as RepoMapLanguage,
     MinimalRepoMap, RepoMapRenderer, RepoTag, TagKind,

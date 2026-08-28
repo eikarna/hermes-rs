@@ -23,12 +23,15 @@ async-trait = { workspace = true }
 # CLI
 clap = { workspace = true, features = ["derive"] }
 config = { workspace = true }
+dialoguer = { workspace = true }
+indicatif = { workspace = true }
 
 # Serialization
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
+toml_edit = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

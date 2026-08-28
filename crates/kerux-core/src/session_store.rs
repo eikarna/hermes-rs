@@ -167,6 +167,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            images: Vec::new(),
         }
     }
 
