@@ -253,7 +253,8 @@ impl Session {
 }
 
 /// File-backed storage for persisting memories to MEMORY.md and user profiles to USER.md,
-/// using the `§` (section sign) delimiter between entries to match the Python hermes-agent format.
+/// using the `§` (section sign) delimiter between entries for compact representation.
+
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
     /// Directory containing MEMORY.md and USER.md

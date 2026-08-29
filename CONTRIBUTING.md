@@ -262,7 +262,8 @@ Use the **Feature Request** template. Include:
 1. **Use case**: What problem does this solve?
 2. **Proposed solution**: How should it work?
 3. **Alternatives considered**: What else did you look at?
-4. **References**: Links to relevant docs, the Python hermes-agent, etc.
+4. **References**: Links to relevant RFCs, issue trackers, or documentation.
+
 
 ## Release Process (Maintainers)
 

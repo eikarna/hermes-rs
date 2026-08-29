@@ -1,7 +1,8 @@
 //! Skills system for Kerux
 //!
 //! Provides skill discovery, loading, and management matching
-//! the Python hermes-agent's skills architecture. Skills are
+//! Skills are
+
 //! directories containing a SKILL.md file with YAML front matter.
 
 use crate::error::{Error, Result};

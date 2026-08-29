@@ -9,7 +9,8 @@ members = [
 version = "0.3.0"
 edition = "2021"
 authors = ["eikarna"]
-license = "MIT OR Apache-2.0"
+license = "MIT"
+
 rust-version = "1.86"
 
 [workspace.dependencies]

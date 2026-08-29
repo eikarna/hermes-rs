@@ -4,7 +4,8 @@
   <a href="https://github.com/eikarna/hermes-rs/actions/workflows/ci.yml"><img src="https://github.com/eikarna/hermes-rs/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://kerux.eikarna.dev/"><img src="https://img.shields.io/badge/docs-kerux.eikarna.dev-00f0ff?logo=mdbook&logoColor=white" alt="Documentation"></a>
   <a href="https://github.com/eikarna/hermes-rs/releases"><img src="https://img.shields.io/github/v/release/eikarna/hermes-rs?label=release&color=e5a93b" alt="Release"></a>
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-86847e" alt="License"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT-86847e" alt="License"></a>
+
 </p>
 
 <p align="center">
@@ -83,10 +84,8 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and the PR process.
 
-## Credits
-
-A pure-Rust rewrite of the [Hermes-Agent](https://github.com/nousresearch/hermes-agent) orchestration loop by [Nous Research](https://nousresearch.com). Unofficial community port — not affiliated with or endorsed by Nous Research.
-
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+Licensed under the [MIT License](LICENSE).
+
+

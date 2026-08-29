@@ -19,6 +19,8 @@ It runs a full ReAct agent loop with tool execution, streaming responses, persis
 | `kerux-core` | Agent loop, LLM clients, tools, gateway adapters, persistence |
 | `kerux-cli` | CLI/TUI frontend, `serve` gateway mode, autonomous coding mode |
 
-## Attribution
+## Project Overview
 
-Kerux began as a Rust port of [hermes-agent](https://github.com/NousResearch/hermes-agent) by Nous Research. See [ATTRIBUTION.md](https://github.com/eikarna/hermes-rs/blob/main/ATTRIBUTION.md) for details.
+
+Kerux is a high-performance agentic orchestration framework and terminal harness written from the ground up in Rust.
+
