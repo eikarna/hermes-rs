@@ -80,7 +80,8 @@ impl KeruxTool for WebSearchTool {
 
                 match response.text().await {
                     Ok(html) => {
-                        let results = parse_ddg_lite_results(&html, num_results);
+                        let sanitized_html = crate::security_guard::sanitize_external_payload("web_search", &html);
+                        let results = parse_ddg_lite_results(&sanitized_html, num_results);
                         ToolResult::success(
                             "web_search",
                             serde_json::json!({
@@ -204,7 +205,8 @@ impl KeruxTool for WebFetchTool {
 
                 match response.text().await {
                     Ok(body) => {
-                        let body_size = body.len();
+                        let sanitized_body = crate::security_guard::sanitize_external_payload("web_fetch", &body);
+                        let body_size = sanitized_body.len();
                         ToolResult::success(
                             "web_fetch",
                             serde_json::json!({
@@ -213,7 +215,7 @@ impl KeruxTool for WebFetchTool {
                                 "status_code": status.as_u16(),
                                 "status_text": status.canonical_reason().unwrap_or(""),
                                 "headers": headers,
-                                "body": body,
+                                "body": sanitized_body,
                                 "body_size": body_size
                             }),
                         )
