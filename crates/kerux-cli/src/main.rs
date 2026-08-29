@@ -1230,14 +1230,23 @@ impl AgentMessageHandler {
         if args.is_empty() || args.eq_ignore_ascii_case("list") {
             let jobs = self.scheduler.list().await;
             if jobs.is_empty() {
-                return "No cron jobs. Add one with:\n/cron add 30m <prompt>".to_string();
+                return "No cron jobs. Add one with:\n/cron add 30m <prompt>\n/cron add cron \"*/5 * * * *\" <prompt>\n/cron add once <timestamp> <prompt>".to_string();
             }
             let mut out = String::from("Cron jobs:\n");
             for job in &jobs {
                 let state = if job.enabled { "on" } else { "paused" };
+                let target_tag = match job.target {
+                    scheduler::JobTarget::Agent => " [agent]",
+                    scheduler::JobTarget::Prompt => "",
+                };
+                let sched_str = match &job.schedule {
+                    scheduler::Schedule::Interval { seconds } => format!("every {}s", seconds),
+                    scheduler::Schedule::Cron { expression } => format!("cron \"{}\"", expression),
+                    scheduler::Schedule::Once { at } => format!("once @ {}", at),
+                };
                 out.push_str(&format!(
-                    "  #{} [{}] every {}s -> \"{}\"\n",
-                    job.id, state, job.interval_secs, job.prompt
+                    "  #{}{}[{}] {} -> \"{}\"\n",
+                    job.id, target_tag, state, sched_str, job.prompt
                 ));
             }
             out.push_str("\n/cron pause <id> | resume <id> | remove <id>");
@@ -1250,31 +1259,47 @@ impl AgentMessageHandler {
 
         match sub.as_str() {
             "add" => {
-                // /cron add <interval> <prompt>
-                let mut rp = rest.splitn(2, ' ');
-                let interval_str = rp.next().unwrap_or("");
-                let prompt = rp.next().unwrap_or("").trim();
-                if interval_str.is_empty() || prompt.is_empty() {
-                    return "Usage: /cron add <interval> <prompt>\nExample: /cron add 30m check the news".to_string();
-                }
-                let interval = match scheduler::parse_interval(interval_str) {
-                    Ok(v) => v,
-                    Err(e) => return format!("Bad interval: {}", e),
+                // /cron add [agent] <interval|cron|once> <prompt>
+                let (target, rest_spec) = if rest.starts_with("agent ") {
+                    (
+                        scheduler::JobTarget::Agent,
+                        rest.strip_prefix("agent ").unwrap_or("").trim(),
+                    )
+                } else {
+                    (scheduler::JobTarget::Prompt, rest)
                 };
+
+                let (schedule, prompt) = match scheduler::parse_add_request(rest_spec) {
+                    Ok(parsed) => parsed,
+                    Err(e) => return format!("Bad schedule syntax: {}", e),
+                };
+
                 match self
                     .scheduler
-                    .add(
+                    .add_schedule(
                         prompt.to_string(),
-                        interval,
+                        schedule.clone(),
+                        target,
                         message.platform.clone(),
                         message.channel_id.clone(),
                     )
                     .await
                 {
-                    Ok(job) => format!(
-                        "Scheduled job #{}: every {}s -> \"{}\"",
-                        job.id, job.interval_secs, job.prompt
-                    ),
+                    Ok(job) => {
+                        let sched_str = match &job.schedule {
+                            scheduler::Schedule::Interval { seconds } => {
+                                format!("every {}s", seconds)
+                            }
+                            scheduler::Schedule::Cron { expression } => {
+                                format!("cron \"{}\"", expression)
+                            }
+                            scheduler::Schedule::Once { at } => format!("once @ {}", at),
+                        };
+                        format!(
+                            "Scheduled job #{}: {} -> \"{}\"",
+                            job.id, sched_str, job.prompt
+                        )
+                    }
                     Err(e) => format!("Failed to add job: {}", e),
                 }
             }
@@ -1559,7 +1584,7 @@ async fn run_gateway(config: &AppConfig, system_prompt: Option<&str>) -> Result<
     let agent = create_agent_without_events(config, system_prompt, &mut mcp_manager).await?;
     let gateway_config = kerux_core::gateway::GatewayConfig::default();
     let scheduler = Arc::new(kerux_core::scheduler::Scheduler::new(
-        kerux_core::scheduler::Scheduler::default_dir(),
+        kerux_core::scheduler::Scheduler::default_path(),
     ));
     let handler = Arc::new(AgentMessageHandler {
         agent: Arc::new(agent),

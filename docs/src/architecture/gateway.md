@@ -61,6 +61,6 @@ All channel state survives restarts:
 | Conversations | `~/.kerux/sessions/<platform>_<channel>.json` (format v2) |
 | Memory | `~/.kerux/memory/memories.json` |
 | Todos | `~/.kerux/todos/todos.json` |
-| Cron jobs | `~/.kerux/cron/jobs.json` |
+| Cron jobs | `~/.kerux/scheduler.json` |
 
 All writes are atomic (temp file + rename). Set `KERUX_HOME` to relocate the state root.
