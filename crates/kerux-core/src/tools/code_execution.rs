@@ -95,12 +95,14 @@ async fn execute_python(
     let temp_dir = std::env::temp_dir();
     let script_path = temp_dir.join(format!("kerux_code_{}.py", uuid_simple()));
 
-    std::fs::write(&script_path, code)
+    tokio::fs::write(&script_path, code)
+        .await
         .map_err(|e| format!("Failed to write temp script: {}", e))?;
 
     let python_cmd =
         crate::platform::find_python().unwrap_or_else(|| std::path::PathBuf::from("python3"));
     let mut cmd = Command::new(&python_cmd);
+    cmd.kill_on_drop(true);
     cmd.arg(script_path.to_str().unwrap_or("script.py"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -141,7 +143,7 @@ async fn execute_python(
     let runtime = start.elapsed();
 
     // Clean up temp file
-    let _ = std::fs::remove_file(&script_path);
+    let _ = tokio::fs::remove_file(&script_path).await;
 
     Ok(serde_json::json!({
         "language": "python",
@@ -164,10 +166,12 @@ async fn execute_javascript(
     let temp_dir = std::env::temp_dir();
     let script_path = temp_dir.join(format!("kerux_code_{}.js", uuid_simple()));
 
-    std::fs::write(&script_path, code)
+    tokio::fs::write(&script_path, code)
+        .await
         .map_err(|e| format!("Failed to write temp script: {}", e))?;
 
     let mut cmd = Command::new("node");
+    cmd.kill_on_drop(true);
     cmd.arg(script_path.to_str().unwrap_or("script.js"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -206,7 +210,7 @@ async fn execute_javascript(
 
     let runtime = start.elapsed();
 
-    let _ = std::fs::remove_file(&script_path);
+    let _ = tokio::fs::remove_file(&script_path).await;
 
     Ok(serde_json::json!({
         "language": "javascript",
@@ -228,6 +232,7 @@ async fn execute_shell(
     let shell = crate::platform::detect_shell();
     let mut cmd = {
         let mut c = Command::new(&shell.path);
+        c.kill_on_drop(true);
         for arg in &shell.args_pattern {
             c.arg(arg);
         }
@@ -294,11 +299,12 @@ async fn execute_rust(
     let project_dir = temp_dir.join(format!("kerux_rust_{}", uuid_simple()));
 
     // Create project structure
-    std::fs::create_dir_all(project_dir.join("src"))
+    tokio::fs::create_dir_all(project_dir.join("src"))
+        .await
         .map_err(|e| format!("Failed to create project dir: {}", e))?;
 
     // Write Cargo.toml
-    std::fs::write(
+    tokio::fs::write(
         project_dir.join("Cargo.toml"),
         r#"[package]
 name = "temp"
@@ -310,13 +316,16 @@ name = "main"
 path = "src/main.rs"
 "#,
     )
+    .await
     .map_err(|e| format!("Failed to write Cargo.toml: {}", e))?;
 
     // Write main.rs
-    std::fs::write(project_dir.join("src/main.rs"), code)
+    tokio::fs::write(project_dir.join("src/main.rs"), code)
+        .await
         .map_err(|e| format!("Failed to write main.rs: {}", e))?;
 
     let mut cmd = Command::new("rustc");
+    cmd.kill_on_drop(true);
     cmd.arg(project_dir.join("src/main.rs"))
         .arg("-o")
         .arg(project_dir.join("main"))
@@ -354,6 +363,7 @@ path = "src/main.rs"
 
     // Run the compiled binary
     let mut run_cmd = Command::new(project_dir.join("main").to_str().unwrap_or("main"));
+    run_cmd.kill_on_drop(true);
     run_cmd.stdout(Stdio::piped());
     run_cmd.stderr(Stdio::piped());
 
@@ -392,7 +402,7 @@ path = "src/main.rs"
     let runtime = start.elapsed();
 
     // Clean up
-    let _ = std::fs::remove_dir_all(&project_dir);
+    let _ = tokio::fs::remove_dir_all(&project_dir).await;
 
     Ok(serde_json::json!({
         "language": "rust",

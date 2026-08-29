@@ -124,6 +124,8 @@ impl KeruxTool for TerminalTool {
         // that kept emitting output could run for unbounded wall time.
         let deadline = Instant::now() + timeout;
 
+        cmd.kill_on_drop(true);
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {

@@ -51,10 +51,14 @@ const THREAT_PATTERNS: &[(&str, &str)] = &[
 lazy_static::lazy_static! {
     static ref THREAT_REGEXES: Vec<(regex::Regex, &'static str)> = THREAT_PATTERNS
         .iter()
-        .map(|&(pattern, id)| {
-            let re = regex::Regex::new(&format!("(?i){}", pattern))
-                .expect("Invalid context scan pattern");
-            (re, id)
+        .filter_map(|&(pattern, id)| {
+            match regex::Regex::new(&format!("(?i){}", pattern)) {
+                Ok(re) => Some((re, id)),
+                Err(error) => {
+                    warn!(pattern = %pattern, error = %error, "Invalid context scan pattern, skipping");
+                    None
+                }
+            }
         })
         .collect();
 }

@@ -428,6 +428,7 @@ impl McpStdioClient {
         info!(command = %self.command, "Spawning MCP stdio server");
 
         let mut cmd = tokio::process::Command::new(&self.command);
+        cmd.kill_on_drop(true);
         cmd.args(&self.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

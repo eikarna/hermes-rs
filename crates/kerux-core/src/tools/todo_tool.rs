@@ -124,15 +124,7 @@ impl KeruxTool for TodoTool {
 
         // Replace the entire list for this session
         {
-            let mut store = match TODO_STORE.lock() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    return ToolResult::error(
-                        "todo",
-                        format!("Failed to acquire lock on todo store: {}", e),
-                    )
-                }
-            };
+            let mut store = crate::lock_sync(&TODO_STORE);
             store.insert(session_id.clone(), todos);
             save_to_disk(&store);
         }

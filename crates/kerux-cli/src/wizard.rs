@@ -625,7 +625,7 @@ pub async fn run_wizard() -> Result<bool> {
         };
         step = match move_ {
             Move::Forward => match step {
-                Step::Provider => after_provider(state.kind.unwrap()),
+                Step::Provider => after_provider(kind),
                 Step::Endpoint => after_endpoint(kind),
                 Step::ApiKey => Step::Model,
                 Step::Model => Step::Probe,
@@ -740,7 +740,7 @@ fn normalize_ollama_host(host: &str) -> String {
 
 async fn endpoint_step(state: &mut WizardState) -> Result<Move> {
     step_header(1, "Provider endpoint");
-    let kind = state.kind.unwrap();
+    let kind = state.kind.unwrap_or(ProviderKind::Openai);
     let current = state.base_url.clone().unwrap_or_default();
     let prompt = match kind {
         ProviderKind::Openai => "Base URL (change this for OpenAI-compatible/custom servers)",
@@ -765,7 +765,7 @@ async fn endpoint_step(state: &mut WizardState) -> Result<Move> {
 }
 
 async fn api_key_step(state: &mut WizardState) -> Result<Move> {
-    let kind = state.kind.unwrap();
+    let kind = state.kind.unwrap_or(ProviderKind::Openai);
 
     // A key from the environment for THIS provider was already confirmed in
     // the provider step (or the provider needs no key at all).
@@ -816,7 +816,7 @@ async fn api_key_step(state: &mut WizardState) -> Result<Move> {
 
 async fn model_step(state: &mut WizardState) -> Result<Move> {
     step_header(3, "Model");
-    let kind = state.kind.unwrap();
+    let kind = state.kind.unwrap_or(ProviderKind::Openai);
     let base_url = state.base_url.clone().unwrap_or_default();
 
     loop {
@@ -876,7 +876,7 @@ async fn model_step(state: &mut WizardState) -> Result<Move> {
 }
 
 async fn probe_step(state: &mut WizardState) -> Result<Move> {
-    step_header(4, "Probe");
+    step_header(4, "Probe capabilities (optional)");
     let model = state.model.clone().unwrap_or_default();
     let want = Confirm::new()
         .with_prompt(format!(
@@ -889,7 +889,7 @@ async fn probe_step(state: &mut WizardState) -> Result<Move> {
         return Ok(Move::Forward);
     }
 
-    let kind = state.kind.unwrap();
+    let kind = state.kind.unwrap_or(ProviderKind::Openai);
     let base_url = state.base_url.clone().unwrap_or_default();
     let provider = build_plan_provider(kind, &base_url, state.api_key.clone())?;
     let result = with_spinner(
@@ -1032,7 +1032,7 @@ async fn pick_fallback() -> Result<Option<FallbackChoice>> {
 
 async fn write_step(state: &mut WizardState, target: &Path) -> Result<Move> {
     step_header(6, "Write config");
-    let kind = state.kind.unwrap();
+    let kind = state.kind.unwrap_or(ProviderKind::Openai);
     let key_shown = match (&state.api_key, &state.key_source) {
         (Some(_), Some(source)) if source.starts_with("environment") => {
             format!("from {source} — not written to file")
@@ -1061,7 +1061,7 @@ async fn write_step(state: &mut WizardState, target: &Path) -> Result<Move> {
 
     let mut replace_fallback = false;
     if state.fallback.is_some() && target.exists() {
-        if let Ok(raw) = std::fs::read_to_string(target) {
+        if let Ok(raw) = tokio::fs::read_to_string(target).await {
             if let Ok(doc) = raw.parse::<DocumentMut>() {
                 let count = doc
                     .get("client")
@@ -1124,7 +1124,7 @@ async fn smoke_step(state: &mut WizardState) -> Result<Move> {
         return Ok(Move::Forward);
     }
 
-    let kind = state.kind.unwrap();
+    let kind = state.kind.unwrap_or(ProviderKind::Openai);
     let base_url = state.base_url.clone().unwrap_or_default();
     let provider = build_plan_provider(kind, &base_url, state.api_key.clone())?;
     match smoke_test(&*provider, &model).await {

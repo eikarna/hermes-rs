@@ -1018,6 +1018,55 @@ impl KeruxAgent {
         conv.clear();
     }
 
+    /// Aggressively prune conversation history when context length is exceeded
+    /// or a payload too large (400/413) error is encountered.
+    pub async fn prune_history_aggressively(&self) {
+        let mut conv = self.conversation.write().await;
+        if conv.is_empty() {
+            return;
+        }
+
+        // Keep system prompt if present
+        let system_msg = if conv[0].role == Role::System {
+            Some(conv[0].clone())
+        } else {
+            None
+        };
+
+        // Cut conversation down to the last 5-10 messages, ensuring no orphaned tool messages
+        let keep_count = 6.min(conv.len());
+        let mut split = conv.len().saturating_sub(keep_count);
+        while split < conv.len() {
+            let tail_starts_orphan = conv[split].role == Role::Tool;
+            let head_ends_toolcall = split > 0
+                && conv[split - 1].role == Role::Assistant
+                && conv[split - 1].tool_calls.is_some();
+            if !tail_starts_orphan && !head_ends_toolcall {
+                break;
+            }
+            split += 1;
+        }
+
+        let tail = if split < conv.len() {
+            conv[split..].to_vec()
+        } else {
+            conv.last().cloned().map(|m| vec![m]).unwrap_or_default()
+        };
+
+        let mut new_conv = Vec::new();
+        if let Some(sys) = system_msg {
+            new_conv.push(sys);
+        } else {
+            new_conv.push(Message::system(format!(
+                "{}\n[Aggressively pruned older conversation context due to payload/context limit]",
+                CONTEXT_SUMMARY_MARKER
+            )));
+        }
+        new_conv.extend(tail);
+        *conv = new_conv;
+        info!("Aggressively pruned conversation history after context overflow");
+    }
+
     /// Rolling context compaction.
     ///
     /// When the conversation buffer reaches `COMPACTION_TRIGGER` messages,
@@ -1245,7 +1294,7 @@ impl KeruxAgent {
 
             // Get tool schemas
             let tools = self.registry.get_schemas().await;
-            let (request_messages, mut preflight_telemetry) =
+            let (mut request_messages, mut preflight_telemetry) =
                 self.prepare_request_messages(&messages, &tools)?;
             preflight_telemetry.turns_completed = iteration;
             self.emit(AgentEvent::Telemetry {
@@ -1261,47 +1310,105 @@ impl KeruxAgent {
             .await?;
 
             let model = self.active_model();
-            let response = if self.config.stream {
-                let stream = self
-                    .client
-                    .chat_streaming(&model, &request_messages, Some(&tools))
-                    .await?;
-                let stream_started = Instant::now();
-                match self
-                    .process_stream(stream, &preflight_telemetry, &cancel)
-                    .await
-                {
-                    Ok((response_text, reasoning_text, tool_calls, usage)) => {
-                        self.emit_stream_telemetry(
-                            &preflight_telemetry,
-                            &response_text,
-                            &reasoning_text,
-                            &tool_calls,
-                            usage.as_ref(),
-                            stream_started.elapsed(),
-                        )
-                        .await?;
-                        let fallback_completion = estimate_tokens(&response_text)
-                            + estimate_tokens(&reasoning_text)
-                            + total_tool_call_tokens(&tool_calls);
-                        self.enforce_budget(
-                            usage.as_ref(),
-                            preflight_telemetry.prompt_tokens,
-                            fallback_completion,
-                        )
-                        .await?;
-                        Ok((response_text, reasoning_text, tool_calls))
+            let mut request_attempts = 0;
+            const MAX_REQUEST_RETRIES: usize = 3;
+
+            let response = loop {
+                request_attempts += 1;
+
+                let response_result = if self.config.stream {
+                    match self
+                        .client
+                        .chat_streaming(&model, &request_messages, Some(&tools))
+                        .await
+                    {
+                        Ok(stream) => {
+                            let stream_started = Instant::now();
+                            match self
+                                .process_stream(stream, &preflight_telemetry, &cancel)
+                                .await
+                            {
+                                Ok((response_text, reasoning_text, tool_calls, usage)) => {
+                                    self.emit_stream_telemetry(
+                                        &preflight_telemetry,
+                                        &response_text,
+                                        &reasoning_text,
+                                        &tool_calls,
+                                        usage.as_ref(),
+                                        stream_started.elapsed(),
+                                    )
+                                    .await?;
+                                    let fallback_completion = estimate_tokens(&response_text)
+                                        + estimate_tokens(&reasoning_text)
+                                        + total_tool_call_tokens(&tool_calls);
+                                    self.enforce_budget(
+                                        usage.as_ref(),
+                                        preflight_telemetry.prompt_tokens,
+                                        fallback_completion,
+                                    )
+                                    .await?;
+                                    Ok((response_text, reasoning_text, tool_calls))
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(error) => Err(error),
+                } else {
+                    let request_started = Instant::now();
+                    match self
+                        .client
+                        .chat(&model, &request_messages, Some(&tools))
+                        .await
+                    {
+                        Ok(resp) => {
+                            self.process_response(
+                                resp,
+                                &preflight_telemetry,
+                                request_started.elapsed(),
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+
+                match response_result {
+                    Ok(res) => break Ok(res),
+                    Err(e) => {
+                        // Check if error is context length / payload too large
+                        if is_context_length_error(&e) {
+                            warn!(error = %e, "Context length or payload exceeded; aggressively pruning conversation history");
+                            self.prune_history_aggressively().await;
+                            // Also rebuild messages for current loop iteration
+                            messages = self.build_messages().await?;
+                            let (new_req_messages, new_telemetry) =
+                                self.prepare_request_messages(&messages, &tools)?;
+                            request_messages = new_req_messages;
+                            preflight_telemetry = new_telemetry;
+                            preflight_telemetry.turns_completed = iteration;
+
+                            if request_attempts <= MAX_REQUEST_RETRIES {
+                                let backoff = calculate_retry_backoff(request_attempts, &e);
+                                tokio::time::sleep(backoff).await;
+                                continue;
+                            }
+                        } else if e.is_transient() && request_attempts <= MAX_REQUEST_RETRIES {
+                            let backoff = calculate_retry_backoff(request_attempts, &e);
+                            warn!(
+                                attempt = request_attempts,
+                                max = MAX_REQUEST_RETRIES,
+                                delay_ms = backoff.as_millis(),
+                                error = %e,
+                                "Transient error from provider (e.g. 429/5xx); applying backoff and retrying"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+
+                        break Err(e);
+                    }
                 }
-            } else {
-                let request_started = Instant::now();
-                let response = self
-                    .client
-                    .chat(&model, &request_messages, Some(&tools))
-                    .await?;
-                self.process_response(response, &preflight_telemetry, request_started.elapsed())
-                    .await
             };
 
             match response {
@@ -2171,6 +2278,113 @@ fn context_window_usage(total_tokens: usize, context_window: usize) -> Option<f6
     (context_window > 0).then_some(total_tokens as f64 / context_window as f64 * 100.0)
 }
 
+fn is_context_length_error(err: &Error) -> bool {
+    match err {
+        Error::ContextLengthExceeded => true,
+        Error::Http { status, body } => {
+            if *status == 413 {
+                return true;
+            }
+            if *status == 400 {
+                let lower = body.to_lowercase();
+                if lower.contains("context_length_exceeded")
+                    || lower.contains("maximum context length")
+                    || lower.contains("context window")
+                    || lower.contains("too many tokens")
+                    || lower.contains("prompt is too long")
+                    || lower.contains("payload too large")
+                    || lower.contains("request too large")
+                    || lower.contains("exceeded the context")
+                    || lower.contains("string_above_max_length")
+                    || lower.contains("max_tokens")
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn calculate_retry_backoff(attempt: usize, err: &Error) -> Duration {
+    // Check for Retry-After hints or HTTP 429 rate limit
+    let base_delay_ms = match err {
+        Error::Http { status: 429, .. } => 1000u64, // 1 second base for 429
+        _ => 500u64,
+    };
+
+    // Exponential backoff: base * 2^(attempt-1), capped at 16s
+    let exp_factor = 2u64.saturating_pow(attempt.saturating_sub(1) as u32);
+    let delay_ms = base_delay_ms.saturating_mul(exp_factor).min(16000);
+
+    // Add jitter: 0 to 250ms random jitter using getrandom
+    let mut rand_buf = [0u8; 2];
+    let jitter_ms = if getrandom::getrandom(&mut rand_buf).is_ok() {
+        (u16::from_ne_bytes(rand_buf) % 250) as u64
+    } else {
+        50
+    };
+
+    Duration::from_millis(delay_ms + jitter_ms)
+}
+
+fn truncate_message_content(content: &str, max_tokens: usize) -> String {
+    let current_tokens = estimate_tokens(content);
+    if current_tokens <= max_tokens || max_tokens == 0 {
+        return content.to_string();
+    }
+
+    let target_chars = max_tokens.saturating_mul(4);
+    let marker = "\n\n[...truncated oversized content...]\n\n";
+    let marker_chars = marker.chars().count();
+
+    if target_chars <= marker_chars {
+        return marker.trim().to_string();
+    }
+
+    let available_chars = target_chars - marker_chars;
+    let head_chars = (available_chars as f64 * 0.7) as usize;
+    let tail_chars = available_chars.saturating_sub(head_chars);
+
+    let total_chars = content.chars().count();
+    if total_chars <= target_chars {
+        return content.to_string();
+    }
+
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content
+        .chars()
+        .skip(total_chars.saturating_sub(tail_chars))
+        .collect();
+
+    format!("{}{}{}", head, marker, tail)
+}
+
+fn truncate_oversized_group(group: Vec<Message>, max_budget: usize) -> Vec<Message> {
+    if max_budget == 0 {
+        return group;
+    }
+
+    let mut truncated_group = Vec::with_capacity(group.len());
+    let per_message_budget = (max_budget / group.len().max(1)).max(1);
+
+    for mut msg in group {
+        let current_tokens = estimate_tokens(&msg.content);
+        // Only truncate messages with large content (e.g. tools or very long user/assistant messages)
+        if current_tokens > per_message_budget && current_tokens > 20 {
+            let role_overhead = 4;
+            let tool_call_overhead = if msg.tool_calls.is_some() { 10 } else { 0 };
+            let overhead = role_overhead + tool_call_overhead;
+            let target_content_budget = per_message_budget.saturating_sub(overhead).max(1);
+            msg.content = truncate_message_content(&msg.content, target_content_budget);
+        }
+        truncated_group.push(msg);
+    }
+
+    truncated_group
+}
+
 fn compact_request_messages(messages: &[Message], max_tokens: usize) -> Vec<Message> {
     if messages.is_empty() {
         return Vec::new();
@@ -2215,10 +2429,19 @@ fn compact_request_messages(messages: &[Message], max_tokens: usize) -> Vec<Mess
     let mut selected = Vec::<(usize, Vec<Message>)>::new();
     for (group_index, group) in groups.into_iter().enumerate() {
         let group_tokens = total_message_tokens(&group);
-        if selected.is_empty()
-            || latest_user_group == Some(group_index)
-            || used_tokens + group_tokens <= max_tokens
-        {
+        if selected.is_empty() || latest_user_group == Some(group_index) {
+            let budget_for_group = max_tokens.saturating_sub(used_tokens);
+            let final_group = if group_tokens > budget_for_group && budget_for_group > 0 {
+                truncate_oversized_group(group, budget_for_group)
+            } else if group_tokens > max_tokens && max_tokens > 0 {
+                truncate_oversized_group(group, max_tokens)
+            } else {
+                group
+            };
+            let actual_tokens = total_message_tokens(&final_group);
+            used_tokens += actual_tokens;
+            selected.push((group_index, final_group));
+        } else if used_tokens + group_tokens <= max_tokens {
             used_tokens += group_tokens;
             selected.push((group_index, group));
         } else if latest_user_group.is_some_and(|index| group_index < index) {
@@ -3864,6 +4087,71 @@ mod tests {
             crate::client::Role::Assistant
         );
         assert!(compacted[tool_index - 1].tool_calls.is_some());
+    }
+
+    #[test]
+    fn compact_request_messages_truncates_oversized_tool_output() {
+        let giant_tool_output = "ERROR: compiler error line 1\n".repeat(500);
+        let assistant = Message::assistant("running build").with_tool_calls(vec![ToolCall {
+            id: "call_build".to_string(),
+            function: crate::client::ToolCallFunction {
+                name: "build".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        let messages = vec![
+            Message::system("system prompt"),
+            Message::user("run build"),
+            assistant,
+            Message::tool("call_build", giant_tool_output),
+        ];
+
+        let budget_tokens = 50;
+        let compacted = compact_request_messages(&messages, budget_tokens);
+
+        let tool_msg = compacted
+            .iter()
+            .find(|m| m.role == crate::client::Role::Tool)
+            .expect("tool message should be in compacted output");
+
+        assert!(tool_msg
+            .content
+            .contains("[...truncated oversized content...]"));
+        assert!(estimate_message_tokens(tool_msg) <= budget_tokens + 20);
+    }
+
+    #[test]
+    fn is_context_length_error_detection() {
+        let err_413 = Error::Http {
+            status: 413,
+            body: "Payload Too Large".to_string(),
+        };
+        assert!(is_context_length_error(&err_413));
+
+        let err_400_ctx = Error::Http {
+            status: 400,
+            body: r#"{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 135000 tokens."}}"#.to_string(),
+        };
+        assert!(is_context_length_error(&err_400_ctx));
+
+        let err_400_other = Error::Http {
+            status: 400,
+            body: r#"{"error":{"message":"Invalid JSON body"}}"#.to_string(),
+        };
+        assert!(!is_context_length_error(&err_400_other));
+    }
+
+    #[test]
+    fn retry_backoff_calculation() {
+        let err_429 = Error::Http {
+            status: 429,
+            body: "Rate limit exceeded".to_string(),
+        };
+        let d1 = calculate_retry_backoff(1, &err_429);
+        assert!(d1.as_millis() >= 1000 && d1.as_millis() <= 1500);
+
+        let d2 = calculate_retry_backoff(2, &err_429);
+        assert!(d2.as_millis() >= 2000 && d2.as_millis() <= 2500);
     }
 
     #[tokio::test]

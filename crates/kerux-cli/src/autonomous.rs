@@ -1,11 +1,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -1179,81 +1177,85 @@ fn exec_git_owned(
 }
 
 async fn run_blocking_command(spec: CommandSpec) -> Result<CommandOutcome> {
-    tokio::task::spawn_blocking(move || {
-        let mut command = match spec.kind {
-            CommandKind::Exec { program, args } => {
-                let mut command = std::process::Command::new(program);
-                command.args(args);
-                command
-            }
-            CommandKind::Shell { command } => {
-                let shell = detect_shell();
-                let mut process = std::process::Command::new(shell.path);
-                process.args(shell.args_pattern).arg(command);
-                process
-            }
-        };
+    use tokio::io::AsyncReadExt;
 
-        command
-            .current_dir(&spec.cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("Failed to spawn '{}'", spec.description))?;
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        let stdout_reader = thread::spawn(move || read_output(stdout));
-        let stderr_reader = thread::spawn(move || read_output(stderr));
-        let deadline = Instant::now() + spec.timeout;
-
-        let status = loop {
-            if let Some(status) = child
-                .try_wait()
-                .with_context(|| format!("Failed while polling '{}'", spec.description))?
-            {
-                break (status, false);
-            }
-
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let status = child
-                    .wait()
-                    .with_context(|| format!("Failed to reap timed out '{}'", spec.description))?;
-                break (status, true);
-            }
-
-            thread::sleep(Duration::from_millis(100));
-        };
-
-        let stdout = stdout_reader.join().unwrap_or_default();
-        let stderr = stderr_reader.join().unwrap_or_default();
-
-        Ok(CommandOutcome {
-            success: status.0.success() && !status.1,
-            exit_code: status.0.code(),
-            stdout,
-            stderr,
-            timed_out: status.1,
-        })
-    })
-    .await
-    .context("Blocking command task failed")?
-}
-
-fn read_output(stream: Option<impl Read>) -> String {
-    let Some(mut stream) = stream else {
-        return String::new();
+    let mut command = match spec.kind {
+        CommandKind::Exec { program, args } => {
+            let mut command = tokio::process::Command::new(program);
+            command.args(args);
+            command
+        }
+        CommandKind::Shell { command } => {
+            let shell = detect_shell();
+            let mut process = tokio::process::Command::new(shell.path);
+            process.args(shell.args_pattern).arg(command);
+            process
+        }
     };
 
-    let mut buffer = Vec::new();
-    if stream.read_to_end(&mut buffer).is_ok() {
+    command
+        .current_dir(&spec.cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Failed to spawn '{}'", spec.description))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_handle = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_end(&mut buffer).await;
+        }
         String::from_utf8_lossy(&buffer).to_string()
-    } else {
-        String::new()
+    });
+
+    let stderr_handle = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_end(&mut buffer).await;
+        }
+        String::from_utf8_lossy(&buffer).to_string()
+    });
+
+    let wait_result = tokio::time::timeout(spec.timeout, child.wait()).await;
+
+    match wait_result {
+        Ok(status_res) => {
+            let status = status_res
+                .with_context(|| format!("Failed while waiting for '{}'", spec.description))?;
+            let stdout = stdout_handle.await.unwrap_or_default();
+            let stderr = stderr_handle.await.unwrap_or_default();
+
+            Ok(CommandOutcome {
+                success: status.success(),
+                exit_code: status.code(),
+                stdout,
+                stderr,
+                timed_out: false,
+            })
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let status = child
+                .wait()
+                .await
+                .with_context(|| format!("Failed to reap timed out '{}'", spec.description))?;
+            let stdout = stdout_handle.await.unwrap_or_default();
+            let stderr = stderr_handle.await.unwrap_or_default();
+
+            Ok(CommandOutcome {
+                success: false,
+                exit_code: status.code(),
+                stdout,
+                stderr,
+                timed_out: true,
+            })
+        }
     }
 }
 

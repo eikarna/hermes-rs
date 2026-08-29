@@ -314,54 +314,59 @@ impl KeruxTool for FileListTool {
             );
         }
 
-        let mut entries = Vec::new();
-
-        fn list_recursive(
-            dir: &PathBuf,
-            entries: &mut Vec<serde_json::Value>,
-            recursive: bool,
-            include_hidden: bool,
-        ) {
-            let read_dir = match std::fs::read_dir(dir) {
-                Ok(rd) => rd,
-                Err(_) => return,
-            };
-
-            for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-
-                // Skip hidden files/dirs unless requested
-                if !include_hidden && name.starts_with('.') {
-                    continue;
-                }
-
-                let path = entry.path();
-                let metadata = entry.metadata().ok();
-
-                let entry_json = serde_json::json!({
-                    "name": name,
-                    "path": path.to_string_lossy(),
-                    "is_dir": path.is_dir(),
-                    "size": metadata.as_ref().map(|m| m.len()).unwrap_or(0),
-                    "modified": metadata.as_ref()
-                        .and_then(|m| m.modified().ok())
-                        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
-                });
-
-                entries.push(entry_json);
-
-                if recursive && path.is_dir() {
-                    list_recursive(&path, entries, recursive, include_hidden);
-                }
-            }
-        }
-
-        list_recursive(
-            &path,
-            &mut entries,
+        let (recursive, include_hidden) = (
             args.recursive.unwrap_or(false),
             args.include_hidden.unwrap_or(false),
         );
+
+        let mut entries = tokio::task::spawn_blocking(move || {
+            let mut entries = Vec::new();
+
+            fn list_recursive(
+                dir: &PathBuf,
+                entries: &mut Vec<serde_json::Value>,
+                recursive: bool,
+                include_hidden: bool,
+            ) {
+                let read_dir = match std::fs::read_dir(dir) {
+                    Ok(rd) => rd,
+                    Err(_) => return,
+                };
+
+                for entry in read_dir.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+
+                    // Skip hidden files/dirs unless requested
+                    if !include_hidden && name.starts_with('.') {
+                        continue;
+                    }
+
+                    let path = entry.path();
+                    let metadata = entry.metadata().ok();
+
+                    let entry_json = serde_json::json!({
+                        "name": name,
+                        "path": path.to_string_lossy(),
+                        "is_dir": path.is_dir(),
+                        "size": metadata.as_ref().map(|m| m.len()).unwrap_or(0),
+                        "modified": metadata.as_ref()
+                            .and_then(|m| m.modified().ok())
+                            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                    });
+
+                    entries.push(entry_json);
+
+                    if recursive && path.is_dir() {
+                        list_recursive(&path, entries, recursive, include_hidden);
+                    }
+                }
+            }
+
+            list_recursive(&path, &mut entries, recursive, include_hidden);
+            entries
+        })
+        .await
+        .unwrap_or_default();
 
         // Sort: directories first, then by name
         entries.sort_by(|a, b| {
