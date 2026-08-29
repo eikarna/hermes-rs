@@ -790,9 +790,14 @@ impl Gateway {
 
                     for update in updates {
                         // Interactive callbacks (Telegram inline-keyboard
-                        // button presses) resolve pending approval requests;
-                        // they never become agent messages.
-                        if update.get("callback_query").is_some() {
+                        // button presses, Discord interaction components) resolve
+                        // pending approval requests; they never become agent messages.
+                        let is_callback = update.get("callback_query").is_some()
+                            || update.get("type").and_then(|t| t.as_i64()) == Some(3)
+                            || update.get("d").and_then(|d| d.get("type")).and_then(|t| t.as_i64()) == Some(3)
+                            || update.get("t").and_then(|t| t.as_str()) == Some("INTERACTION_CREATE");
+
+                        if is_callback {
                             if let Err(e) = adapter.handle_callback_query(update).await {
                                 warn!(platform = %platform, error = %e, "Failed to handle callback query");
                             }
@@ -2053,6 +2058,33 @@ impl DiscordAdapter {
     fn api_url(&self) -> String {
         runtime_config().gateway.discord_api_base
     }
+
+    /// Respond to an interaction (type 4: ChannelMessageWithSource, ephemeral acknowledgment)
+    async fn respond_interaction(
+        &self,
+        interaction_id: &str,
+        interaction_token: &str,
+        message: &str,
+    ) -> Result<()> {
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "type": 4, // CHANNEL_MESSAGE_WITH_SOURCE
+            "data": {
+                "content": message,
+                "flags": 64 // EPHEMERAL
+            }
+        });
+
+        let url = format!(
+            "{}/interactions/{}/{}/callback",
+            self.api_url(),
+            interaction_id,
+            interaction_token
+        );
+
+        let _ = client.post(&url).json(&body).send().await;
+        Ok(())
+    }
 }
 
 fn sensitive_authorization_header(scheme: &str, token: &str) -> Result<HeaderValue> {
@@ -2142,6 +2174,52 @@ impl PlatformAdapter for DiscordAdapter {
         Ok(())
     }
 
+    async fn send_message_tracked(&self, message: OutgoingMessage) -> Result<Option<String>> {
+        let client = reqwest::Client::new();
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::MissingConfig {
+                key: "discord_token".to_string(),
+            })?;
+
+        let body = serde_json::json!({
+            "content": message.content,
+        });
+
+        let url = format!(
+            "{}/channels/{}/messages",
+            self.api_url(),
+            message.channel_id
+        );
+
+        let response = client
+            .post(&url)
+            .header(
+                "Authorization",
+                sensitive_authorization_header("Bot", token)?,
+            )
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(crate::error::Error::Agent(format!(
+                "Discord sendMessage failed with status {}",
+                response.status()
+            )));
+        }
+
+        let resp_json: serde_json::Value = response.json().await.unwrap_or_default();
+        let message_id = resp_json
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(|s| s.to_string());
+
+        Ok(message_id)
+    }
+
     async fn handle_update(&self, update: serde_json::Value) -> Result<Option<IncomingMessage>> {
         // Parse Discord message create event
         let d = match update.get("d") {
@@ -2186,6 +2264,246 @@ impl PlatformAdapter for DiscordAdapter {
             )
             .with_raw(update),
         ))
+    }
+
+    async fn edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        message: OutgoingMessage,
+    ) -> Result<()> {
+        let client = reqwest::Client::new();
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::MissingConfig {
+                key: "discord_token".to_string(),
+            })?;
+
+        let body = serde_json::json!({
+            "content": message.content,
+        });
+
+        let url = format!(
+            "{}/channels/{}/messages/{}",
+            self.api_url(),
+            channel_id,
+            message_id
+        );
+
+        let response = client
+            .patch(&url)
+            .header(
+                "Authorization",
+                sensitive_authorization_header("Bot", token)?,
+            )
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(crate::error::Error::Agent(format!(
+                "Discord editMessage failed with status {}",
+                response.status()
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn handle_callback_query(&self, update: serde_json::Value) -> Result<()> {
+        // Discord interaction shape: type 3 is MESSAGE_COMPONENT (button click)
+        // Can be wrapped in gateway dispatch event {"t": "INTERACTION_CREATE", "d": {...}} or raw interaction {...}
+        let d = if let Some(d) = update.get("d") {
+            d
+        } else {
+            &update
+        };
+
+        let interaction_type = d.get("type").and_then(|v| v.as_i64()).unwrap_or(0);
+        if interaction_type != 3 {
+            return Ok(());
+        }
+
+        let interaction_id = d
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let interaction_token = d
+            .get("token")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let data = match d.get("data") {
+            Some(data) => data,
+            None => return Ok(()),
+        };
+
+        let custom_id = data
+            .get("custom_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        let channel_id = d
+            .get("channel_id")
+            .and_then(|v| v.as_str())
+            .map(|id| format!("discord:{}", id));
+
+        // Button custom_id payloads: "approve:<id>", "session:<id>", "always:<id>", "reject:<id>" (and legacy "deny:<id>", "once:<id>").
+        let (choice, id_str) = match custom_id.split_once(':') {
+            Some(("approve", id)) | Some(("once", id)) => {
+                (crate::approval::ApprovalChoice::AllowOnce, id)
+            }
+            Some(("session", id)) => (crate::approval::ApprovalChoice::Session, id),
+            Some(("always", id)) => (crate::approval::ApprovalChoice::AlwaysAllow, id),
+            Some(("reject", id)) | Some(("deny", id)) => {
+                (crate::approval::ApprovalChoice::Reject, id)
+            }
+            _ => {
+                if !interaction_id.is_empty() && !interaction_token.is_empty() {
+                    let _ = self
+                        .respond_interaction(&interaction_id, &interaction_token, "Unknown action")
+                        .await;
+                }
+                return Ok(());
+            }
+        };
+
+        let id: u64 = match id_str.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                if !interaction_id.is_empty() && !interaction_token.is_empty() {
+                    let _ = self
+                        .respond_interaction(
+                            &interaction_id,
+                            &interaction_token,
+                            "Malformed request id",
+                        )
+                        .await;
+                }
+                return Ok(());
+            }
+        };
+
+        let resolved = resolve_pending_approval(id, choice, channel_id.as_deref());
+        let feedback = if !resolved {
+            "This request already expired."
+        } else {
+            match choice {
+                crate::approval::ApprovalChoice::AllowOnce => "✅ Allowed once",
+                crate::approval::ApprovalChoice::Session => "⏳ Allowed for this session",
+                crate::approval::ApprovalChoice::AlwaysAllow => "🔒 Always allowed (persisted)",
+                crate::approval::ApprovalChoice::Reject => "❌ Rejected",
+            }
+        };
+
+        if !interaction_id.is_empty() && !interaction_token.is_empty() {
+            let _ = self
+                .respond_interaction(&interaction_id, &interaction_token, feedback)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    async fn send_approval_prompt(
+        &self,
+        channel_id: &str,
+        tool_name: &str,
+        arguments_preview: &str,
+    ) -> Result<(
+        u64,
+        tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>,
+    )> {
+        let (id, rx) = register_pending_approval(tool_name, arguments_preview);
+
+        let preview: String = arguments_preview.chars().take(200).collect();
+        let text = format!(
+            "🔐 Tool approval required\n\nTool: {}\nArgs: {}\n\nChoose permission:",
+            tool_name,
+            if preview.is_empty() {
+                "(none)"
+            } else {
+                &preview
+            }
+        );
+
+        let body = serde_json::json!({
+            "content": text,
+            "components": [
+                {
+                    "type": 1, // Action Row
+                    "components": [
+                        {
+                            "type": 2, // Button
+                            "style": 3, // Success / Green
+                            "label": "Allow Once",
+                            "custom_id": format!("approve:{}", id)
+                        },
+                        {
+                            "type": 2, // Button
+                            "style": 1, // Primary / Blurple
+                            "label": "Session",
+                            "custom_id": format!("session:{}", id)
+                        },
+                        {
+                            "type": 2, // Button
+                            "style": 2, // Secondary / Grey
+                            "label": "Always Allow",
+                            "custom_id": format!("always:{}", id)
+                        },
+                        {
+                            "type": 2, // Button
+                            "style": 4, // Danger / Red
+                            "label": "Reject",
+                            "custom_id": format!("reject:{}", id)
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let client = reqwest::Client::new();
+        let token = match self.token.as_ref() {
+            Some(t) => t,
+            None => {
+                drop_pending_approval(id);
+                return Err(crate::error::Error::MissingConfig {
+                    key: "discord_token".to_string(),
+                });
+            }
+        };
+
+        let url = format!("{}/channels/{}/messages", self.api_url(), channel_id);
+
+        let res = client
+            .post(&url)
+            .header(
+                "Authorization",
+                sensitive_authorization_header("Bot", token)?,
+            )
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await;
+
+        match res {
+            Ok(resp) if resp.status().is_success() => Ok((id, rx)),
+            Ok(resp) => {
+                drop_pending_approval(id);
+                Err(crate::error::Error::Agent(format!(
+                    "Discord send_approval_prompt failed with status {}",
+                    resp.status()
+                )))
+            }
+            Err(e) => {
+                drop_pending_approval(id);
+                Err(crate::error::Error::Agent(e.to_string()))
+            }
+        }
     }
 
     fn config_json(&self) -> serde_json::Value {
@@ -3296,6 +3614,69 @@ mod tests {
     async fn test_discord_adapter_disabled() {
         let adapter = DiscordAdapter::new(None);
         assert!(!adapter.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn discord_approval_flow_resolves_receiver() {
+        let adapter = DiscordAdapter::new(Some("test-token".to_string()));
+        let (id, rx) = register_pending_approval("execute_command", "rm -rf /tmp/test");
+
+        // Simulate Discord interaction webhook / event
+        let interaction_update = serde_json::json!({
+            "type": 3,
+            "id": "interaction_123",
+            "token": "token_abc",
+            "channel_id": "987654321",
+            "data": {
+                "custom_id": format!("approve:{}", id),
+                "component_type": 2
+            }
+        });
+
+        adapter
+            .handle_callback_query(interaction_update)
+            .await
+            .expect("handle interaction callback");
+
+        let choice = rx.await.expect("receive approval choice");
+        assert_eq!(choice, crate::approval::ApprovalChoice::AllowOnce);
+    }
+
+    #[tokio::test]
+    async fn discord_approval_reject_flow_resolves_receiver() {
+        let adapter = DiscordAdapter::new(Some("test-token".to_string()));
+        let (id, rx) = register_pending_approval("execute_command", "rm -rf /tmp/test");
+
+        let interaction_update = serde_json::json!({
+            "d": {
+                "type": 3,
+                "id": "interaction_123",
+                "token": "token_abc",
+                "channel_id": "987654321",
+                "data": {
+                    "custom_id": format!("reject:{}", id),
+                    "component_type": 2
+                }
+            }
+        });
+
+        adapter
+            .handle_callback_query(interaction_update)
+            .await
+            .expect("handle interaction callback");
+
+        let choice = rx.await.expect("receive approval choice");
+        assert_eq!(choice, crate::approval::ApprovalChoice::Reject);
+    }
+
+    #[tokio::test]
+    async fn discord_send_approval_prompt_fails_closed_without_token() {
+        let adapter = DiscordAdapter::new(None);
+        let result = adapter
+            .send_approval_prompt("channel_123", "bash", "echo hi")
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]

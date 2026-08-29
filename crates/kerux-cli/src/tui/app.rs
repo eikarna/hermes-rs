@@ -618,8 +618,16 @@ impl TuiApp {
     }
 
     async fn refresh_mcp(&mut self) -> Result<()> {
+        if self.state.persistent.config.mcp.autoload {
+            let _ = self.mcp_manager.auto_discover_and_connect().await;
+        }
+
         let mut items = Vec::new();
+        let mut processed_names = std::collections::HashSet::new();
+
+        // 1. Configured servers in config.mcp.servers
         for server in &self.state.persistent.config.mcp.servers {
+            processed_names.insert(server.name.clone());
             let connected = match self.mcp_manager.get(&server.name) {
                 Some(transport) => transport.is_connected().await,
                 None => false,
@@ -641,6 +649,31 @@ impl TuiApp {
                 tool_count,
             });
         }
+
+        // 2. Active servers from McpManager (including auto-discovered ones) not in config.mcp.servers
+        for (name, transport) in self.mcp_manager.servers() {
+            if !processed_names.contains(name) {
+                let connected = transport.is_connected().await;
+                let tool_count = if connected {
+                    transport.get_tools().await.len()
+                } else {
+                    0
+                };
+                let transport_kind = match transport {
+                    kerux_core::mcp::McpTransport::Http(_) => McpTransportKind::Http,
+                    kerux_core::mcp::McpTransport::Stdio(_) => McpTransportKind::Stdio,
+                };
+                items.push(McpServerItem {
+                    name: name.clone(),
+                    transport: transport_kind,
+                    endpoint: "auto-discovered".to_string(),
+                    enabled: true,
+                    connected,
+                    tool_count,
+                });
+            }
+        }
+
         self.state.reduce(Action::SyncMcp(items));
         Ok(())
     }

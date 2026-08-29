@@ -3,6 +3,7 @@
 mod autonomous;
 mod runs;
 mod screenshot;
+mod session;
 mod tui;
 mod wizard;
 
@@ -113,6 +114,9 @@ enum Commands {
     Chat {
         #[arg(short, long)]
         system: Option<String>,
+        /// Session ID to resume or save into (defaults to 'cli:default').
+        #[arg(long)]
+        session: Option<String>,
     },
     Serve {
         #[arg(short, long)]
@@ -140,6 +144,11 @@ enum Commands {
     Runs {
         #[command(subcommand)]
         command: runs::RunsCommands,
+    },
+    /// Manage and export conversation sessions.
+    Session {
+        #[command(subcommand)]
+        command: session::SessionCommands,
     },
     /// Interactive setup: provider, API key, model picker, fallback, smoke test.
     #[command(alias = "onboarding")]
@@ -582,10 +591,16 @@ pub(crate) async fn build_registry(
     registry.register(CalculatorTool::new()).await?;
 
     if config.mcp.autoload {
+        // First connect to explicitly configured servers
         for server in config.mcp.servers.iter().filter(|server| server.enabled) {
             if mcp_manager.get(&server.name).is_none() {
                 connect_mcp_server(mcp_manager, server).await?;
             }
+        }
+
+        // Auto-discover servers from ~/.kerux/mcp.json and Claude Desktop config
+        if let Err(e) = mcp_manager.auto_discover_and_connect().await {
+            tracing::warn!(error = %e, "MCP auto-discovery encountered an issue");
         }
 
         for tool in mcp_manager.get_all_tools().await {
@@ -722,9 +737,39 @@ async fn run_non_tui(config: &AppConfig, system_prompt: Option<&str>, query: &st
     Ok(())
 }
 
-async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result<()> {
+async fn chat_non_tui(
+    config: &AppConfig,
+    system_prompt: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<()> {
     let mut mcp_manager = McpManager::new();
     let agent = create_agent_without_events(config, system_prompt, &mut mcp_manager).await?;
+
+    let channel_key = session_id.unwrap_or("cli:default");
+    let store = kerux_core::session_store::SessionStore::new(
+        kerux_core::session_store::SessionStore::default_dir(),
+    );
+    let session_data = store.load(channel_key);
+
+    if !session_data.messages.is_empty() {
+        println!(
+            "Loaded {} message(s) from session '{}'.",
+            session_data.messages.len(),
+            channel_key
+        );
+        if let Some(summary) = &session_data.summary {
+            agent
+                .add_message(kerux_core::client::Message::system(format!(
+                    "{}\n{}",
+                    kerux_core::agent::CONTEXT_SUMMARY_MARKER,
+                    summary
+                )))
+                .await;
+        }
+        for msg in &session_data.messages {
+            agent.add_message(msg.clone()).await;
+        }
+    }
 
     loop {
         print!("You: ");
@@ -737,16 +782,23 @@ async fn chat_non_tui(config: &AppConfig, system_prompt: Option<&str>) -> Result
             continue;
         }
         if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
+            let history = agent.conversation().await;
+            let _ = store.save(channel_key, session_data.summary.as_deref(), &history);
             break;
         }
         if input.eq_ignore_ascii_case("clear") {
             agent.clear_history().await;
+            store.clear(channel_key);
             println!("Conversation cleared.");
             continue;
         }
 
         match agent.run(input.to_string()).await {
-            Ok(response) => println!("Assistant: {}\n", response.content),
+            Ok(response) => {
+                println!("Assistant: {}\n", response.content);
+                let history = agent.conversation().await;
+                let _ = store.save(channel_key, session_data.summary.as_deref(), &history);
+            }
             Err(error) => eprintln!("Error: {}\n", error),
         }
     }
@@ -2170,6 +2222,9 @@ async fn main() -> Result<()> {
                 | Commands::Chat { .. }
                 | Commands::Serve { .. }
                 | Commands::Autonomous { .. }
+                | Commands::Session {
+                    command: session::SessionCommands::Resume { .. },
+                }
         )
     {
         println!("No config file found — launching the setup wizard.");
@@ -2219,14 +2274,14 @@ async fn main() -> Result<()> {
                 run_non_tui(&loaded.config, system.as_deref(), query).await?;
             }
         }
-        Commands::Chat { system } => {
+        Commands::Chat { system, session } => {
             if loaded.config.tui.rich_output {
                 TuiApp::enter(loaded.config.clone(), system.clone(), LaunchMode::Landing)
                     .await?
                     .run()
                     .await?;
             } else {
-                chat_non_tui(&loaded.config, system.as_deref()).await?;
+                chat_non_tui(&loaded.config, system.as_deref(), session.as_deref()).await?;
             }
         }
         Commands::Serve { system } => {
@@ -2273,6 +2328,9 @@ async fn main() -> Result<()> {
         Commands::Runs { command } => {
             runs::handle(command)?;
         }
+        Commands::Session { command } => {
+            session::handle(&loaded.config, command, None).await?;
+        }
         Commands::Wizard => {
             wizard::run_wizard().await?;
         }
@@ -2295,6 +2353,31 @@ mod tests {
     #[test]
     fn validate_subcommand_parses() {
         assert!(Cli::try_parse_from(["kerux", "validate"]).is_ok());
+    }
+
+    #[test]
+    fn chat_subcommand_parses() {
+        assert!(Cli::try_parse_from(["kerux", "chat"]).is_ok());
+        assert!(Cli::try_parse_from(["kerux", "chat", "--session", "custom_session"]).is_ok());
+    }
+
+    #[test]
+    fn session_subcommand_parses() {
+        assert!(Cli::try_parse_from(["kerux", "session", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["kerux", "session", "resume", "test_id"]).is_ok());
+        assert!(Cli::try_parse_from(["kerux", "session", "resume", "test_id", "--cli"]).is_ok());
+        assert!(Cli::try_parse_from(["kerux", "session", "export", "test_id"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "kerux",
+            "session",
+            "export",
+            "test_id",
+            "--format",
+            "json",
+            "-o",
+            "test.json"
+        ])
+        .is_ok());
     }
 
     #[tokio::test]

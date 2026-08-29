@@ -1,12 +1,3 @@
-//! Per-channel session persistence.
-//!
-//! Stores conversation history as JSON files so the agent remembers context
-//! across gateway restarts. One file per channel key (`platform:channel_id`).
-//!
-//! This is the missing piece that made the bot "forget" everything after a
-//! restart: the in-memory `KeruxAgent.conversation` was the only history,
-//! and it died with the process.
-
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +21,23 @@ pub struct SessionData {
     pub summary: Option<String>,
     /// Recent messages (the live tail of the conversation).
     pub messages: Vec<Message>,
+}
+
+/// Metadata summary of a stored session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionInfo {
+    /// Unique session identifier (the channel key / sanitized file stem).
+    pub id: String,
+    /// Unix timestamp in seconds (derived from file modified time, or 0 if unavailable).
+    pub updated_at: u64,
+    /// Message count in the session.
+    pub message_count: usize,
+    /// Estimated total token count (estimated roughly ~4 chars per token).
+    pub estimated_tokens: usize,
+    /// Model used (if identifiable from messages, or fallback).
+    pub model: Option<String>,
+    /// Title or excerpt from the initial user query / summary.
+    pub title: String,
 }
 
 /// v2 on-disk representation.
@@ -56,6 +64,11 @@ impl SessionStore {
     /// Default location: `~/.kerux/sessions`.
     pub fn default_dir() -> PathBuf {
         crate::persist::data_dir("sessions")
+    }
+
+    /// Return the underlying storage directory.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
     }
 
     /// Map a channel key to a safe file path.
@@ -97,6 +110,77 @@ impl SessionStore {
                 SessionData::default()
             }
         }
+    }
+
+    /// List all sessions stored in the directory.
+    pub fn list(&self) -> Vec<SessionInfo> {
+        let mut result = Vec::new();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            Err(_) => return result,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let file_stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(stem) => stem.to_string(),
+                None => continue,
+            };
+
+            let metadata = std::fs::metadata(&path).ok();
+            let updated_at = metadata
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let session_data = self.load(&file_stem);
+            let message_count = session_data.messages.len();
+
+            let mut total_chars = 0;
+            let mut title = String::new();
+
+            for msg in &session_data.messages {
+                total_chars += msg.content.len();
+                if title.is_empty() && msg.role == crate::client::Role::User {
+                    let first_line = msg.content.lines().next().unwrap_or("").trim();
+                    if !first_line.is_empty() {
+                        title = first_line.chars().take(60).collect();
+                    }
+                }
+            }
+
+            if title.is_empty() {
+                if let Some(summary) = &session_data.summary {
+                    let first_line = summary.lines().next().unwrap_or("").trim();
+                    if !first_line.is_empty() {
+                        title = first_line.chars().take(60).collect();
+                    }
+                }
+            }
+
+            if title.is_empty() {
+                title = "(empty session)".to_string();
+            }
+
+            let estimated_tokens = total_chars.div_ceil(4);
+
+            result.push(SessionInfo {
+                id: file_stem,
+                updated_at,
+                message_count,
+                estimated_tokens,
+                model: None,
+                title,
+            });
+        }
+
+        // Sort newest first
+        result.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
+        result
     }
 
     /// Save history for a channel, capped to the last 200 messages.
@@ -267,5 +351,26 @@ mod tests {
             .save("telegram:-1001234567890", None, &[msg(Role::User, "x")])
             .unwrap();
         assert_eq!(store.load("telegram:-1001234567890").messages.len(), 1);
+    }
+
+    #[test]
+    fn list_sessions_orders_by_recency() {
+        let (store, _dir) = temp_store();
+        store
+            .save("session_a", None, &[msg(Role::User, "First question in A")])
+            .unwrap();
+        store
+            .save(
+                "session_b",
+                None,
+                &[msg(Role::User, "Second question in B")],
+            )
+            .unwrap();
+
+        let list = store.list();
+        assert_eq!(list.len(), 2);
+        let ids: Vec<_> = list.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"session_a"));
+        assert!(ids.contains(&"session_b"));
     }
 }

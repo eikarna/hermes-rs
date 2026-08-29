@@ -784,6 +784,252 @@ pub struct McpManager {
     servers: HashMap<String, McpTransport>,
 }
 
+/// Discovered MCP Server configuration from standard files (e.g. ~/.kerux/mcp.json or Claude Desktop config)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveredMcpServer {
+    pub name: String,
+    pub transport: String,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub url: Option<String>,
+    pub auth_token: Option<String>,
+    pub source: String,
+}
+
+/// JSON format used by Claude Desktop and standard MCP configs
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RawMcpConfigFile {
+    #[serde(default, rename = "mcpServers")]
+    pub mcp_servers: HashMap<String, RawMcpServerEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RawMcpServerEntry {
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default, rename = "authToken")]
+    pub auth_token: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub disabled: Option<bool>,
+}
+
+impl McpManager {
+    /// Discovers MCP server configurations from default files:
+    /// 1. ~/.kerux/mcp.json
+    /// 2. Claude Desktop config (%APPDATA%\Claude\claude_desktop_config.json on Windows,
+    ///    ~/Library/Application Support/Claude/claude_desktop_config.json on macOS,
+    ///    ~/.config/Claude/claude_desktop_config.json on Linux)
+    pub fn discover_configs() -> Vec<DiscoveredMcpServer> {
+        let mut discovered = Vec::new();
+
+        // 1. ~/.kerux/mcp.json
+        if let Some(home) = dirs::home_dir() {
+            let kerux_mcp_path = home.join(".kerux").join("mcp.json");
+            if kerux_mcp_path.is_file() {
+                discovered.extend(Self::parse_config_file(
+                    &kerux_mcp_path,
+                    "~/.kerux/mcp.json",
+                ));
+            }
+        }
+
+        // 2. Claude Desktop config
+        for claude_path in Self::claude_desktop_config_paths() {
+            if claude_path.is_file() {
+                let source_label = claude_path.to_string_lossy().to_string();
+                discovered.extend(Self::parse_config_file(&claude_path, &source_label));
+                break;
+            }
+        }
+
+        discovered
+    }
+
+    /// Candidate paths for Claude Desktop configuration across platforms
+    pub fn claude_desktop_config_paths() -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(app_data) = dirs::config_dir() {
+                // dirs::config_dir() returns %APPDATA% on Windows (e.g. C:\Users\<User>\AppData\Roaming)
+                paths.push(app_data.join("Claude").join("claude_desktop_config.json"));
+            }
+            if let Ok(appdata_env) = std::env::var("APPDATA") {
+                let p = std::path::PathBuf::from(appdata_env)
+                    .join("Claude")
+                    .join("claude_desktop_config.json");
+                if !paths.contains(&p) {
+                    paths.push(p);
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(home) = dirs::home_dir() {
+                paths.push(
+                    home.join("Library")
+                        .join("Application Support")
+                        .join("Claude")
+                        .join("claude_desktop_config.json"),
+                );
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(config_dir) = dirs::config_dir() {
+                paths.push(config_dir.join("Claude").join("claude_desktop_config.json"));
+            }
+            if let Some(home) = dirs::home_dir() {
+                paths.push(
+                    home.join(".config")
+                        .join("Claude")
+                        .join("claude_desktop_config.json"),
+                );
+            }
+        }
+
+        // Fallback for general platforms or if OS-specific check missed
+        if let Some(home) = dirs::home_dir() {
+            let win_path = home
+                .join("AppData")
+                .join("Roaming")
+                .join("Claude")
+                .join("claude_desktop_config.json");
+            if !paths.contains(&win_path) {
+                paths.push(win_path);
+            }
+            let mac_path = home
+                .join("Library")
+                .join("Application Support")
+                .join("Claude")
+                .join("claude_desktop_config.json");
+            if !paths.contains(&mac_path) {
+                paths.push(mac_path);
+            }
+            let linux_path = home
+                .join(".config")
+                .join("Claude")
+                .join("claude_desktop_config.json");
+            if !paths.contains(&linux_path) {
+                paths.push(linux_path);
+            }
+        }
+
+        paths
+    }
+
+    /// Parses a JSON config file containing `mcpServers`
+    pub fn parse_config_file(
+        path: &std::path::Path,
+        source_label: &str,
+    ) -> Vec<DiscoveredMcpServer> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "Failed to read MCP config file");
+                return Vec::new();
+            }
+        };
+
+        Self::parse_config_str(&content, source_label)
+    }
+
+    /// Parses a raw JSON string containing `mcpServers`
+    pub fn parse_config_str(content: &str, source_label: &str) -> Vec<DiscoveredMcpServer> {
+        let parsed: RawMcpConfigFile = match serde_json::from_str(content) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(error = %e, source = %source_label, "Failed to parse JSON MCP config");
+                return Vec::new();
+            }
+        };
+
+        let mut servers = Vec::new();
+        for (name, entry) in parsed.mcp_servers {
+            if entry.disabled.unwrap_or(false) {
+                continue;
+            }
+
+            // Determine transport: stdio vs sse/http
+            let transport = entry.transport.clone().unwrap_or_else(|| {
+                if entry.url.is_some() {
+                    "http".to_string()
+                } else {
+                    "stdio".to_string()
+                }
+            });
+
+            servers.push(DiscoveredMcpServer {
+                name,
+                transport,
+                command: entry.command,
+                args: entry.args,
+                env: entry.env,
+                url: entry.url,
+                auth_token: entry.auth_token,
+                source: source_label.to_string(),
+            });
+        }
+
+        servers
+    }
+
+    /// Auto-discovers and connects to all discovered MCP servers (stdio and http/sse)
+    pub async fn auto_discover_and_connect(&mut self) -> Result<Vec<DiscoveredMcpServer>> {
+        let discovered = Self::discover_configs();
+        for s in &discovered {
+            // Only connect if not already present
+            if self.servers.contains_key(&s.name) {
+                continue;
+            }
+
+            let transport_norm = s.transport.to_ascii_lowercase();
+            if transport_norm == "stdio" {
+                if let Some(cmd) = &s.command {
+                    if let Err(e) = self
+                        .add_stdio_server(
+                            s.name.clone(),
+                            cmd.clone(),
+                            s.args.clone(),
+                            s.env.clone(),
+                        )
+                        .await
+                    {
+                        warn!(server = %s.name, error = %e, "Failed to connect to discovered stdio MCP server");
+                    } else {
+                        info!(server = %s.name, source = %s.source, "Connected to discovered stdio MCP server");
+                    }
+                }
+            } else if transport_norm == "http" || transport_norm == "sse" {
+                if let Some(url) = &s.url {
+                    if let Err(e) = self
+                        .add_server(s.name.clone(), url.clone(), s.auth_token.clone())
+                        .await
+                    {
+                        warn!(server = %s.name, error = %e, "Failed to connect to discovered HTTP/SSE MCP server");
+                    } else {
+                        info!(server = %s.name, source = %s.source, "Connected to discovered HTTP/SSE MCP server");
+                    }
+                }
+            }
+        }
+
+        Ok(discovered)
+    }
+}
+
 impl McpManager {
     /// Create a new MCP manager
     pub fn new() -> Self {
@@ -1183,5 +1429,54 @@ for line in sys.stdin:
         .unwrap();
 
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn test_parse_mcp_config_json() {
+        let sample = r#"{
+            "mcpServers": {
+                "fetch": {
+                    "command": "uvx",
+                    "args": ["mcp-server-fetch"],
+                    "env": {"DEBUG": "1"}
+                },
+                "remote_api": {
+                    "url": "https://mcp.example.com/sse",
+                    "authToken": "secret-token",
+                    "transport": "sse"
+                },
+                "disabled_server": {
+                    "command": "node",
+                    "args": ["server.js"],
+                    "disabled": true
+                }
+            }
+        }"#;
+
+        let servers = McpManager::parse_config_str(sample, "test-config");
+        assert_eq!(servers.len(), 2);
+
+        let fetch = servers.iter().find(|s| s.name == "fetch").unwrap();
+        assert_eq!(fetch.transport, "stdio");
+        assert_eq!(fetch.command.as_deref(), Some("uvx"));
+        assert_eq!(fetch.args, vec!["mcp-server-fetch".to_string()]);
+        assert_eq!(fetch.env.get("DEBUG").map(|s| s.as_str()), Some("1"));
+        assert_eq!(fetch.source, "test-config");
+
+        let remote = servers.iter().find(|s| s.name == "remote_api").unwrap();
+        assert_eq!(remote.transport, "sse");
+        assert_eq!(remote.url.as_deref(), Some("https://mcp.example.com/sse"));
+        assert_eq!(remote.auth_token.as_deref(), Some("secret-token"));
+
+        assert!(servers.iter().all(|s| s.name != "disabled_server"));
+    }
+
+    #[test]
+    fn test_claude_desktop_paths() {
+        let paths = McpManager::claude_desktop_config_paths();
+        assert!(!paths.is_empty());
+        for p in &paths {
+            assert!(p.to_string_lossy().contains("claude_desktop_config.json"));
+        }
     }
 }
