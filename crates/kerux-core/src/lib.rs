@@ -80,6 +80,7 @@ pub mod repomap;
 pub mod run_journal;
 pub mod scheduler;
 pub mod schema;
+pub mod security_guard;
 pub mod session_store;
 pub mod skills;
 pub mod taste;

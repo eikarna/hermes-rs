@@ -2037,6 +2037,23 @@ impl KeruxAgent {
                 continue;
             }
 
+            // Evaluasi Security Guard sebelum eksekusi (menolak prompt injection upstream / malware / keyloggers)
+            let sec_check = crate::security_guard::inspect_payload(&name, &args_str);
+            if sec_check.blocked {
+                let reason = sec_check.reason.unwrap_or_else(|| "Blocked by security mechanism".to_string());
+                warn!(tool = %name, reason = %reason, "Tool execution hard-blocked by security guard");
+                results.push(ToolResult::error(&tool_call.id, &reason));
+                let _ = self.record_edit_outcome(
+                    &tool_call.id,
+                    &name,
+                    &args_str,
+                    "blocked",
+                    crate::edit_metrics::EditApplyStatus::Denied,
+                    None,
+                );
+                continue;
+            }
+
             // Human approval gate for dangerous tools. The gate (installed
             // per-run by the gateway) presents the request and blocks until
             // the human decides or the gate's own timeout auto-denies.
