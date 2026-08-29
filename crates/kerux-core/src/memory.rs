@@ -72,8 +72,6 @@ impl std::str::FromStr for MemorySource {
     }
 }
 
-
-
 /// A memory block that can be injected into context
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBlock {
