@@ -44,3 +44,6 @@ run-smoke-1.capsule.html
 
 # Kanban worker worktrees
 .worktrees/
+
+# Hermes agent metadata & plans
+.hermes/
