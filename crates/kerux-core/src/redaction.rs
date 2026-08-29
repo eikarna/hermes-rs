@@ -30,6 +30,11 @@ pub fn redact_text(text: &str) -> String {
         .into_owned()
 }
 
+/// Check if text contains well-known credential shapes or bearer tokens.
+pub fn contains_credentials(text: &str) -> bool {
+    BEARER_RE.is_match(text) || PREFIXED_KEY_RE.is_match(text)
+}
+
 /// Return a recursively redacted clone of a JSON value.
 ///
 /// The input is borrowed and remains unchanged.

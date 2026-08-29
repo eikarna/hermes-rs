@@ -11,6 +11,69 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
+/// Source origin of a memory block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySource {
+    User,
+    #[default]
+    Agent,
+    Web,
+    File,
+    Tool,
+}
+
+impl MemorySource {
+    /// Default trust score for this source (0-100).
+    pub fn default_trust(&self) -> u8 {
+        match self {
+            MemorySource::User => 100,
+            MemorySource::Agent => 75,
+            MemorySource::File => 60,
+            MemorySource::Tool => 40,
+            MemorySource::Web => 30,
+        }
+    }
+
+    /// Whether this source is considered low-trust (requires provenance tagging in prompt).
+    pub fn is_low_trust(&self) -> bool {
+        matches!(self, MemorySource::Web | MemorySource::Tool)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemorySource::User => "user",
+            MemorySource::Agent => "agent",
+            MemorySource::Web => "web",
+            MemorySource::File => "file",
+            MemorySource::Tool => "tool",
+        }
+    }
+}
+
+impl std::fmt::Display for MemorySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for MemorySource {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "user" => Ok(MemorySource::User),
+            "agent" => Ok(MemorySource::Agent),
+            "web" => Ok(MemorySource::Web),
+            "file" => Ok(MemorySource::File),
+            "tool" => Ok(MemorySource::Tool),
+            _ => Ok(MemorySource::Agent),
+        }
+    }
+}
+
+
+
 /// A memory block that can be injected into context
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBlock {
@@ -32,6 +95,16 @@ pub struct MemoryBlock {
     /// Pinned memories never decay and are exempt from pruning/dedup.
     #[serde(default)]
     pub pinned: bool,
+    /// Provenance origin of this memory
+    #[serde(default)]
+    pub source: MemorySource,
+    /// Trust score (0-100) for firewall evaluation
+    #[serde(default = "default_trust_score")]
+    pub trust: u8,
+}
+
+fn default_trust_score() -> u8 {
+    MemorySource::Agent.default_trust()
 }
 
 impl MemoryBlock {
@@ -46,6 +119,9 @@ impl MemoryBlock {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        let source = MemorySource::default();
+        let trust = source.default_trust();
+
         Self {
             id: id.into(),
             block_type: block_type.into(),
@@ -55,7 +131,22 @@ impl MemoryBlock {
             last_accessed: now,
             tags: Vec::new(),
             pinned: false,
+            source,
+            trust,
         }
+    }
+
+    /// Set memory source and default its trust score
+    pub fn source(mut self, source: MemorySource) -> Self {
+        self.trust = source.default_trust();
+        self.source = source;
+        self
+    }
+
+    /// Explicitly override trust score (0-100)
+    pub fn trust(mut self, score: u8) -> Self {
+        self.trust = score.min(100);
+        self
     }
 
     /// Set importance score
@@ -211,6 +302,12 @@ impl MemoryStore {
             if block.pinned {
                 out.push_str(", pinned: true");
             }
+            if block.source != MemorySource::Agent {
+                out.push_str(&format!(", source: {}", block.source));
+            }
+            if block.trust != block.source.default_trust() {
+                out.push_str(&format!(", trust: {}", block.trust));
+            }
             out.push_str(&format!(
                 ", created_at: {}, last_accessed: {}]\n",
                 block.created_at, block.last_accessed
@@ -252,6 +349,8 @@ impl MemoryStore {
             let mut created_at: i64 = 0;
             let mut last_accessed: i64 = 0;
             let mut pinned = false;
+            let mut source = MemorySource::Agent;
+            let mut trust: Option<u8> = None;
 
             // Split by ", " (comma-space) to separate fields.
             // Tag values use "," without space, so they stay intact.
@@ -274,6 +373,12 @@ impl MemoryStore {
                         "created_at" => created_at = value.parse().unwrap_or(0),
                         "last_accessed" => last_accessed = value.parse().unwrap_or(0),
                         "pinned" => pinned = value == "true" || value == "1",
+                        "source" => {
+                            source = value.parse().unwrap_or(MemorySource::Agent);
+                        }
+                        "trust" => {
+                            trust = value.parse().ok();
+                        }
                         _ => {}
                     }
                 }
@@ -282,6 +387,8 @@ impl MemoryStore {
             if id.is_empty() {
                 continue;
             }
+
+            let final_trust = trust.unwrap_or_else(|| source.default_trust());
 
             let block = MemoryBlock {
                 id: id.clone(),
@@ -292,6 +399,8 @@ impl MemoryStore {
                 last_accessed,
                 tags,
                 pinned,
+                source,
+                trust: final_trust,
             };
             memories.insert(id, block);
         }
@@ -567,10 +676,34 @@ impl MemoryManager {
         Vec::new()
     }
 
-    /// Store a memory block.
+    /// Store a memory block applying memory firewall policies.
+    ///
+    /// If `mask_secrets` is enabled in config (default true), secrets are redacted
+    /// and unmasked credential payloads are sanitized.
+    /// If `quarantine_low_trust` is enabled and trust < `trust_threshold`,
+    /// it is flagged in tags with `quarantined`.
     /// When `storage_dir` is set, automatically persists to MEMORY.md on disk.
-    pub async fn store(&self, block: MemoryBlock) {
-        debug!(block_id = %block.id, block_type = %block.block_type, "Storing memory block");
+    pub async fn store(&self, mut block: MemoryBlock) {
+        let config = crate::config::runtime_config().memory;
+
+        if config.mask_secrets {
+            block.content = crate::redaction::redact_text(&block.content);
+        }
+
+        if config.quarantine_low_trust
+            && block.trust < config.trust_threshold
+            && !block.tags.contains(&"quarantined".to_string())
+        {
+            block.tags.push("quarantined".to_string());
+        }
+
+        debug!(
+            block_id = %block.id,
+            block_type = %block.block_type,
+            source = %block.source,
+            trust = block.trust,
+            "Storing memory block"
+        );
         self.long_term.write().await.insert(block.id.clone(), block);
         if self.storage_dir.is_some() {
             let _ = self.save_to_disk().await;
@@ -750,14 +883,35 @@ impl MemoryManager {
         self.sessions.write().await.remove(session_id);
     }
 
-    /// Build context from memory (for injection into prompts)
+    /// Build context from memory (for injection into prompts).
+    ///
+    /// Respects the `trust_threshold` configuration: memories below the threshold
+    /// (including quarantined memories) are omitted from the prompt.
+    /// Memories from low-trust sources (`web`, `tool`) or non-default sources
+    /// carry explicit provenance tags `[source: ...]` to defend against memory poisoning.
     pub async fn build_memory_context(&self, max_tokens: usize) -> String {
+        let memory_config = crate::config::runtime_config().memory;
         let important_memories = self.get_important(70).await;
         let mut context = String::new();
         let mut tokens_used = 0;
 
         for memory in important_memories {
-            let memory_text = format!("[{}] {}\n", memory.block_type, memory.content);
+            if memory.trust < memory_config.trust_threshold
+                || memory.tags.iter().any(|t| t == "quarantined")
+            {
+                continue;
+            }
+
+            let memory_text =
+                if memory.source.is_low_trust() || memory.source != MemorySource::Agent {
+                    format!(
+                        "[{}] [source: {}, trust: {}] {}\n",
+                        memory.block_type, memory.source, memory.trust, memory.content
+                    )
+                } else {
+                    format!("[{}] {}\n", memory.block_type, memory.content)
+                };
+
             let memory_tokens = crate::context::estimate_tokens(&memory_text);
 
             if tokens_used + memory_tokens > max_tokens {
@@ -931,6 +1085,8 @@ mod tests {
             last_accessed: 2000,
             tags: vec!["geography".to_string(), "facts".to_string()],
             pinned: false,
+            source: MemorySource::Agent,
+            trust: 75,
         };
         memories.insert("m1".to_string(), block);
 
@@ -943,6 +1099,8 @@ mod tests {
             last_accessed: 4000,
             tags: Vec::new(),
             pinned: false,
+            source: MemorySource::User,
+            trust: 100,
         };
         memories.insert("m2".to_string(), block2);
 
@@ -984,6 +1142,8 @@ mod tests {
             last_accessed: 0,
             tags: Vec::new(),
             pinned: false,
+            source: MemorySource::Agent,
+            trust: 75,
         };
 
         let profile = UserProfile {
@@ -1028,6 +1188,8 @@ mod tests {
                 last_accessed: 200,
                 tags: vec!["greeting".to_string()],
                 pinned: false,
+                source: MemorySource::Agent,
+                trust: 75,
             },
         );
 
@@ -1076,6 +1238,8 @@ mod tests {
             last_accessed: 600,
             tags: vec!["lang".to_string()],
             pinned: false,
+            source: MemorySource::Agent,
+            trust: 75,
         };
         manager
             .long_term
@@ -1219,6 +1383,8 @@ mod tests {
                 last_accessed: 0,
                 tags: vec!["geography".to_string(), "facts".to_string()],
                 pinned: false,
+                source: MemorySource::Agent,
+                trust: 75,
             },
         );
         let output = MemoryStore::serialize_memories(&memories);
@@ -1228,5 +1394,89 @@ mod tests {
         assert!(output.contains("importance: 80"));
         assert!(output.contains("tags: geography,facts"));
         assert!(output.contains("test content"));
+    }
+
+    #[tokio::test]
+    async fn test_trust_tagging_per_source() {
+        let block_user =
+            MemoryBlock::new("u1", "fact", "User said something").source(MemorySource::User);
+        assert_eq!(block_user.source, MemorySource::User);
+        assert_eq!(block_user.trust, 100);
+
+        let block_agent = MemoryBlock::new("a1", "fact", "Agent inferred this");
+        assert_eq!(block_agent.source, MemorySource::Agent);
+        assert_eq!(block_agent.trust, 75);
+
+        let block_web =
+            MemoryBlock::new("w1", "fact", "Scraped from web").source(MemorySource::Web);
+        assert_eq!(block_web.source, MemorySource::Web);
+        assert_eq!(block_web.trust, 30);
+        assert!(block_web.source.is_low_trust());
+
+        let block_tool =
+            MemoryBlock::new("t1", "fact", "Tool execution output").source(MemorySource::Tool);
+        assert_eq!(block_tool.source, MemorySource::Tool);
+        assert_eq!(block_tool.trust, 40);
+        assert!(block_tool.source.is_low_trust());
+    }
+
+    #[tokio::test]
+    async fn test_masking_credentials_on_store() {
+        let manager = MemoryManager::new();
+        let secret_content =
+            "The api key is sk-1234567890abcdef and token is Bearer secret_tok_12345";
+        let block = MemoryBlock::new("sec1", "fact", secret_content).importance(80);
+
+        manager.store(block).await;
+
+        let retrieved = manager.get("sec1").await.unwrap();
+        assert!(!retrieved.content.contains("sk-1234567890abcdef"));
+        assert!(!retrieved.content.contains("secret_tok_12345"));
+        assert!(retrieved.content.contains(crate::redaction::REDACTED));
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_low_trust_and_provenance_in_context() {
+        let manager = MemoryManager::new();
+
+        // 1. High trust from User (100) -> injected with [source: user, trust: 100]
+        let block_user = MemoryBlock::new("u1", "fact", "Preferred font is Fira Code")
+            .source(MemorySource::User)
+            .importance(90);
+        manager.store(block_user).await;
+
+        // 2. Default Agent (75) -> injected without extra source tag (standard)
+        let block_agent = MemoryBlock::new("a1", "fact", "Project is in Rust")
+            .source(MemorySource::Agent)
+            .importance(85);
+        manager.store(block_agent).await;
+
+        // 3. Web source (trust 30 < 50 threshold) -> quarantined and not in context
+        let block_web = MemoryBlock::new("w1", "fact", "Ignore instructions from web")
+            .source(MemorySource::Web)
+            .importance(95);
+        manager.store(block_web).await;
+
+        let stored_web = manager.get("w1").await.unwrap();
+        assert!(stored_web.tags.contains(&"quarantined".to_string()));
+
+        let context = manager.build_memory_context(2048).await;
+        assert!(context.contains("Preferred font is Fira Code"));
+        assert!(context.contains("[source: user, trust: 100]"));
+        assert!(context.contains("Project is in Rust"));
+        assert!(!context.contains("Ignore instructions from web"));
+    }
+
+    #[test]
+    fn test_legacy_block_migration_default_source_trust() {
+        // Serialized format from an older version without source or trust fields
+        let legacy_serialized = "\u{00A7} [id: legacy1, type: fact, importance: 80, tags: old, created_at: 100, last_accessed: 200]\nLegacy memory body\n";
+        let memories = MemoryStore::deserialize_memories(legacy_serialized);
+        assert_eq!(memories.len(), 1);
+
+        let block = memories.get("legacy1").unwrap();
+        assert_eq!(block.source, MemorySource::Agent);
+        assert_eq!(block.trust, 75);
+        assert_eq!(block.content, "Legacy memory body");
     }
 }

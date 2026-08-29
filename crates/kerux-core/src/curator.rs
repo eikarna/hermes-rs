@@ -261,6 +261,7 @@ async fn compress_old_facts(
         absorbed.first().map(|b| b.created_at).unwrap_or(now)
     );
     let mut summary = MemoryBlock::new(summary_id, "session_summary", body)
+        .source(crate::memory::MemorySource::Agent)
         .importance(60)
         .tags(vec!["compressed".to_string(), "long_term".to_string()]);
     summary.created_at = absorbed.first().map(|b| b.created_at).unwrap_or(now);

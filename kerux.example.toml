@@ -156,6 +156,11 @@ warn_threshold_pct = 80    # gateway warning at this % of a configured limit
 on_limit = "pause"         # pause | downgrade | stop
 # downgrade_model = "gpt-4o-mini" # required when on_limit = "downgrade"
 
+[memory]
+trust_threshold = 50       # minimum trust score (0-100) to inject into prompt context
+mask_secrets = true        # mask credentials (API keys, bearer tokens) on store
+quarantine_low_trust = true # quarantine memories below trust_threshold with tag
+
 [mcp]
 autoload = true
 

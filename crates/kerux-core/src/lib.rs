@@ -125,7 +125,7 @@ pub use gateway::{
 };
 pub use githarness::{GitHarness, RepoSnapshot};
 pub use mcp::{McpClient, McpStdioClient, McpTool, McpTransport};
-pub use memory::{MemoryBlock, MemoryManager, Session, UserProfile};
+pub use memory::{MemoryBlock, MemoryManager, MemorySource, Session, UserProfile};
 pub use parser::ToolCallParser;
 pub use platform::PlatformInfo;
 pub use probe::{probe_model, probe_streaming, probe_tools, probe_vision, ProbeResult};

@@ -45,6 +45,10 @@ struct MemoryEntry {
     importance: u8,
     tags: Vec<String>,
     created_at: i64,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    trust: u8,
 }
 
 /// Tool for storing a memory
@@ -58,6 +62,8 @@ struct MemoryStoreArgs {
     block_type: Option<String>,
     importance: Option<u8>,
     tags: Option<Vec<String>>,
+    source: Option<String>,
+    trust: Option<u8>,
 }
 
 #[async_trait]
@@ -87,12 +93,38 @@ impl KeruxTool for MemoryStoreTool {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        let config = crate::config::runtime_config().memory;
+        let content = if config.mask_secrets {
+            crate::redaction::redact_text(&args.content)
+        } else {
+            args.content.clone()
+        };
+
+        let mem_source: crate::memory::MemorySource = args
+            .source
+            .as_deref()
+            .unwrap_or("tool")
+            .parse()
+            .unwrap_or(crate::memory::MemorySource::Tool);
+
+        let trust = args.trust.unwrap_or_else(|| mem_source.default_trust());
+
+        let mut tags = args.tags.unwrap_or_default();
+        if config.quarantine_low_trust
+            && trust < config.trust_threshold
+            && !tags.contains(&"quarantined".to_string())
+        {
+            tags.push("quarantined".to_string());
+        }
+
         let entry = MemoryEntry {
-            content: args.content.clone(),
+            content,
             block_type: args.block_type.unwrap_or_else(|| "general".to_string()),
             importance: args.importance.unwrap_or(50).min(100),
-            tags: args.tags.unwrap_or_default(),
+            tags,
             created_at: now,
+            source: mem_source.to_string(),
+            trust,
         };
 
         {

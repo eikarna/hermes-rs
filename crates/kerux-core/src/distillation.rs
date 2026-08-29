@@ -66,6 +66,7 @@ pub async fn distill_session_with_provider(
             "fact",
             trimmed.to_string(),
         )
+        .source(crate::memory::MemorySource::Agent)
         .importance(90)
         .tags(vec!["distilled".to_string(), "long_term".to_string()]);
         memory_manager.store(block).await;

@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub tui: TuiSettings,
     pub telemetry: TelemetrySettings,
     pub budget: BudgetSettings,
+    pub memory: MemorySettings,
     pub mcp: McpSettings,
     pub skills: SkillsSettings,
     pub taste: TasteSettings,
@@ -123,15 +124,51 @@ impl BudgetSettings {
             "pause" | "downgrade" | "stop" => {}
             other => {
                 return Err(Error::Config(format!(
-                    "[budget] on_limit must be one of pause|downgrade|stop (got '{}')",
+                    "[budget] on_limit must be 'pause', 'downgrade', or 'stop' (got '{}')",
                     other
-                )))
+                )));
             }
         }
         if self.on_limit == "downgrade" && self.downgrade_model.is_none() {
             return Err(Error::Config(
-                "[budget] on_limit = \"downgrade\" requires downgrade_model".to_string(),
+                "[budget] downgrade_model is required when on_limit = 'downgrade'".to_string(),
             ));
+        }
+        Ok(())
+    }
+}
+
+/// Memory firewall & storage policy settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemorySettings {
+    /// Minimum trust score (0-100) required for a memory to be injected
+    /// into prompt context or accepted without quarantine. Default 50.
+    pub trust_threshold: u8,
+    /// Automatically redact secrets/credentials before saving memories,
+    /// and reject memories that contain unmasked credentials. Default true.
+    pub mask_secrets: bool,
+    /// Quarantine low-trust memories or memories with failed validation. Default true.
+    pub quarantine_low_trust: bool,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            trust_threshold: 50,
+            mask_secrets: true,
+            quarantine_low_trust: true,
+        }
+    }
+}
+
+impl MemorySettings {
+    pub fn validate(&self) -> Result<()> {
+        if self.trust_threshold > 100 {
+            return Err(Error::Config(format!(
+                "[memory] trust_threshold must be <= 100 (got {})",
+                self.trust_threshold
+            )));
         }
         Ok(())
     }
@@ -827,6 +864,7 @@ pub fn parse_config_str(raw: &str, source: &Path) -> Result<AppConfig> {
         Error::Config(message)
     })?;
     config.budget.validate()?;
+    config.memory.validate()?;
     Ok(config)
 }
 
