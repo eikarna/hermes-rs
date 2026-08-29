@@ -47,3 +47,6 @@ run-smoke-1.capsule.html
 
 # Hermes agent metadata & plans
 .hermes/
+
+# Research notes & scratchpads
+research/
