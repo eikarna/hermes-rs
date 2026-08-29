@@ -248,7 +248,10 @@ pub trait PlatformAdapter: Send + Sync {
         _channel_id: &str,
         _tool_name: &str,
         _arguments_preview: &str,
-    ) -> Result<(u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>)> {
+    ) -> Result<(
+        u64,
+        tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>,
+    )> {
         let (id, rx) = register_pending_approval(_tool_name, _arguments_preview);
         resolve_pending_approval(id, crate::approval::ApprovalChoice::AllowOnce, None);
         Ok((id, rx))
@@ -294,7 +297,10 @@ pub trait MessageSink: Send + Sync {
         &self,
         _tool_name: &str,
         _arguments_preview: &str,
-    ) -> Result<(u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>)> {
+    ) -> Result<(
+        u64,
+        tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>,
+    )> {
         let (id, rx) = register_pending_approval(_tool_name, _arguments_preview);
         resolve_pending_approval(id, crate::approval::ApprovalChoice::AllowOnce, None);
         Ok((id, rx))
@@ -343,7 +349,10 @@ impl MessageSink for ChannelSink {
         &self,
         tool_name: &str,
         arguments_preview: &str,
-    ) -> Result<(u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>)> {
+    ) -> Result<(
+        u64,
+        tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>,
+    )> {
         self.adapter
             .send_approval_prompt(&self.channel_id, tool_name, arguments_preview)
             .await
@@ -471,7 +480,10 @@ static NEXT_APPROVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub fn register_pending_approval(
     tool_name: &str,
     arguments_preview: &str,
-) -> (u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>) {
+) -> (
+    u64,
+    tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>,
+) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let id = NEXT_APPROVAL_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let entry = PendingApprovalEntry {
@@ -1525,10 +1537,14 @@ impl PlatformAdapter for TelegramAdapter {
 
         // Button payloads: "approve:<id>", "session:<id>", "always:<id>", "reject:<id>" (and legacy "deny:<id>").
         let (choice, id_str) = match data.split_once(':') {
-            Some(("approve", id)) | Some(("once", id)) => (crate::approval::ApprovalChoice::AllowOnce, id),
+            Some(("approve", id)) | Some(("once", id)) => {
+                (crate::approval::ApprovalChoice::AllowOnce, id)
+            }
             Some(("session", id)) => (crate::approval::ApprovalChoice::Session, id),
             Some(("always", id)) => (crate::approval::ApprovalChoice::AlwaysAllow, id),
-            Some(("reject", id)) | Some(("deny", id)) => (crate::approval::ApprovalChoice::Reject, id),
+            Some(("reject", id)) | Some(("deny", id)) => {
+                (crate::approval::ApprovalChoice::Reject, id)
+            }
             _ => {
                 self.answer_callback(&query_id, "Unknown action").await;
                 return Ok(());
@@ -1563,7 +1579,10 @@ impl PlatformAdapter for TelegramAdapter {
         channel_id: &str,
         tool_name: &str,
         arguments_preview: &str,
-    ) -> Result<(u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>)> {
+    ) -> Result<(
+        u64,
+        tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>,
+    )> {
         let (id, rx) = register_pending_approval(tool_name, arguments_preview);
 
         let preview: String = arguments_preview.chars().take(200).collect();
@@ -3072,8 +3091,15 @@ mod tests {
         .join();
 
         let (id, receiver) = register_pending_approval("terminal", "echo hello");
-        assert!(resolve_pending_approval(id, crate::approval::ApprovalChoice::AllowOnce, None));
-        assert_eq!(receiver.await, Ok(crate::approval::ApprovalChoice::AllowOnce));
+        assert!(resolve_pending_approval(
+            id,
+            crate::approval::ApprovalChoice::AllowOnce,
+            None
+        ));
+        assert_eq!(
+            receiver.await,
+            Ok(crate::approval::ApprovalChoice::AllowOnce)
+        );
     }
 
     #[test]

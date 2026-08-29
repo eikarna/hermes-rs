@@ -80,7 +80,8 @@ impl KeruxTool for WebSearchTool {
 
                 match response.text().await {
                     Ok(html) => {
-                        let sanitized_html = crate::security_guard::sanitize_external_payload("web_search", &html);
+                        let sanitized_html =
+                            crate::security_guard::sanitize_external_payload("web_search", &html);
                         let results = parse_ddg_lite_results(&sanitized_html, num_results);
                         ToolResult::success(
                             "web_search",
@@ -205,7 +206,8 @@ impl KeruxTool for WebFetchTool {
 
                 match response.text().await {
                     Ok(body) => {
-                        let sanitized_body = crate::security_guard::sanitize_external_payload("web_fetch", &body);
+                        let sanitized_body =
+                            crate::security_guard::sanitize_external_payload("web_fetch", &body);
                         let body_size = sanitized_body.len();
                         ToolResult::success(
                             "web_fetch",

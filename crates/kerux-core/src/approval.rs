@@ -151,7 +151,12 @@ impl ApprovalRuleStore {
     }
 
     /// Check if a tool call with the given args preview is allowed by persistent or session rules.
-    pub fn is_allowed(&self, session_key: Option<&str>, tool_name: &str, args_preview: &str) -> bool {
+    pub fn is_allowed(
+        &self,
+        session_key: Option<&str>,
+        tool_name: &str,
+        args_preview: &str,
+    ) -> bool {
         // 1. Check persistent rules
         if let Ok(rules) = self.persistent_rules.read() {
             for (rule, re) in rules.iter() {
@@ -227,7 +232,11 @@ impl ApprovalRuleStore {
 
 /// Global shared rule store instance.
 static GLOBAL_RULE_STORE: std::sync::LazyLock<Arc<ApprovalRuleStore>> =
-    std::sync::LazyLock::new(|| Arc::new(ApprovalRuleStore::new(Some(ApprovalRuleStore::default_path()))));
+    std::sync::LazyLock::new(|| {
+        Arc::new(ApprovalRuleStore::new(Some(
+            ApprovalRuleStore::default_path(),
+        )))
+    });
 
 /// Access the global approval rule store.
 pub fn global_rule_store() -> Arc<ApprovalRuleStore> {
@@ -288,10 +297,18 @@ mod tests {
     #[tokio::test]
     async fn decision_round_trip() {
         let (id, rx) = crate::gateway::register_pending_approval("terminal", "echo test");
-        assert!(crate::gateway::resolve_pending_approval(id, ApprovalChoice::AllowOnce, None));
+        assert!(crate::gateway::resolve_pending_approval(
+            id,
+            ApprovalChoice::AllowOnce,
+            None
+        ));
         assert_eq!(rx.await, Ok(ApprovalChoice::AllowOnce));
         // Second resolve of the same ID is a no-op (stale button press).
-        assert!(!crate::gateway::resolve_pending_approval(id, ApprovalChoice::Reject, None));
+        assert!(!crate::gateway::resolve_pending_approval(
+            id,
+            ApprovalChoice::Reject,
+            None
+        ));
     }
 
     #[tokio::test]
