@@ -88,6 +88,10 @@ pub struct AgentConfig {
     /// Output token price per million tokens (`[telemetry]` rate) used for
     /// budget cost estimation.
     pub output_cost_per_million: f64,
+    /// Project validators run after each successful edit tool.
+    pub validation: crate::validation::ValidationPolicy,
+    /// Workspace root used by post-edit validators.
+    pub validation_workspace: std::path::PathBuf,
 }
 
 impl Default for AgentConfig {
@@ -115,6 +119,9 @@ impl From<&BehaviorSettings> for AgentConfig {
             budget: runtime.budget.clone(),
             input_cost_per_million: runtime.telemetry.input_cost_per_million,
             output_cost_per_million: runtime.telemetry.output_cost_per_million,
+            validation: runtime.validation.clone(),
+            validation_workspace: std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
         }
     }
 }
@@ -1979,7 +1986,7 @@ impl KeruxAgent {
             .await;
 
             match result {
-                Ok(Ok(r)) => {
+                Ok(Ok(mut r)) => {
                     debug!(tool = %name, success = r.success, "Tool execution completed");
                     let _ = self.record_edit_outcome(
                         &tool_call.id,
@@ -1993,6 +2000,27 @@ impl KeruxAgent {
                         },
                         Some(&r.content),
                     );
+                    if r.success
+                        && crate::edit_metrics::EditFormat::from_tool_name(&name).is_some()
+                        && self.config.validation.enabled
+                    {
+                        let recorder = crate::lock_sync(&self.run_recorder).clone();
+                        let validation = crate::validators::run_validation_pass(
+                            &self.config.validation,
+                            &self.config.validation_workspace,
+                            recorder.as_ref(),
+                        )
+                        .await?;
+                        let status = if validation.passed {
+                            "passed"
+                        } else {
+                            "failed"
+                        };
+                        let evidence = serde_json::to_string(&validation)
+                            .unwrap_or_else(|_| "{\"results\":[]}".to_string());
+                        r.content
+                            .push_str(&format!("\n\nPost-edit validation {status}:\n{evidence}"));
+                    }
                     results.push(r);
                 }
                 Ok(Err(e)) => {
@@ -2732,6 +2760,89 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
+    struct ValidationFeedbackProvider {
+        workspace: std::path::PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+        saw_feedback: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::client::LLMProvider for ValidationFeedbackProvider {
+        async fn chat(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> Result<crate::client::ChatResponse> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let message = if call == 0 {
+                crate::client::MessageDelta {
+                    role: Some(crate::client::Role::Assistant),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![crate::client::ToolCallDelta {
+                        index: 0,
+                        id: Some("edit-1".to_string()),
+                        call_type: Some("function".to_string()),
+                        function: Some(crate::client::ToolCallFunction {
+                            name: "file_write".to_string(),
+                            arguments: serde_json::json!({
+                                "path": self.workspace.join("edited.txt"),
+                                "content": "broken"
+                            })
+                            .to_string(),
+                        }),
+                    }]),
+                }
+            } else {
+                self.saw_feedback.store(
+                    messages.iter().any(|message| {
+                        message.role == crate::client::Role::Tool
+                            && message.content.contains("validation")
+                            && message.content.contains("failed")
+                    }),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                crate::client::MessageDelta {
+                    role: Some(crate::client::Role::Assistant),
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                }
+            };
+            Ok(crate::client::ChatResponse {
+                id: format!("validation-response-{call}"),
+                object: "chat.completion".to_string(),
+                created: 0,
+                model: "test-model".to_string(),
+                choices: vec![crate::client::Choice {
+                    index: 0,
+                    message,
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: crate::client::Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                    cached_prompt_tokens: 0,
+                },
+            })
+        }
+
+        async fn chat_streaming(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: Option<&[crate::schema::ToolSchema]>,
+        ) -> Result<crate::client::ChatStreamResponse> {
+            Err(Error::Agent("streaming not expected".to_string()))
+        }
+
+        fn capabilities(&self, _model: &str) -> crate::client::ProviderCapabilities {
+            crate::client::ProviderCapabilities::default()
+        }
+    }
+
     #[async_trait]
     impl crate::client::LLMProvider for FailingProvider {
         async fn chat(
@@ -2817,6 +2928,107 @@ mod tests {
         let config = AgentConfig::default();
         assert_eq!(config.model, "gpt-4");
         assert_eq!(config.max_iterations, 20);
+    }
+
+    #[cfg(windows)]
+    fn failing_validator_command() -> String {
+        "cmd /c exit 1".to_string()
+    }
+
+    #[cfg(unix)]
+    fn failing_validator_command() -> String {
+        "false".to_string()
+    }
+
+    fn failing_validation_policy() -> crate::validation::ValidationPolicy {
+        crate::validation::ValidationPolicy {
+            enabled: true,
+            validators: vec![crate::validation::ValidatorSpec {
+                name: "fail-check".to_string(),
+                command: failing_validator_command(),
+                required: true,
+                timeout_secs: 10,
+                workdir: None,
+                output_cap_bytes: crate::validation::DEFAULT_OUTPUT_CAP_BYTES,
+            }],
+            fail_fast: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_edit_feeds_validation_failure_back_into_context() {
+        let workspace = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ValidationFeedbackProvider {
+            workspace: workspace.path().to_path_buf(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            saw_feedback: std::sync::atomic::AtomicBool::new(false),
+        });
+        let registry = ToolRegistry::new(Duration::from_secs(5));
+        registry
+            .register(crate::tools::FileWriteTool)
+            .await
+            .unwrap();
+        let config = AgentConfig {
+            stream: false,
+            validation: failing_validation_policy(),
+            validation_workspace: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        let agent = KeruxAgent::new_with_provider(config, provider.clone(), registry);
+
+        let result = agent.run("edit the file".to_string()).await.unwrap();
+
+        assert_eq!(result.content, "done");
+        assert!(provider
+            .saw_feedback
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn post_edit_validation_outcomes_are_journaled() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runs_root = workspace.path().join("runs");
+        let journal = crate::run_journal::RunJournal::create_in(
+            &runs_root,
+            test_run_manifest("agent-validation-run"),
+        )
+        .unwrap();
+        let recorder = Arc::new(crate::run_journal::RunRecorder::new(journal));
+        let provider = Arc::new(ValidationFeedbackProvider {
+            workspace: workspace.path().to_path_buf(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            saw_feedback: std::sync::atomic::AtomicBool::new(false),
+        });
+        let registry = ToolRegistry::new(Duration::from_secs(5));
+        registry
+            .register(crate::tools::FileWriteTool)
+            .await
+            .unwrap();
+        let config = AgentConfig {
+            stream: false,
+            validation: failing_validation_policy(),
+            validation_workspace: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        let agent = KeruxAgent::new_with_provider(config, provider, registry);
+        agent.set_run_recorder(Some(Arc::clone(&recorder)));
+
+        agent.run("edit the file".to_string()).await.unwrap();
+
+        let events = recorder.events().unwrap();
+        let pass_ends: Vec<_> = events
+            .iter()
+            .filter_map(|event| {
+                if event.kind != "validation_pass" {
+                    return None;
+                }
+                let payload = decode_event_payload(event);
+                (payload.get("phase").and_then(|v| v.as_str()) == Some("end")).then_some(payload)
+            })
+            .collect();
+        assert_eq!(pass_ends.len(), 1);
+        assert_eq!(pass_ends[0]["passed"], serde_json::json!(false));
+        assert!(events.iter().any(|event| event.kind == "validator_result"));
     }
 
     #[tokio::test]

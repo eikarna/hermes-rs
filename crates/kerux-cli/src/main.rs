@@ -125,6 +125,8 @@ enum Commands {
         #[arg(short, long)]
         args: Option<String>,
     },
+    /// Run configured project validators once.
+    Validate,
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
@@ -540,7 +542,23 @@ fn agent_config(
         agent.system_prompt = Some(prompt.to_string());
     }
     agent.request_timeout = Duration::from_secs(config.agent.request_timeout_secs);
+    agent.validation = config.validation.clone();
+    agent.validation_workspace =
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     agent
+}
+
+async fn run_configured_validation(
+    config: &AppConfig,
+    workspace: &std::path::Path,
+) -> Result<kerux_core::validation::ValidationPassResult> {
+    if !config.validation.enabled {
+        anyhow::bail!("Project validation is disabled in [validation]");
+    }
+    config.validation.validate()?;
+    kerux_core::validators::run_validation_pass(&config.validation, workspace, None)
+        .await
+        .map_err(Into::into)
 }
 
 pub(crate) async fn build_registry(
@@ -2197,6 +2215,17 @@ async fn main() -> Result<()> {
         Commands::Test { tool_name, args } => {
             test_tool(&loaded.config, tool_name, args.as_deref()).await?;
         }
+        Commands::Validate => {
+            let workspace =
+                std::env::current_dir().context("Failed to determine current project directory")?;
+            let result = run_configured_validation(&loaded.config, &workspace).await?;
+            for validator in &result.results {
+                println!("{}: {}", validator.name, validator.outcome.as_str());
+            }
+            if !result.passed {
+                anyhow::bail!("Project validation failed");
+            }
+        }
         Commands::Auth { command } => {
             handle_auth_command(command).await?;
         }
@@ -2236,6 +2265,45 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use kerux_core::auth::AuthProfile;
+
+    #[test]
+    fn validate_subcommand_parses() {
+        assert!(Cli::try_parse_from(["kerux", "validate"]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_command_runs_configured_policy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.validation.enabled = true;
+        config
+            .validation
+            .validators
+            .push(kerux_core::validation::ValidatorSpec {
+                name: "pass".to_string(),
+                command: passing_command(),
+                required: true,
+                timeout_secs: 10,
+                workdir: None,
+                output_cap_bytes: kerux_core::validation::DEFAULT_OUTPUT_CAP_BYTES,
+            });
+
+        let result = run_configured_validation(&config, workspace.path())
+            .await
+            .unwrap();
+
+        assert!(result.passed);
+    }
+
+    #[cfg(windows)]
+    fn passing_command() -> String {
+        "cmd /c exit 0".to_string()
+    }
+
+    #[cfg(unix)]
+    fn passing_command() -> String {
+        "true".to_string()
+    }
 
     #[test]
     fn cli_parses_taste_push_and_pull() {

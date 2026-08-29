@@ -168,6 +168,8 @@ Use the echo tool to repeat information and the calculate tool for math."
         budget: Default::default(),
         input_cost_per_million: 0.0,
         output_cost_per_million: 0.0,
+        validation: Default::default(),
+        validation_workspace: std::path::PathBuf::from("."),
     };
 
     let agent = KeruxAgent::new(agent_config, client, registry);
