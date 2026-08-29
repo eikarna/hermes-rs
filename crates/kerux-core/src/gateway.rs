@@ -248,9 +248,9 @@ pub trait PlatformAdapter: Send + Sync {
         _channel_id: &str,
         _tool_name: &str,
         _arguments_preview: &str,
-    ) -> Result<(u64, tokio::sync::oneshot::Receiver<bool>)> {
-        let (id, rx) = register_pending_approval();
-        resolve_pending_approval(id, true);
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>)> {
+        let (id, rx) = register_pending_approval(_tool_name, _arguments_preview);
+        resolve_pending_approval(id, crate::approval::ApprovalChoice::AllowOnce, None);
         Ok((id, rx))
     }
 
@@ -294,9 +294,9 @@ pub trait MessageSink: Send + Sync {
         &self,
         _tool_name: &str,
         _arguments_preview: &str,
-    ) -> Result<(u64, tokio::sync::oneshot::Receiver<bool>)> {
-        let (id, rx) = register_pending_approval();
-        resolve_pending_approval(id, true);
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>)> {
+        let (id, rx) = register_pending_approval(_tool_name, _arguments_preview);
+        resolve_pending_approval(id, crate::approval::ApprovalChoice::AllowOnce, None);
         Ok((id, rx))
     }
 }
@@ -343,7 +343,7 @@ impl MessageSink for ChannelSink {
         &self,
         tool_name: &str,
         arguments_preview: &str,
-    ) -> Result<(u64, tokio::sync::oneshot::Receiver<bool>)> {
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>)> {
         self.adapter
             .send_approval_prompt(&self.channel_id, tool_name, arguments_preview)
             .await
@@ -358,13 +358,22 @@ impl MessageSink for ChannelSink {
 pub struct SinkApprovalGate {
     sink: Arc<dyn MessageSink>,
     timeout: std::time::Duration,
+    channel_key: Option<String>,
 }
 
 impl SinkApprovalGate {
     /// Create a gate that prompts through `sink` and auto-denies after
     /// `timeout` without a decision.
-    pub fn new(sink: Arc<dyn MessageSink>, timeout: std::time::Duration) -> Self {
-        Self { sink, timeout }
+    pub fn new(
+        sink: Arc<dyn MessageSink>,
+        timeout: std::time::Duration,
+        channel_key: Option<String>,
+    ) -> Self {
+        Self {
+            sink,
+            timeout,
+            channel_key,
+        }
     }
 }
 
@@ -374,6 +383,16 @@ impl crate::approval::ToolApprovalGate for SinkApprovalGate {
         &self,
         request: crate::approval::ApprovalRequest,
     ) -> crate::approval::ApprovalDecision {
+        // Fast-path: Check pattern-based allow rules (session or persistent) first
+        let rule_store = crate::approval::global_rule_store();
+        if rule_store.is_allowed(
+            self.channel_key.as_deref(),
+            &request.tool_name,
+            &request.arguments_preview,
+        ) {
+            return crate::approval::ApprovalDecision::Approved;
+        }
+
         let (id, rx) = match self
             .sink
             .request_approval(&request.tool_name, &request.arguments_preview)
@@ -391,11 +410,17 @@ impl crate::approval::ToolApprovalGate for SinkApprovalGate {
         };
 
         match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(true)) => crate::approval::ApprovalDecision::Approved,
-            Ok(Ok(false)) => crate::approval::ApprovalDecision::Denied {
-                reason: "Tool execution denied by the user.".to_string(),
-                outcome: crate::approval::ApprovalOutcome::Denied,
-            },
+            Ok(Ok(crate::approval::ApprovalChoice::AllowOnce))
+            | Ok(Ok(crate::approval::ApprovalChoice::Session))
+            | Ok(Ok(crate::approval::ApprovalChoice::AlwaysAllow)) => {
+                crate::approval::ApprovalDecision::Approved
+            }
+            Ok(Ok(crate::approval::ApprovalChoice::Reject)) => {
+                crate::approval::ApprovalDecision::Denied {
+                    reason: "Tool execution denied by the user.".to_string(),
+                    outcome: crate::approval::ApprovalOutcome::Denied,
+                }
+            }
             Ok(Err(_)) => crate::approval::ApprovalDecision::Denied {
                 reason: "Approval channel closed unexpectedly.".to_string(),
                 outcome: crate::approval::ApprovalOutcome::ChannelClosed,
@@ -424,12 +449,18 @@ struct ActiveRun {
     done: tokio::sync::watch::Sender<bool>,
 }
 
-/// Pending tool-approval requests: request ID → decision channel.
+struct PendingApprovalEntry {
+    sender: tokio::sync::oneshot::Sender<crate::approval::ApprovalChoice>,
+    tool_name: String,
+    arguments_preview: String,
+}
+
+/// Pending tool-approval requests: request ID → decision channel and request details.
 ///
 /// Process-wide because the approval prompt is sent by the adapter while the
 /// decision is awaited inside the agent's execute loop (different tasks).
 static PENDING_APPROVALS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>,
+    std::sync::Mutex<HashMap<u64, PendingApprovalEntry>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 static NEXT_APPROVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -437,19 +468,54 @@ static NEXT_APPROVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Register a fresh approval request and return `(id, decision_receiver)`.
 /// The adapter resolves the receiver when the human presses a button; the
 /// gate awaits the receiver (bounded by its own timeout).
-pub fn register_pending_approval() -> (u64, tokio::sync::oneshot::Receiver<bool>) {
+pub fn register_pending_approval(
+    tool_name: &str,
+    arguments_preview: &str,
+) -> (u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let id = NEXT_APPROVAL_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    crate::lock_sync(&PENDING_APPROVALS).insert(id, tx);
+    let entry = PendingApprovalEntry {
+        sender: tx,
+        tool_name: tool_name.to_string(),
+        arguments_preview: arguments_preview.to_string(),
+    };
+    crate::lock_sync(&PENDING_APPROVALS).insert(id, entry);
     (id, rx)
 }
 
 /// Resolve a pending approval request. Returns `false` when the ID is
 /// unknown (stale/duplicate button press).
-pub(crate) fn resolve_pending_approval(id: u64, approved: bool) -> bool {
-    let tx = crate::lock_sync(&PENDING_APPROVALS).remove(&id);
-    match tx {
-        Some(tx) => tx.send(approved).is_ok(),
+pub(crate) fn resolve_pending_approval(
+    id: u64,
+    choice: crate::approval::ApprovalChoice,
+    session_key: Option<&str>,
+) -> bool {
+    let entry = crate::lock_sync(&PENDING_APPROVALS).remove(&id);
+    match entry {
+        Some(entry) => {
+            // Apply rule to store if Session or AlwaysAllow
+            let rule_store = crate::approval::global_rule_store();
+            let escaped_preview = regex::escape(&entry.arguments_preview);
+            let pattern = if escaped_preview.is_empty() {
+                ".*".to_string()
+            } else {
+                format!("^{}$", escaped_preview)
+            };
+
+            match choice {
+                crate::approval::ApprovalChoice::Session => {
+                    if let Some(key) = session_key {
+                        rule_store.add_session_rule(key, &entry.tool_name, &pattern);
+                    }
+                }
+                crate::approval::ApprovalChoice::AlwaysAllow => {
+                    rule_store.add_persistent_rule(&entry.tool_name, &pattern);
+                }
+                _ => {}
+            }
+
+            entry.sender.send(choice).is_ok()
+        }
         None => false,
     }
 }
@@ -1450,16 +1516,25 @@ impl PlatformAdapter for TelegramAdapter {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
 
-        // Button payloads: "approve:<id>" / "deny:<id>".
-        let (approved, id) = match data.split_once(':') {
-            Some(("approve", id)) => (true, id),
-            Some(("deny", id)) => (false, id),
+        let channel_id = query
+            .get("message")
+            .and_then(|m| m.get("chat"))
+            .and_then(|c| c.get("id"))
+            .and_then(|id| id.as_i64())
+            .map(|i| format!("telegram:{}", i));
+
+        // Button payloads: "approve:<id>", "session:<id>", "always:<id>", "reject:<id>" (and legacy "deny:<id>").
+        let (choice, id_str) = match data.split_once(':') {
+            Some(("approve", id)) | Some(("once", id)) => (crate::approval::ApprovalChoice::AllowOnce, id),
+            Some(("session", id)) => (crate::approval::ApprovalChoice::Session, id),
+            Some(("always", id)) => (crate::approval::ApprovalChoice::AlwaysAllow, id),
+            Some(("reject", id)) | Some(("deny", id)) => (crate::approval::ApprovalChoice::Reject, id),
             _ => {
                 self.answer_callback(&query_id, "Unknown action").await;
                 return Ok(());
             }
         };
-        let id: u64 = match id.parse() {
+        let id: u64 = match id_str.parse() {
             Ok(id) => id,
             Err(_) => {
                 self.answer_callback(&query_id, "Malformed request id")
@@ -1468,13 +1543,16 @@ impl PlatformAdapter for TelegramAdapter {
             }
         };
 
-        let resolved = resolve_pending_approval(id, approved);
+        let resolved = resolve_pending_approval(id, choice, channel_id.as_deref());
         let feedback = if !resolved {
             "This request already expired."
-        } else if approved {
-            "✅ Approved"
         } else {
-            "❌ Denied"
+            match choice {
+                crate::approval::ApprovalChoice::AllowOnce => "✅ Allowed once",
+                crate::approval::ApprovalChoice::Session => "⏳ Allowed for this session",
+                crate::approval::ApprovalChoice::AlwaysAllow => "🔒 Always allowed (persisted)",
+                crate::approval::ApprovalChoice::Reject => "❌ Rejected",
+            }
         };
         self.answer_callback(&query_id, feedback).await;
         Ok(())
@@ -1485,12 +1563,12 @@ impl PlatformAdapter for TelegramAdapter {
         channel_id: &str,
         tool_name: &str,
         arguments_preview: &str,
-    ) -> Result<(u64, tokio::sync::oneshot::Receiver<bool>)> {
-        let (id, rx) = register_pending_approval();
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<crate::approval::ApprovalChoice>)> {
+        let (id, rx) = register_pending_approval(tool_name, arguments_preview);
 
         let preview: String = arguments_preview.chars().take(200).collect();
         let text = format!(
-            "🔐 Tool approval required\n\nTool: {}\nArgs: {}\n\nApprove execution?",
+            "🔐 Tool approval required\n\nTool: {}\nArgs: {}\n\nChoose permission:",
             tool_name,
             if preview.is_empty() {
                 "(none)"
@@ -1503,10 +1581,16 @@ impl PlatformAdapter for TelegramAdapter {
             "chat_id": channel_id,
             "text": text,
             "reply_markup": {
-                "inline_keyboard": [[
-                    { "text": "✅ Approve", "callback_data": format!("approve:{}", id) },
-                    { "text": "❌ Deny", "callback_data": format!("deny:{}", id) }
-                ]]
+                "inline_keyboard": [
+                    [
+                        { "text": "✅ Allow Once", "callback_data": format!("approve:{}", id) },
+                        { "text": "⏳ Session", "callback_data": format!("session:{}", id) }
+                    ],
+                    [
+                        { "text": "🔒 Always Allow", "callback_data": format!("always:{}", id) },
+                        { "text": "❌ Reject", "callback_data": format!("reject:{}", id) }
+                    ]
+                ]
             }
         });
 
@@ -2987,9 +3071,9 @@ mod tests {
         })
         .join();
 
-        let (id, receiver) = register_pending_approval();
-        assert!(resolve_pending_approval(id, true));
-        assert_eq!(receiver.await, Ok(true));
+        let (id, receiver) = register_pending_approval("terminal", "echo hello");
+        assert!(resolve_pending_approval(id, crate::approval::ApprovalChoice::AllowOnce, None));
+        assert_eq!(receiver.await, Ok(crate::approval::ApprovalChoice::AllowOnce));
     }
 
     #[test]

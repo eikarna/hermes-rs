@@ -1427,6 +1427,7 @@ impl kerux_core::gateway::MessageHandler for AgentMessageHandler {
             let gate = kerux_core::gateway::SinkApprovalGate::new(
                 sink.clone(),
                 Duration::from_secs(self.tool_approval_timeout_secs),
+                Some(channel_key.clone()),
             );
             self.agent.set_approval_gate(Some(Arc::new(gate)));
         }
