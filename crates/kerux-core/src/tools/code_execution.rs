@@ -115,25 +115,31 @@ async fn execute_python(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let mut stdout_output = String::new();
-    let mut stderr_output = String::new();
-
-    // Read outputs
-    if let Some(stdout) = stdout {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-            stdout_output.push_str(&line);
-            stdout_output.push('\n');
+    // Read stdout/stderr concurrently — sequential reads deadlock when the child
+    // fills one pipe's OS buffer while we block reading the other.
+    let out_fut = async move {
+        let mut buf = String::new();
+        if let Some(stdout) = stdout {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-    }
-
-    if let Some(stderr) = stderr {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-            stderr_output.push_str(&line);
-            stderr_output.push('\n');
+        buf
+    };
+    let err_fut = async move {
+        let mut buf = String::new();
+        if let Some(stderr) = stderr {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-    }
+        buf
+    };
+    let (stdout_output, stderr_output) = tokio::join!(out_fut, err_fut);
 
     let status = tokio::time::timeout(timeout, child.wait())
         .await
@@ -184,24 +190,31 @@ async fn execute_javascript(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let mut stdout_output = String::new();
-    let mut stderr_output = String::new();
-
-    if let Some(stdout) = stdout {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-            stdout_output.push_str(&line);
-            stdout_output.push('\n');
+    // Read stdout/stderr concurrently — sequential reads deadlock when the child
+    // fills one pipe's OS buffer while we block reading the other.
+    let out_fut = async move {
+        let mut buf = String::new();
+        if let Some(stdout) = stdout {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-    }
-
-    if let Some(stderr) = stderr {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-            stderr_output.push_str(&line);
-            stderr_output.push('\n');
+        buf
+    };
+    let err_fut = async move {
+        let mut buf = String::new();
+        if let Some(stderr) = stderr {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-    }
+        buf
+    };
+    let (stdout_output, stderr_output) = tokio::join!(out_fut, err_fut);
 
     let status = tokio::time::timeout(timeout, child.wait())
         .await
@@ -251,24 +264,31 @@ async fn execute_shell(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let mut stdout_output = String::new();
-    let mut stderr_output = String::new();
-
-    if let Some(stdout) = stdout {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-            stdout_output.push_str(&line);
-            stdout_output.push('\n');
+    // Read stdout/stderr concurrently — sequential reads deadlock when the child
+    // fills one pipe's OS buffer while we block reading the other.
+    let out_fut = async move {
+        let mut buf = String::new();
+        if let Some(stdout) = stdout {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-    }
-
-    if let Some(stderr) = stderr {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-            stderr_output.push_str(&line);
-            stderr_output.push('\n');
+        buf
+    };
+    let err_fut = async move {
+        let mut buf = String::new();
+        if let Some(stderr) = stderr {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-    }
+        buf
+    };
+    let (stdout_output, stderr_output) = tokio::join!(out_fut, err_fut);
 
     let status = tokio::time::timeout(timeout, child.wait())
         .await
@@ -375,24 +395,31 @@ path = "src/main.rs"
     let stdout = run_child.stdout.take();
     let stderr = run_child.stderr.take();
 
-    let mut stdout_output = String::new();
-    let mut stderr_output = String::new();
-
-    if let Some(stdout) = stdout {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-            stdout_output.push_str(&line);
-            stdout_output.push('\n');
+    // Read stdout/stderr concurrently — sequential reads deadlock when the child
+    // fills one pipe's OS buffer while we block reading the other.
+    let out_fut = async move {
+        let mut buf = String::new();
+        if let Some(stdout) = stdout {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-    }
-
-    if let Some(stderr) = stderr {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
-            stderr_output.push_str(&line);
-            stderr_output.push('\n');
+        buf
+    };
+    let err_fut = async move {
+        let mut buf = String::new();
+        if let Some(stderr) = stderr {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Ok(Some(line))) = tokio::time::timeout(timeout, reader.next_line()).await {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-    }
+        buf
+    };
+    let (stdout_output, stderr_output) = tokio::join!(out_fut, err_fut);
 
     let status = tokio::time::timeout(timeout, run_child.wait())
         .await

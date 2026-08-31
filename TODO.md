@@ -2,6 +2,12 @@
 
 ## Implemented
 
+- **Interactive Onboarding Wizard & Model Picker** (`kerux wizard`, `kerux model`): automatic credential discovery, capability badges, live probe verification, and dynamic provider fallback configuration
+- **Live Capability Probing Engine** (`kerux_core::probe`): mini-stream TTFT measurement, function call probe, and base64 vision verification
+- **Post-Edit Validation Policy Gate**: automated validation pass execution on successful edits with error feedback injection for self-healing
+- **Next-Gen Benchmark Suite** (`crates/kerux-bench`): dynamic synthetic workspace generation, trap/broken AST injections, and scoring engine
+- **Subprocess Pipe Deadlock & MCP Fixes**: concurrent `stdout`/`stderr` reading via `tokio::join!` in terminal and code execution tools; background stderr draining in MCP transport
+- **Streaming Tool Parser Hardening**: tolerant handling of nested non-tool HTML tags and generic type parameters within JSON tool call arguments
 - ReAct agent orchestration loop through `KeruxAgent::run()`
 - Shared TOML runtime configuration across `kerux-core` and `kerux-cli`
 - Ratatui prompt-first TUI with conversation, reasoning, activity, MCP, skills, and behavior panels

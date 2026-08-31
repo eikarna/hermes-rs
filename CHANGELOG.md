@@ -5,19 +5,25 @@ format based on [Keep Changelog](https://keepachangelog.com/en/1.1.0/), this pro
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-01
+
 ### Added
 
 - **Interactive onboarding wizard** (`kerux wizard`, alias `kerux onboarding`): full first-run setup without reading docs — environment credential sniffing (OPENAI/ANTHROPIC/GEMINI/OPENROUTER keys, OLLAMA_HOST), provider picker, API key validation via a live model-list call (not format checks), fuzzy model picker with capability badges over the live `list_models()` catalog (thousands of models safe, manual-entry fallback so no endpoint failure dead-ends the flow), optional live capability probe with verified ✓ results, optional fallback model wired into `[[client.fallback]]`, config written to the KERUX_HOME-aware global path (existing files edited in place, comments preserved, env-sourced keys never written to disk), and a smoke-test round trip with token usage. Every step supports skip/back. Auto-launches on fresh installs (no config file, no env credentials) before `chat`/`run`/`serve`/`autonomous`
 - **Model picker command** (`kerux model [id] [--refresh]`): switch the configured model anytime through the same fuzzy picker with capability badges, or set an id directly; writes only `[agent] model`, preserving the rest of the config
 - **Live capability probes** (`kerux_core::probe`): opt-in per-model verification for wizard-selected models — a mini streaming completion (verifies SSE flow + measures TTFT), a trivial `get_time` tool-call request, and a 1px base64 PNG vision payload; verdicts are `Some(true)`/`Some(false)` (verified/rejected) vs `None` (untested or inconclusive network/timeout), and `ProbeResult::to_capability_updates()` feeds `CapabilityReport::merge_probe` so probed verdicts override catalog/heuristic ones. Messages can now carry base64 images (`Message::with_images`), serialized as OpenAI `image_url` data-URL parts, Anthropic `image` blocks, and Gemini `inlineData` parts
 - **Post-edit validation gate**: successful edit tools now run the configured `[validation]` policy, return pass/fail evidence to the agent context for self-repair, and journal every validator outcome; `kerux validate` runs the same policy manually
+- **Next-Gen Benchmark Suite** (`crates/kerux-bench`): automated evaluation crate with dynamic synthetic workspace generation, trap/broken AST injections, and scoring engine
 
 ### Changed
 
 - **TUI chat redesign**: the Conversation panel now renders turns with a glyph gutter (`❯` user / `✦` assistant) plus a dim `HH:MM` timestamp instead of full `User:`/`Assistant:` role labels; tool calls render as indented `┊ tool: <name> ✓/✗ <duration>` sub-lines attached to their turn; a thin `┄` separator marks turn boundaries; body text wraps at a consistent 9-column indent across 40/80/120-column widths, and streaming turns show the glyph immediately while output flows beside it
+- **Subprocess concurrency**: replaced sequential `stdout`/`stderr` reader loops in `terminal_tool` and `code_execution` with concurrent async tasks via `tokio::join!`, avoiding OS pipe buffer deadlocks (64KB limits) during high-volume error logs
 
 ### Fixed
 
+- **Streaming XML Parser**: fixed false-positive nested non-tool tag handling in `ToolCallParser` so HTML tags (`<div>`) and generic type brackets (`<T>`) within JSON arguments are no longer silently discarded
+- **MCP Stderr Drainage**: MCP stdio transport now drains child stderr handles in background tasks, preventing server freezes caused by unread stderr pipe buffers
 - TUI: clear pending tool sub-lines and in-flight tool timers at every run boundary (`begin_run`, `begin_shell_run`, `fail_run`) so tool lines from a failed or interrupted run no longer leak into the next run's streaming turn
 
 ## [0.3.0] - 2026-08-27

@@ -123,6 +123,21 @@ impl ToolCallParser {
 
         // Handle any remaining buffer if we see the end
         if data.is_empty() {
+            // A dangling partial tag (stream ended mid-tag) is content too —
+            // flush it before the main buffer so nothing is silently lost.
+            if self.state == ParserState::InsideNestedTag
+                || self.state == ParserState::InsideOpenTag
+            {
+                if self.state == ParserState::InsideOpenTag {
+                    // InsideOpenTag's tag_buffer lacks the leading '<'.
+                    self.buffer.push('<');
+                }
+                let dangling = std::mem::take(&mut self.tag_buffer);
+                if !dangling.is_empty() {
+                    self.buffer.push_str(&dangling);
+                }
+                self.state = ParserState::Outside;
+            }
             // Flush any remaining text
             if !self.buffer.is_empty() {
                 let text = std::mem::take(&mut self.buffer);
@@ -176,17 +191,33 @@ impl ToolCallParser {
             }
             ParserState::InsideContent => {
                 if ch == '<' {
-                    // Check for closing tag
-                    self.state = ParserState::InsideNestedTag;
+                    // Possible closing/opening tag. Hold the '<' in tag_buffer and
+                    // decide on the NEXT char whether this is a real tag start —
+                    // "< 5" or "< T" in code must stay content, not enter a tag.
+                    // Deferring (instead of peeking) works across chunk boundaries.
                     self.tag_buffer.clear();
+                    self.tag_buffer.push('<');
                     self.nested_depth = 1;
+                    self.state = ParserState::InsideNestedTag;
                 } else {
                     // Accumulate content
                     self.buffer.push(ch);
                 }
             }
             ParserState::InsideNestedTag => {
-                if ch == '<' {
+                if self.tag_buffer == "<" {
+                    // Second char after '<' decides: real tags start with a letter,
+                    // '/' or '!'. Anything else means the '<' was literal content
+                    // (e.g. "x < y", "a <T" without close) — flush it verbatim.
+                    if ch.is_ascii_alphabetic() || ch == '/' || ch == '!' {
+                        self.tag_buffer.push(ch);
+                    } else {
+                        self.buffer.push_str(&self.tag_buffer.clone());
+                        self.tag_buffer.clear();
+                        self.buffer.push(ch);
+                        self.state = ParserState::InsideContent;
+                    }
+                } else if ch == '<' {
                     self.nested_depth += 1;
                     self.tag_buffer.push(ch);
                 } else if ch == '>' {
@@ -194,8 +225,9 @@ impl ToolCallParser {
                     self.tag_buffer.push(ch);
 
                     if self.nested_depth == 0 {
-                        let nested_tag = self.tag_buffer.trim().to_lowercase();
-                        self.tag_buffer.clear();
+                        // raw_tag includes the leading '<' and trailing '>'.
+                        let raw_tag = std::mem::take(&mut self.tag_buffer);
+                        let nested_tag = raw_tag.trim_start_matches('<').trim().to_lowercase();
 
                         if nested_tag.starts_with("/tool_call") {
                             // Found closing </tool_call>
@@ -205,11 +237,13 @@ impl ToolCallParser {
                         } else if nested_tag == "tool_call" {
                             // Nested <tool_call> inside <tool_call> (malformed)
                             warn!("Malformed XML: nested <tool_call> tag");
-                            self.buffer.push('<');
-                            self.buffer.push_str(&nested_tag);
+                            self.buffer.push_str(&raw_tag);
                             self.state = ParserState::InsideContent;
                         } else {
-                            // Other nested tag, continue
+                            // Not a tool_call-related tag (e.g. HTML <div>, generic
+                            // <T> inside a JSON string). Flush verbatim into the
+                            // content buffer so the payload isn't silently corrupted.
+                            self.buffer.push_str(&raw_tag);
                             self.state = ParserState::InsideContent;
                         }
                     }
@@ -596,5 +630,99 @@ Some text here
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].function.name, "echo");
         assert_eq!(text, "");
+    }
+
+    #[test]
+    fn test_html_tags_inside_arguments_are_preserved() {
+        // HTML tags inside a JSON string argument must survive the state machine:
+        // a naive implementation discards tag_buffer when the nested tag isn't a
+        // tool_call, silently corrupting the payload before JSON deserialization.
+        let content = r#"<tool_call>{"name": "write_file", "arguments": "{\"content\": \"<div><span>hello</span></div>\"}"}</tool_call>"#;
+        let mut parser = ToolCallParser::new();
+        let tool_calls = parser.parse(content).unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "write_file");
+
+        // The arguments string is itself JSON; parse it and check the inner payload.
+        let args: serde_json::Value =
+            serde_json::from_str(&tool_calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args["content"].as_str().unwrap(),
+            "<div><span>hello</span></div>"
+        );
+    }
+
+    #[test]
+    fn test_generic_brackets_inside_arguments_are_preserved() {
+        // Generic type syntax (Vec<T>, HashMap<K, V>) inside a code-writing tool's
+        // payload must not be eaten by the XML state machine.
+        let inner =
+            r#"{"code": "let v: Vec<T> = Vec::new(); let m: HashMap<K, V> = HashMap::new();"}"#;
+        let content = format!(
+            r#"<tool_call>{{"name": "write_code", "arguments": {}}}</tool_call>"#,
+            serde_json::to_string(inner).unwrap()
+        );
+
+        let mut parser = ToolCallParser::new();
+        let tool_calls = parser.parse(&content).unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(&tool_calls[0].function.arguments).unwrap();
+        let code = args["code"].as_str().unwrap();
+        assert!(code.contains("Vec<T>"), "generic bracket lost: {code}");
+        assert!(
+            code.contains("HashMap<K, V>"),
+            "generic bracket lost: {code}"
+        );
+    }
+
+    #[test]
+    fn test_chunked_stream_with_html_and_generics() {
+        // Stream the payload one character at a time: the state machine must hold
+        // partial tags across chunk boundaries without corrupting anything.
+        let inner = r#"{"content": "<div>x</div> and Vec<T>"}"#;
+        let content = format!(
+            r#"<tool_call>{{"name": "write_file", "arguments": {}}}</tool_call>"#,
+            serde_json::to_string(inner).unwrap()
+        );
+
+        let mut parser = ToolCallParser::new();
+        let mut tool_calls: Vec<_> = Vec::new();
+        for ch in content.chars() {
+            for event in parser.feed(&ch.to_string()) {
+                if let ParserEvent::ToolCall(tc) = event {
+                    tool_calls.push(tc);
+                }
+            }
+        }
+        for event in parser.feed("") {
+            if let ParserEvent::ToolCall(tc) = event {
+                tool_calls.push(tc);
+            }
+        }
+
+        assert_eq!(tool_calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(&tool_calls[0].function.arguments).unwrap();
+        let payload = args["content"].as_str().unwrap();
+        assert_eq!(payload, "<div>x</div> and Vec<T>");
+    }
+
+    #[test]
+    fn test_unterminated_nested_tag_flushes_at_closing_tool_call() {
+        // A "<" with no matching ">" before </tool_call> (e.g. "a < b" in code)
+        // leaves the parser mid-nested-tag; the closing </tool_call> still resolves
+        // the tag run, and the whole run must be preserved verbatim.
+        let content =
+            r#"<tool_call>{"name": "calc", "arguments": "{\"expr\": \"x < 5\"}"}</tool_call>"#;
+        let mut parser = ToolCallParser::new();
+        let tool_calls = parser.parse(content).unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(&tool_calls[0].function.arguments).unwrap();
+        assert_eq!(args["expr"].as_str().unwrap(), "x < 5");
     }
 }

@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -148,7 +148,8 @@ struct JsonRpcRequest {
 #[allow(dead_code)]
 struct JsonRpcResponse {
     jsonrpc: String,
-    id: u64,
+    /// `None` for server-initiated notifications, which carry no id
+    id: Option<u64>,
     result: Option<Value>,
     error: Option<JsonRpcError>,
 }
@@ -451,6 +452,21 @@ impl McpStdioClient {
         let stdout = child.stdout.take().ok_or_else(|| {
             crate::error::Error::Agent("Failed to capture child stdout".to_string())
         })?;
+        let stderr = child.stderr.take();
+
+        // Drain stderr in the background. If left unread, a chatty MCP server
+        // fills the OS pipe buffer (~64KB) and blocks the child forever.
+        if let Some(mut stderr) = stderr {
+            tokio::spawn(async move {
+                let mut sink = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut sink).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            });
+        }
 
         *self.child.write().await = Some(child);
         *self.io.lock().await = Some(StdioIo {
@@ -616,25 +632,52 @@ impl McpStdioClient {
             .await
             .map_err(|e| crate::error::Error::Agent(format!("Failed to flush MCP stdin: {}", e)))?;
 
-        // Read response from stdout
-        let mut response_line = String::new();
-        io.stdout.read_line(&mut response_line).await.map_err(|e| {
-            crate::error::Error::Agent(format!("Failed to read from MCP stdout: {}", e))
-        })?;
-
-        if response_line.is_empty() {
-            return Err(crate::error::Error::Agent(
-                "MCP server closed stdout unexpectedly".to_string(),
-            ));
-        }
-
-        let rpc_response: JsonRpcResponse =
-            serde_json::from_str(response_line.trim()).map_err(|e| {
-                crate::error::Error::ParseResponse(format!(
-                    "Failed to parse MCP stdio response: {}",
-                    e
-                ))
+        // Read response from stdout. Skip any lines that are not the response
+        // for this request: server-initiated notifications (notifications/*,
+        // progress, logging) carry no `id` and must not be consumed as the
+        // answer, or every subsequent request would read one line early.
+        let response = loop {
+            let mut response_line = String::new();
+            let n = io.stdout.read_line(&mut response_line).await.map_err(|e| {
+                crate::error::Error::Agent(format!("Failed to read from MCP stdout: {}", e))
             })?;
+
+            if n == 0 {
+                return Err(crate::error::Error::Agent(
+                    "MCP server closed stdout unexpectedly".to_string(),
+                ));
+            }
+
+            let parsed: JsonRpcResponse = match serde_json::from_str(response_line.trim()) {
+                Ok(p) => p,
+                // Skip unparseable lines (e.g. server banner output) — keep the
+                // stream position aligned with real JSON-RPC messages.
+                Err(_) => {
+                    debug!(line = %response_line.trim(), "Skipping non-JSON line on MCP stdout");
+                    continue;
+                }
+            };
+
+            // A message without an `id` is a server notification — drain it.
+            if parsed.id.is_none() && parsed.result.is_none() && parsed.error.is_none() {
+                debug!(line = %response_line.trim(), "Skipping MCP server notification");
+                continue;
+            }
+
+            // A response for a different (stale) request id — skip it.
+            if parsed.id != Some(request_id) {
+                debug!(
+                    got = ?parsed.id,
+                    expected = request_id,
+                    "Skipping stale MCP response"
+                );
+                continue;
+            }
+
+            break parsed;
+        };
+
+        let rpc_response = response;
 
         if let Some(error) = rpc_response.error {
             return Err(crate::error::Error::Agent(format!(

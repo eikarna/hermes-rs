@@ -136,41 +136,49 @@ impl KeruxTool for TerminalTool {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        let mut stdout_output = String::new();
-        let mut stderr_output = String::new();
-
-        // Read stdout
-        if let Some(stdout) = stdout {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Ok(Some(l))) =
-                tokio::time::timeout(remaining_budget(deadline), reader.next_line()).await
-            {
-                if stdout_output.len() + l.len() < max_output {
-                    stdout_output.push_str(&l);
-                    stdout_output.push('\n');
-                } else if stdout_output.len() < max_output {
-                    let remaining = max_output - stdout_output.len();
-                    stdout_output.push_str(&l[..remaining.min(l.len())]);
-                    stdout_output.push_str("\n[output truncated]");
-                } else {
-                    stdout_output.push_str("\n[output truncated]");
-                    break;
+        // Read stdout and stderr CONCURRENTLY. Sequential reads deadlock when
+        // the child fills one pipe's OS buffer (~64KB) while we're blocked
+        // reading the other: child blocks on write, we block on read.
+        // Both readers share the single wall-clock `deadline`.
+        let out_fut = async move {
+            let mut buf = String::new();
+            if let Some(stdout) = stdout {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Ok(Ok(Some(l))) =
+                    tokio::time::timeout(remaining_budget(deadline), reader.next_line()).await
+                {
+                    if buf.len() + l.len() < max_output {
+                        buf.push_str(&l);
+                        buf.push('\n');
+                    } else if buf.len() < max_output {
+                        let remaining = max_output - buf.len();
+                        buf.push_str(&l[..remaining.min(l.len())]);
+                        buf.push_str("\n[output truncated]");
+                    } else {
+                        buf.push_str("\n[output truncated]");
+                        break;
+                    }
                 }
             }
-        }
-
-        // Read stderr
-        if let Some(stderr) = stderr {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Ok(Some(l))) =
-                tokio::time::timeout(remaining_budget(deadline), reader.next_line()).await
-            {
-                if stderr_output.len() + l.len() < max_output / 4 {
-                    stderr_output.push_str(&l);
-                    stderr_output.push('\n');
+            buf
+        };
+        let err_limit = max_output / 4;
+        let err_fut = async move {
+            let mut buf = String::new();
+            if let Some(stderr) = stderr {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Ok(Some(l))) =
+                    tokio::time::timeout(remaining_budget(deadline), reader.next_line()).await
+                {
+                    if buf.len() + l.len() < err_limit {
+                        buf.push_str(&l);
+                        buf.push('\n');
+                    }
                 }
             }
-        }
+            buf
+        };
+        let (stdout_output, stderr_output) = tokio::join!(out_fut, err_fut);
 
         // Wait for process to complete
         let status = match tokio::time::timeout(remaining_budget(deadline), child.wait()).await {

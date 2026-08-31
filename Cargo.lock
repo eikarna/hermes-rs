@@ -1150,8 +1150,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kerux-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kerux-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1179,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "kerux-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
